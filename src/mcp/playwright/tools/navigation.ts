@@ -4,9 +4,12 @@ import { validateNavigationUrl } from '../../../shared/types';
 import { sendRpc } from '../../wmux-client';
 import { PlaywrightEngine } from '../PlaywrightEngine';
 import {
+  requireBrowserTargetScope,
   sendScopedBrowserRpc,
   type BrowserToolDeps,
 } from '../browserScope';
+import { domainFromUrl } from '../../../shared/browserMemory/siteMemory';
+import { normalizeUrlKey } from '../../../shared/browserReplay/actionTrace';
 import { withAutomationLease } from '../automationLease';
 import { describeToolError } from '../toolError';
 import { redactPasswordParams } from '../redact';
@@ -60,6 +63,94 @@ export const BROWSER_TABS_SHAPE = {
     .optional()
     .describe('Removed. Use surfaceId.'),
 };
+
+/**
+ * The error CLASS behind a failed navigation, or null if it was not one.
+ *
+ * This is the whole attribution rule for the navigation write hook. Several
+ * paths in this file return `isError: true` for reasons that are wmux's own —
+ * a tabs-tool error, no live page, an unresolved scope — and none of them say
+ * anything about the host. Recording those would fill a site's memory with
+ * this application's problems.
+ *
+ * So only two classes qualify, and both mean "the browser actually issued a
+ * request to that host and it did not come back": a Playwright TimeoutError,
+ * and a Chromium `net::ERR_*` code. The code string itself is the only thing
+ * kept — never the message body, never page text.
+ */
+function navigationErrorClass(error: unknown): string | null {
+  const err = error as { name?: unknown; message?: unknown } | null | undefined;
+  const message = typeof err?.message === 'string' ? err.message : '';
+  const netCode = /net::ERR_[A-Z0-9_]+/.exec(message);
+  if (netCode) return netCode[0];
+  if (err?.name === 'TimeoutError' || /\bTimeoutError\b/.test(message)) return 'TimeoutError';
+  return null;
+}
+
+/**
+ * How long a navigation result waits for its own failure to be recorded.
+ *
+ * Fire-and-forget lost the record outright: a stdio MCP process can exit as
+ * soon as it has written the tool response, and an in-flight RPC goes with it.
+ * Measured — no file at all without a hold, the file present with one — so the
+ * write is awaited, briefly.
+ *
+ * Short, because the cost is paid on a path the agent is already waiting on,
+ * and one-and-a-half seconds is generous for a local pipe write. If the bound
+ * is hit, the record is abandoned rather than chased: the failure will happen
+ * again if it is real, and the agent's error is the thing that must not be
+ * held up.
+ */
+const SITE_MEMORY_RECORD_TIMEOUT_MS = 1500;
+
+/**
+ * File a failed navigation against the host that was attempted.
+ *
+ * Awaited with a bound, never allowed to throw: a navigation that already
+ * failed must not fail twice, and must not hang either.
+ */
+async function recordNavigationFailure(
+  deps: BrowserToolDeps,
+  surfaceId: string | undefined,
+  url: string,
+  error: unknown,
+): Promise<void> {
+  const errorClass = navigationErrorClass(error);
+  if (!errorClass) return;
+  const domain = domainFromUrl(url);
+  if (!domain) return;
+  const write = requireBrowserTargetScope(deps, surfaceId).then((scope) =>
+    sendScopedBrowserRpc('browser.siteMemory.record', scope, {
+      domain,
+      kind: 'failure',
+      source: 'navigate',
+      // normalizeUrlKey drops the query and the userinfo, so the stored key
+      // can never carry a credential or a one-time token.
+      urlKey: normalizeUrlKey(url),
+      what: 'navigation failed',
+      cause: errorClass,
+      tryInstead: 'check the host is reachable before starting a flow here',
+    }),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      write,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SITE_MEMORY_RECORD_TIMEOUT_MS);
+        // The bound must not be the reason the process stays alive.
+        timer.unref?.();
+      }),
+    ]);
+  } catch {
+    /* memory is bookkeeping; it never fails a navigation */
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  // The race leaves `write` unhandled when the timeout won, and an unhandled
+  // rejection would be reported against a navigation that already returned.
+  write.catch(() => {});
+}
 
 function tabsToolError(result: BrowserTabsErrorResult) {
   return {
@@ -245,6 +336,13 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
           { redundantNavigationUrl: () => finalUrl },
         );
       } catch (error) {
+        // Only a real network failure to the requested host is remembered —
+        // see navigationErrorClass. wmux's own errors reach here too and are
+        // deliberately not this site's problem.
+        //
+        // Awaited: the MCP process may exit the moment this response is
+        // written, taking an in-flight RPC with it.
+        await recordNavigationFailure(deps, surfaceId, url, error);
         const message = describeToolError(error);
         return {
           content: [{ type: 'text' as const, text: message }],
