@@ -35,12 +35,24 @@ import {
   type CaptureWindow,
   type ConsoleEntry,
 } from '../pageCapture';
+import { clampScreenshotCeilingBytes, MAX_SCREENSHOT_MAXBYTES } from '../../resultCap';
 
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
   .string()
   .optional()
   .describe('Omit for the active surface.');
+
+// Per-call text-result cap, honoured by the dispatch-layer guard
+// (src/mcp/resultCap.ts). Tools whose output size the caller does not control
+// (a console ring, a network log, an arbitrary JSON.stringify) accept this so
+// a legitimate need for more than the 64 KiB default is one parameter away.
+// Plain z.number(): the guard floors and clamps the value itself (every zod
+// numeric modifier costs bytes in tools/list).
+const maxBytesParam = z
+  .number()
+  .optional()
+  .describe('Cap the text result in bytes (default 65536, max 524288).');
 
 // Module-scope parameter shapes: hoisted out of the per-registration path so
 // every createWmuxServer() instance shares one set of zod schema objects.
@@ -79,6 +91,10 @@ const BROWSER_SCREENSHOT_SHAPE = {
     .optional()
     .describe('Element to capture; omit for the whole page.'),
   surfaceId: optionalSurfaceId,
+  maxBytes: z
+    .number()
+    .optional()
+    .describe('Image base64 ceiling (default 2097152, max 8388608). Over it the image is downscaled, never refused.'),
 };
 
 const BROWSER_EVALUATE_SHAPE = {
@@ -92,6 +108,7 @@ const BROWSER_EVALUATE_SHAPE = {
     .optional()
     .describe("Run in the page's own JS world to reach its globals (e.g. window.__NEXT_DATA__). Default false."),
   surfaceId: optionalSurfaceId,
+  maxBytes: maxBytesParam,
 };
 
 const BROWSER_CONSOLE_SHAPE = {
@@ -104,6 +121,7 @@ const BROWSER_CONSOLE_SHAPE = {
     .optional()
     .describe('Clear after returning.'),
   surfaceId: optionalSurfaceId,
+  maxBytes: maxBytesParam,
 };
 
 const BROWSER_NETWORK_SHAPE = {
@@ -116,6 +134,7 @@ const BROWSER_NETWORK_SHAPE = {
     .optional()
     .describe('Clear requests and retained response bodies after returning.'),
   surfaceId: optionalSurfaceId,
+  maxBytes: maxBytesParam,
 };
 
 const BROWSER_RESPONSE_BODY_SHAPE = {
@@ -123,6 +142,7 @@ const BROWSER_RESPONSE_BODY_SHAPE = {
     .string()
     .describe('URL glob, e.g. "*api/users*".'),
   surfaceId: optionalSurfaceId,
+  maxBytes: maxBytesParam,
 };
 
 const BROWSER_HIGHLIGHT_SHAPE = {
@@ -478,11 +498,111 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
     return typeof value === 'number' && value > 0 ? value : null;
   };
 
+  /**
+   * One rung of the downscale ladder: a re-encode the lane can actually
+   * perform. `scale` is relative to the ORIGINAL capture, so the note the
+   * caller reads ("scaled to 0.5") is the number they divide image pixels by
+   * on top of the coordinate basis already stated.
+   */
+  interface ShrinkRung {
+    readonly scale: number;
+    readonly quality: number;
+  }
+
+  /**
+   * Owner decision: browser_screenshot NEVER refuses. Over the base64 ceiling
+   * the image is re-encoded smaller — JPEG first, then progressively scaled —
+   * and the result SAYS what was applied, so a caller reading coordinates off
+   * the pixels can compensate exactly. A refusal used to protect the
+   * coordinate contract by removing the capability; stating the factor
+   * protects it while keeping the capability.
+   */
+  const SHRINK_LADDER: readonly ShrinkRung[] = Object.freeze([
+    { scale: 1, quality: 80 },
+    { scale: 0.75, quality: 80 },
+    { scale: 0.5, quality: 75 },
+    { scale: 0.35, quality: 70 },
+    { scale: 0.25, quality: 60 },
+  ]);
+
+  /** What a shrink produced, plus the sentence describing it. */
+  interface FittedImage {
+    readonly data: string;
+    readonly mimeType: string;
+    /** Empty when the original PNG was already within the ceiling. */
+    readonly note: string;
+  }
+
+  /**
+   * Walk the ladder until a rung fits under `ceiling`. A rung that a lane
+   * cannot perform returns null and ends the walk; the smallest payload seen
+   * is returned either way, because handing back a too-large image with an
+   * honest note still beats refusing (and the text cap never touches image
+   * content, so the caller's own ceiling is the only bound that applies).
+   */
+  const fitScreenshot = async (
+    original: string,
+    ceiling: number,
+    shrink: (rung: ShrinkRung) => Promise<string | null>,
+  ): Promise<FittedImage> => {
+    if (original.length <= ceiling) {
+      return { data: original, mimeType: 'image/png', note: '' };
+    }
+    let best = { data: original, mimeType: 'image/png', scale: 1, quality: 0 };
+    for (const rung of SHRINK_LADDER) {
+      const data = await shrink(rung).catch(() => null);
+      if (data === null) break;
+      if (data.length < best.data.length) {
+        best = { data, mimeType: 'image/jpeg', scale: rung.scale, quality: rung.quality };
+      }
+      if (data.length <= ceiling) break;
+    }
+    if (best.mimeType === 'image/png') {
+      // No lane knob produced anything smaller. Say so rather than pretending.
+      return {
+        data: best.data,
+        mimeType: 'image/png',
+        note:
+          `This image is ${(best.data.length / (1024 * 1024)).toFixed(1)} MiB of base64, over the ` +
+          `${(ceiling / (1024 * 1024)).toFixed(1)} MiB ceiling, and this capture path offers no ` +
+          'downscale. Narrow the capture (omit fullPage, or scope to an element with ref).',
+      };
+    }
+    const fits = best.data.length <= ceiling ? '' : ' It is still over the ceiling — narrow the capture.';
+    return {
+      data: best.data,
+      mimeType: best.mimeType,
+      note:
+        `Downscaled to fit the ${(ceiling / (1024 * 1024)).toFixed(1)} MiB ceiling: JPEG q${best.quality}` +
+        `${best.scale === 1 ? ' at full size' : `, scaled to ${best.scale}`}. Divide image pixels by ` +
+        `${best.scale} before applying the coordinate basis above.${fits}` +
+        ` Pass maxBytes (up to ${MAX_SCREENSHOT_MAXBYTES / (1024 * 1024)} MiB) for the original.`,
+    };
+  };
+
+  /** Playwright lanes can simply re-capture at the rung's format and scale. */
+  const shrinkViaPlaywright = (
+    capture: (rung: ShrinkRung) => Promise<Buffer>,
+  ): ((rung: ShrinkRung) => Promise<string | null>) =>
+    async (rung) => (await capture(rung)).toString('base64');
+
+  /** Assemble the result parts, appending the shrink note when there is one. */
+  const imageResult = (fitted: FittedImage, basis: string) => ({
+    content: [
+      { type: 'image' as const, data: fitted.data, mimeType: fitted.mimeType },
+      {
+        type: 'text' as const,
+        text: fitted.note ? `${basis}\n\n${fitted.note}` : basis,
+      },
+    ],
+  });
+
   server.tool(
     'browser_screenshot',
     'Screenshot the page or one element as a base64-encoded PNG. Requires browser_open first, even if a browser panel is already visible.',
     BROWSER_SCREENSHOT_SHAPE,
-    async ({ fullPage, ref, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ fullPage, ref, surfaceId, maxBytes }) => withAutomationLease(deps, surfaceId, async (scope) => {
+      const ceiling = clampScreenshotCeilingBytes(maxBytes);
       try {
         // Chrome backend (dogfood P2): browser.screenshot has no chrome lane —
         // whole-page shots go over the resolved Playwright page instead.
@@ -493,15 +613,21 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             // between the two would otherwise mislabel the image.
             const dpr = fullPage ? null : await readDpr(page);
             const buf = await page.screenshot({ ...(fullPage && { fullPage: true }), type: 'png' });
-            return {
-              content: [
-                { type: 'image' as const, data: buf.toString('base64'), mimeType: 'image/png' },
-                {
-                  type: 'text' as const,
-                  text: coordinateBasis(fullPage ? 'fullPage' : 'viewport', dpr),
-                },
-              ],
-            };
+            const fitted = await fitScreenshot(
+              buf.toString('base64'),
+              ceiling,
+              shrinkViaPlaywright((rung) =>
+                page.screenshot({
+                  ...(fullPage && { fullPage: true }),
+                  type: 'jpeg',
+                  quality: rung.quality,
+                  // Playwright scales the whole capture, so the rung's factor
+                  // is exactly the number stated back to the caller.
+                  ...(rung.scale < 1 && { scale: 'css' as const }),
+                }),
+              ),
+            );
+            return imageResult(fitted, coordinateBasis(fullPage ? 'fullPage' : 'viewport', dpr));
           }
         }
         // Try Playwright for element-level screenshots (ref)
@@ -513,12 +639,14 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
               throw new Error(`Could not resolve ref="${ref}" to an element.`);
             }
             const buffer = (await el.screenshot()) as Buffer;
-            return {
-              content: [
-                { type: 'image' as const, data: buffer.toString('base64'), mimeType: 'image/png' as const },
-                { type: 'text' as const, text: coordinateBasis('element', null) },
-              ],
-            };
+            const fitted = await fitScreenshot(
+              buffer.toString('base64'),
+              ceiling,
+              shrinkViaPlaywright((rung) =>
+                el.screenshot({ type: 'jpeg', quality: rung.quality }) as Promise<Buffer>,
+              ),
+            );
+            return imageResult(fitted, coordinateBasis('element', null));
           }
         }
 
@@ -527,21 +655,21 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
           ...(fullPage && { fullPage }),
         });
 
-        return {
-          content: [
-            {
-              type: 'image' as const,
-              data: result.data,
-              mimeType: 'image/png' as const,
-            },
-            {
-              // The RPC lane cannot click by coordinate at all, so telling the
-              // caller how to convert pixels here would contradict itself.
-              type: 'text' as const,
-              text: coordinateBasis(fullPage ? 'fullPage' : 'unsupported', null),
-            },
-          ],
-        };
+        // The daemon re-encodes in the main process (nativeImage): it is the
+        // only place this lane's pixels exist. A daemon that predates the
+        // parameters answers with the same PNG, which fitScreenshot reads as
+        // "no knob" and reports honestly instead of refusing.
+        const fitted = await fitScreenshot(result.data, ceiling, async (rung) => {
+          const shrunk = await sendScopedBrowserRpc<{ data: string; mimeType?: string }>(
+            'browser.screenshot',
+            scope,
+            { ...(fullPage && { fullPage }), format: 'jpeg', quality: rung.quality, scale: rung.scale },
+          );
+          return shrunk.mimeType === 'image/jpeg' ? shrunk.data : null;
+        });
+        // The RPC lane cannot click by coordinate at all, so telling the
+        // caller how to convert pixels here would contradict itself.
+        return imageResult(fitted, coordinateBasis(fullPage ? 'fullPage' : 'unsupported', null));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return {

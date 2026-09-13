@@ -4,6 +4,7 @@ import type {
 } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { inputSchemaDeclaresMaxBytes, wrapHandlerWithResultCap } from './resultCap';
 
 /**
  * Launch-time tool surfaces. A server instance selects exactly one profile and
@@ -208,7 +209,18 @@ export function registerWmuxTools(
           description: spec.description,
           inputSchema: toolInputSchema(spec),
         },
-        (input: Record<string, unknown>) => spec.invoke(input, context),
+        // Result-size guard (src/mcp/resultCap.ts): every catalog tool's TEXT
+        // result is capped at 64 KiB head+tail unless the tool's input schema
+        // declares a `maxBytes` the caller set. The wrapped callback is passed
+        // through UNADAPTED on purpose: it carries the guard's idempotency
+        // mark, so the legacy-lane wrapper in createWmuxServer (which also
+        // patches server.registerTool) recognizes it and skips a second wrap
+        // instead of truncating twice. The marker names the raise path only
+        // when this spec's schema actually declares maxBytes.
+        wrapHandlerWithResultCap(
+          (parsed: Record<string, unknown>) => spec.invoke(parsed, context),
+          { declaresMaxBytes: inputSchemaDeclaresMaxBytes(spec.inputSchema) },
+        ),
       ),
     ),
   );
