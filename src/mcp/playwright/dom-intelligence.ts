@@ -939,6 +939,16 @@ export function getSmartElementByRef(ref: number): IndexedElement | null {
 }
 
 /**
+ * Every element the last smart snapshot listed, when that snapshot was taken on
+ * `page`; empty otherwise. A record from another page — or from the RPC lane,
+ * which has no page — says nothing about this one.
+ */
+export function listSmartElementsOnPage(page: Page): readonly IndexedElement[] {
+  const record = getSnapshotRecord();
+  return record.page === page ? record.elements : [];
+}
+
+/**
  * The same, but only when the smart snapshot was taken on `page`.
  *
  * For the ref-space hint in browser_type / browser_fill: "that number IS live

@@ -189,12 +189,12 @@ const BROWSER_REPL_DESCRIPTION =
   '{text, events} (+ refs:[{ref,param,role,name}] for snapshot/smart_snapshot, diff text, all refs; ' +
   'pass refs[i].ref as the arg named refs[i].param). A failed step throws (catchable). ' +
   `Allowed: ${BROWSER_REPL_TOOLS.join(', ')}. ` +
-  'Args for the steps whose standalone tools are unlisted: navigate_back() hover(ref) drag(sourceRef,targetRef) ' +
+  'Args for the steps whose standalone tools are unlisted: navigate_back() hover(ref) drag(sourceRef,targetRef|path) ' +
   'select(ref,values) scroll_into_view(ref) highlight(ref) dialog(accept,text). ' +
   'Other browser_* tools stay separate calls. Top-level await works; state persists between calls ' +
   'until a timeout kills the runtime, but let/const inside an awaiting snippet do not — assign to ' +
   'globalThis to keep a value. console.log is captured; sleep(ms) is available. ' +
-  'Every step still records to the action trace for browser_replay.';
+  'Steps record to the action trace for browser_replay, except path drags, point wheels and modifier gestures.';
 
 // Per-call text-result cap, honoured by the dispatch-layer guard
 // (src/mcp/resultCap.ts). Plain z.number(): the guard floors and clamps the
