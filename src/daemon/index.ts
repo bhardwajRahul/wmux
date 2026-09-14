@@ -1,3 +1,4 @@
+import { recoveryCwd, isWslShell } from '../shared/wsl';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -727,6 +728,7 @@ function resumeLaunchCommand(
   session: {
     id: string;
     exec?: { command: string };
+    cmd?: string;
     cwd: string;
     resumeBinding?: ResumeBinding;
     supervision?: { restorePermissionMode?: boolean };
@@ -734,7 +736,7 @@ function resumeLaunchCommand(
   spoolBinding?: ResumeBinding,
 ): string | undefined {
   if (!session.exec) return undefined;
-  if (!fs.existsSync(session.cwd)) return undefined; // cwd gone → fresh, not wrong-target resume
+  if (!isWslShell(session.cmd) && !fs.existsSync(session.cwd)) return undefined; // cwd gone → fresh, not wrong-target resume
   // Prefer the persisted binding; fall back to a spool-captured one (the live
   // capture RPC failed, so the exact id only survived in the spool) so an exec
   // agent pane replays as `--resume <id>` instead of an ambiguous `--continue`.
@@ -1321,6 +1323,22 @@ async function recoverSessions(
       }
       continue;
     }
+    // Publish every WSL placeholder, including cap-skipped panes. Boot must
+    // publish RPC/panes without
+    // waiting for a cold distro, and one unavailable target must not lose its
+    // identity, binding or snapshot. Attach/promote retries asynchronously.
+    if (isWslShell(session.cmd)) {
+      if (!rebooted && session.state !== 'suspended' && recoverableIds.has(session.id)) {
+        await reapIfIdentityConfirmed({ pid: session.pid, cmd: session.cmd,
+          storedStartTime: session.pidStartTime, reason: `WSL recovery of ${session.id}` });
+      }
+      session.state = 'suspended';
+      session.bufferDumpPath ??= stateWriter.getBufferDumpPath(session.id);
+      sessionManager.keepPendingRecovery(session, session.recoveryError || 'WSL session is waiting to reconnect.');
+      changed = true;
+      continue;
+    }
+
     // Cap-skipped: leave session untouched in state.sessions. It will be
     // re-evaluated on the next launch.
     if (!recoverableIds.has(session.id)) continue;
@@ -1345,7 +1363,7 @@ async function recoverSessions(
         );
 
         // Verify cwd still exists; fall back to homedir
-        const cwd = fs.existsSync(session.cwd) ? session.cwd : os.homedir();
+        const cwd = recoveryCwd(session);
 
         // ConPTY on Windows occasionally rejects the first spawn after a
         // daemon restart with ERROR_INVALID_PARAMETER (87) — a known
@@ -1367,9 +1385,10 @@ async function recoverSessions(
         let lastSpawnErr: unknown;
         for (let attempt = 1; attempt <= RECOVERY_PTY_RETRIES; attempt++) {
           try {
-            recovered = sessionManager.createSession({
+            recovered = await sessionManager.createSessionAsync({
               id: session.id,
             cmd: session.cmd,
+            wslTarget: session.wslTarget,
           ...(session.args ? { args: session.args } : {}),
             cwd,
             // Replay the ORIGINAL spawn directory. `cwd` above is the LIVE one
@@ -1457,11 +1476,12 @@ async function recoverSessions(
       if (fs.existsSync(snapshotPath)) {
         try {
           const scrollbackData = fs.readFileSync(snapshotPath);
-          const cwd = fs.existsSync(session.cwd) ? session.cwd : os.homedir();
+          const cwd = recoveryCwd(session);
 
-          const recovered = sessionManager.createSession({
+          const recovered = await sessionManager.createSessionAsync({
             id: session.id,
             cmd: session.cmd,
+            wslTarget: session.wslTarget,
           ...(session.args ? { args: session.args } : {}),
             cwd,
             // Replay the ORIGINAL spawn directory. `cwd` above is the LIVE one
@@ -1509,10 +1529,11 @@ async function recoverSessions(
       // This handles cases where the daemon was killed before
       // the 30s snapshot interval fired (e.g. immediate reboot).
       try {
-        const cwd = fs.existsSync(session.cwd) ? session.cwd : os.homedir();
-        const recovered = sessionManager.createSession({
+        const cwd = recoveryCwd(session);
+        const recovered = await sessionManager.createSessionAsync({
           id: session.id,
           cmd: session.cmd,
+          wslTarget: session.wslTarget,
           ...(session.args ? { args: session.args } : {}),
           cwd,
           // Replay the ORIGINAL spawn directory. `cwd` above is the LIVE one
@@ -1579,7 +1600,7 @@ async function recoverSessions(
     // any session the recovery cap excluded — which stays suspended).
     const liveState = buildState(sessionManager);
     const preservedFromState = state.sessions.filter(
-      (s) => !recoveredIds.has(s.id),
+      (s) => !liveState.sessions.some((live) => live.id === s.id),
     );
     liveState.sessions.push(...preservedFromState);
     stateWriter.saveImmediate(liveState);
@@ -1657,12 +1678,12 @@ async function recoverSessions(
  * and backs off. On failure the dead tombstone is re-inserted so the
  * session keeps existing for sessions.json, the badge, and rearm.
  */
-function restartSupervisedSession(
+async function restartSupervisedSession(
   id: string,
   sessionManager: DaemonSessionManager,
   stateWriter: StateWriter,
   processMonitor: ProcessMonitor,
-): void {
+): Promise<void> {
   const managed = sessionManager.getSession(id);
   if (!managed) throw new Error(`restart: session '${id}' not found`);
   if (managed.meta.state !== 'dead') {
@@ -1673,7 +1694,9 @@ function restartSupervisedSession(
   const replay = {
     id: meta.id,
     cmd: meta.cmd,
-    cwd: fs.existsSync(meta.cwd) ? meta.cwd : os.homedir(),
+    wslTarget: meta.wslTarget,
+    args: meta.args,
+    cwd: recoveryCwd(meta),
     // Replay the ORIGINAL spawn directory; `cwd` above is the live, OSC
     // 7-tracked one. See createSession's `spawnCwd`.
     spawnCwd: meta.spawnCwd,
@@ -1694,9 +1717,9 @@ function restartSupervisedSession(
   sessionManager.removeTombstone(id);
   let recovered;
   try {
-    recovered = sessionManager.createSession(replay);
+    recovered = await sessionManager.createSessionAsync(replay);
   } catch (err) {
-    sessionManager.reinsertSession(managed);
+    if (!shuttingDown && !(err instanceof Error && err.message === 'Session creation cancelled')) sessionManager.reinsertSession(managed);
     throw err;
   }
 
@@ -1802,9 +1825,10 @@ function registerRpcHandlers(
     if (p.args !== undefined && !isWslDistroSpawnArgs(p.cmd, p.args)) {
       throw new Error('Invalid session args: expected [\'-d\', wsl-distro] for a wsl.exe cmd');
     }
-    const session = sessionManager.createSession({
+    const session = await sessionManager.createSessionAsync({
       id: p.id,
       cmd: p.cmd,
+      wslTarget: p.wslTarget,
       args: p.args,
       cwd: p.cwd,
       env: p.env,
@@ -1978,6 +2002,10 @@ function registerRpcHandlers(
   // daemon.attachSession
   pipeServer.onRpc('daemon.attachSession', async (params) => {
     const p = params as unknown as DaemonSessionIdParams;
+    if (sessionManager.getPendingRecovery(p.id)) {
+      const result = await promoteOnce(p.id);
+      if (!result.ok) throw new Error(result.error?.message || 'WSL recovery failed; retry after checking the target');
+    }
     sessionManager.attachSession(p.id);
 
     // Create and start SessionPipe for data streaming
@@ -2337,7 +2365,9 @@ function registerRpcHandlers(
   // came back with its ptyId absent and reconcile destructively cleared it. This
   // lets the renderer spawn exactly the one session it still needs, keeping the
   // ptyId stable so scrollback restores from the daemon's ring buffer.
-  pipeServer.onRpc('daemon.promoteSession', async (rawParams) => {
+  const promotionInFlight = new Map<string, Promise<{ ok: boolean; alreadyActive?: boolean; error?: { code: string; message: string } }>>();
+  const promoteSession = async (rawParams: Record<string, unknown>) => {
+    if (shuttingDown) return { ok: false, error: { code: 'SHUTTING_DOWN', message: 'Daemon is shutting down; retry after reconnect.' } };
     const params = (rawParams ?? {}) as Record<string, unknown>;
     const sessionId = typeof params['id'] === 'string' ? params['id'] : '';
     if (!sessionId) {
@@ -2351,7 +2381,7 @@ function registerRpcHandlers(
     }
 
     const state = stateWriter.load();
-    const session = state.sessions.find((s) => s.id === sessionId && s.state === 'suspended');
+    const session = sessionManager.getPendingRecovery(sessionId) ?? state.sessions.find((s) => s.id === sessionId && s.state === 'suspended');
     if (!session) {
       return { ok: false, error: { code: 'NOT_FOUND', message: `No suspended session with id ${sessionId}` } };
     }
@@ -2363,16 +2393,17 @@ function registerRpcHandlers(
       if (session.bufferDumpPath && fs.existsSync(session.bufferDumpPath)) {
         scrollbackData = fs.readFileSync(session.bufferDumpPath);
       }
-      const cwd = fs.existsSync(session.cwd) ? session.cwd : os.homedir();
+      const cwd = recoveryCwd(session);
 
       const PROMOTE_RETRIES = 4;
       let promoted: ReturnType<typeof sessionManager.createSession> | undefined;
       let lastErr: unknown;
       for (let attempt = 1; attempt <= PROMOTE_RETRIES; attempt++) {
         try {
-          promoted = sessionManager.createSession({
+          promoted = await sessionManager.createSessionAsync({
             id: session.id,
             cmd: session.cmd,
+            wslTarget: session.wslTarget,
           ...(session.args ? { args: session.args } : {}),
             cwd,
             spawnCwd: session.spawnCwd,
@@ -2385,6 +2416,7 @@ function registerRpcHandlers(
             lastActivity: session.lastActivity,
             deadTtlHours: session.deadTtlHours,
             exec: session.exec,
+            execLaunchCommand: resumeLaunchCommand(session, readResumeSpoolMap().get(session.id)),
             supervision: session.supervision,
             scrollbackData,
             deferOutput: true,
@@ -2413,6 +2445,20 @@ function registerRpcHandlers(
         }
       });
 
+      const fresh = sessionManager.getSession(sessionId);
+      if (fresh) {
+        fresh.meta.resumeBinding = session.resumeBinding;
+        fresh.meta.lastDetectedAgent = session.lastDetectedAgent;
+        const offer = resumeOfferForRecovered(fresh.meta);
+        if (offer) recoveredAgentShellIds.set(sessionId, offer as AgentSlug);
+        if (session.resumeBinding && normalizeResumeCwd(session.resumeBinding.cwd) === normalizeResumeCwd(fresh.meta.cwd)
+          && (isWslShell(session.cmd) || bindingTranscriptLives(session.resumeBinding))) {
+          recoveredResumeBindings.set(sessionId, session.resumeBinding);
+        }
+      }
+      if (promoted.supervision) paneSupervisor.arm(sessionId, promoted.supervision, promoted.supervision.status);
+      stateWriter.saveImmediate(buildState(sessionManager));
+
       if (session.bufferDumpPath) {
         try { fs.unlinkSync(session.bufferDumpPath); } catch { /* ignore */ }
       }
@@ -2422,9 +2468,33 @@ function registerRpcHandlers(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log('error', `[promote] Failed to promote session ${sessionId}: ${msg}`);
+      if (isWslShell(session.cmd) && !shuttingDown && sessionManager.getPendingRecovery(sessionId)) {
+        sessionManager.keepPendingRecovery(session, msg);
+        stateWriter.saveImmediate(buildState(sessionManager));
+      }
       return { ok: false, error: { code: 'SPAWN_FAILED', message: msg } };
     }
+  };
+  const promoteOnce = (id: string) => {
+    const existing = promotionInFlight.get(id);
+    if (existing) return existing;
+    const operation = promoteSession({ id }).finally(() => promotionInFlight.delete(id));
+    promotionInFlight.set(id, operation);
+    return operation;
+  };
+  pipeServer.onRpc('daemon.promoteSession', (params) => promoteOnce(String(params?.id ?? '')));
+  // Defer cold WSL starts until RPC registration/event wiring can finish.
+  // Independent panes recover concurrently; foreground attach shares the same
+  // in-flight promotion. Exec units also resume when no GUI is attached.
+  setImmediate(() => {
+    if (shuttingDown) return;
+    const pending = sessionManager.listSessions().filter(s => sessionManager.getPendingRecovery(s.id));
+    const selected = selectRecoverableSessions(pending, Math.min(loadConfig().session.maxSessions, MAX_RECOVER_SESSIONS));
+    for (const session of pending.filter(s => selected.recoverableIds.has(s.id))) {
+      void promoteOnce(session.id).catch(err => log('error', `WSL background recovery ${session.id}:`, err));
+    }
   });
+
 
   // wmux web (read-only-by-default browser terminal). Lives in the daemon so it
   // can tee the NON-exclusive DaemonPTYBridge without contending with the GUI's
@@ -4980,6 +5050,7 @@ async function shutdown(
 ): Promise<{ stateSaved: boolean }> {
   if (shuttingDown) return { stateSaved: false };
   shuttingDown = true;
+  sessionManager.cancelPendingCreates();
   log('info', `Received ${signal} — shutting down gracefully`);
 
   // Tear down the wmux web server first (best-effort) so its HTTP listener +
@@ -5107,7 +5178,7 @@ async function shutdown(
   const stateSaveStart = phaseStartedAt();
   const suspendState: DaemonState = {
     version: 1,
-    sessions: managedSessions.map((m) => ({ ...m.meta })),
+    sessions: sessionManager.listSessions(),
     bootId: cachedBootId,
   };
   // saveImmediate is non-throwing (returns false on write failure). Capture
@@ -6300,7 +6371,7 @@ async function main(): Promise<void> {
         if (!cachedBootId) cachedBootId = getBootIdSync();
         const suspendState: DaemonState = {
           version: 1,
-          sessions: managed.map((m) => ({ ...m.meta })),
+          sessions: sessionManager.listSessions(),
           bootId: cachedBootId,
         };
         stateWriter.saveImmediate(suspendState);

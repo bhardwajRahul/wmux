@@ -49,7 +49,7 @@ describe('pty.handler PTY_PROMOTE — renderer→daemon hop', () => {
 
   it('forwards to daemon.promoteSession and normalizes the reply the renderer reads', () => {
     const region = promoteRegion();
-    expect(region).toMatch(/daemonClient\.rpc\('daemon\.promoteSession', \{ id \}\)/);
+    expect(region).toMatch(/daemonClient\.rpc\('daemon\.promoteSession', \{ id \}, \{ timeoutMs: WSL_RPC_TIMEOUT_MS \}\)/);
     expect(region).toMatch(/if \(res\.ok\) return \{ success: true \}/);
     // A failure must carry a message, or reconcile logs `undefined` and the
     // operator cannot tell a cap hit from a spawn crash.
@@ -73,7 +73,7 @@ describe('daemon.promoteSession — guards', () => {
   const source = fs.readFileSync(path.join(srcRoot, 'daemon', 'index.ts'), 'utf-8');
 
   function promoteRegion(): string {
-    const start = source.indexOf("pipeServer.onRpc('daemon.promoteSession'");
+    const start = source.indexOf("const promoteSession = async");
     expect(start, 'daemon.promoteSession not registered').toBeGreaterThanOrEqual(0);
     const end = source.indexOf('pipeServer.onRpc(', start + 1);
     return source.slice(start, end > 0 ? end : start + 6000);
@@ -115,7 +115,7 @@ describe('daemon.promoteSession — guards', () => {
   });
 
   it('falls back to the home directory when the recorded cwd is gone', () => {
-    expect(promoteRegion()).toMatch(/fs\.existsSync\(session\.cwd\) \? session\.cwd : os\.homedir\(\)/);
+    expect(promoteRegion()).toMatch(/recoveryCwd\(session\)/);
   });
 
   it('reports a spawn failure as a structured error instead of throwing at the pipe', () => {
@@ -125,6 +125,22 @@ describe('daemon.promoteSession — guards', () => {
   it('starts process monitoring for the promoted session', () => {
     // Without this the promoted pane would never be marked dead when it exits.
     expect(promoteRegion()).toMatch(/processMonitor\.watch\(/);
+  });
+
+  it('restores a non-WSL cap-skipped session with the same parity as boot recovery', () => {
+    const region = promoteRegion();
+    const createAt = region.indexOf('sessionManager.createSessionAsync(');
+    const armAt = region.indexOf('paneSupervisor.arm(sessionId');
+    const saveAt = region.indexOf('stateWriter.saveImmediate(buildState(sessionManager))');
+    expect(createAt).toBeGreaterThanOrEqual(0);
+    expect(armAt).toBeGreaterThan(createAt);
+    expect(saveAt).toBeGreaterThan(armAt);
+    // Exec units replay `--resume <id>` like boot recovery does.
+    expect(region).toMatch(/execLaunchCommand: resumeLaunchCommand\(session, /);
+    // The resume binding is exposed off-WSL too, gated on a live transcript.
+    expect(region).toMatch(/isWslShell\(session\.cmd\) \|\| bindingTranscriptLives\(session\.resumeBinding\)/);
+    // None of the above is fenced behind a WSL-only branch.
+    expect(region.slice(createAt, saveAt)).not.toMatch(/if \(isWslShell\(session\.cmd\)\)/);
   });
 
   it('daemon.listSessions appends suspended entries ONLY when asked', () => {

@@ -1,3 +1,4 @@
+import { WSL_RPC_TIMEOUT_MS } from '../../../shared/wsl';
 import { ipcMain, BrowserWindow } from 'electron';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -41,10 +42,11 @@ import {
 import type { DaemonSupervisionPolicy } from '../../../shared/rpc';
 import type { ResumeBinding } from '../../../shared/agentResume';
 import { createDeadPaneRecovery, type DeadPaneRecovery } from '../../../shared/ptyRecovery';
-import { resolvePtyCreateCwd, type PtyCwdSource } from '../../pty/resolvePtyCwd';
+import { isWslShell, type WslTarget } from '../../../shared/wsl';
+import { resolvePtyCreateCwdForShell, type PtyCwdSource } from '../../pty/resolvePtyCwd';
 import { FANOUT_TASK_PORT_ENV } from '../../worktask/fanoutEnvironment';
 import { agentDisplayToSlug } from '../../../shared/agentIdentity';
-import { wslDistroArgs } from '../../../shared/wslDistro';
+import { wslDistroArgs, isWslDistroSpawnArgs } from '../../../shared/wslDistro';
 import { getDefaultWslDistro } from '../../pty/defaultWslDistro';
 import { SessionPromptScheduler } from '../../pty/SessionPromptScheduler';
 import {
@@ -100,9 +102,9 @@ interface PtyCreateSupervisionInput {
 type PtyCreateOptions = {
   shell?: string;
   cwd?: string;
-  /** Dead-session replacement candidates. Main validates spawnCwd, then cwd;
+  /** Dead-session replacement candidates. WSL validates inside its distro;
    * neither value is trusted merely because it came from the renderer. */
-  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd'>;
+  recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'wslTarget' | 'args' | 'sourceSessionId'>;
   cols?: number;
   rows?: number;
   workspaceId?: string;
@@ -369,17 +371,28 @@ export function registerPTYHandlers(
           ? resolveSupervisionPolicy(options.supervision)
           : undefined;
 
-      const cwdResolution = resolvePtyCreateCwd(options?.cwd, options?.recoveryCwds);
-      const safeCwd = cwdResolution.safeCwd;
-      const effectiveCwd = safeCwd ?? require('os').homedir();
       // Daemon-mode default shell. On Windows prefer PowerShell 7 over 5.1 via
       // ShellDetector (issue #176) — mirrors PTYManager.getDefaultShell() so
       // both modes pick the same default.
       const shell = options?.shell || (process.platform === 'win32' ? new ShellDetector().getDefault() : (process.env.SHELL || '/bin/bash'));
+      const cwdResolution = resolvePtyCreateCwdForShell(options?.cwd, options?.recoveryCwds, shell);
+      const safeCwd = cwdResolution.safeCwd;
+      let effectiveCwd = safeCwd ?? (isWslShell(shell) ? '~' : require('os').homedir());
       // #1103 — the renderer's WSL distro choice, applied at the one place
       // the effective shell is known. Non-wsl shells and no-choice both yield
       // undefined (today's behaviour).
-      const wslArgs = wslDistroArgs(shell, getDefaultWslDistro());
+      // A renderer may name a dead session, but cannot supply its distro/user.
+      // Ordinary new panes always use the settings picker.
+      const recoveryId = options?.recoveryCwds?.sourceSessionId;
+      // WSL-only: non-WSL replacements never read distro/user from the dead
+      // session, so they must not pay for (or fail on) this lookup.
+      const recoverySessions = recoveryId && isWslShell(shell)
+        ? await daemonClient.rpc('daemon.listSessions', {}) as Array<{ id: string; state: string; cmd: string; args?: string[]; wslTarget?: WslTarget }>
+        : [];
+      const trustedRecovery = recoverySessions.find(s => s.id === recoveryId && s.state === 'dead' && isWslShell(s.cmd));
+      const wslArgs = isWslDistroSpawnArgs(shell, trustedRecovery?.args)
+        ? [...trustedRecovery.args]
+        : wslDistroArgs(shell, getDefaultWslDistro());
 
       // Generate a unique session ID
       const crypto = require('crypto');
@@ -497,12 +510,16 @@ export function registerPTYHandlers(
         cmd: shell,
         ...(wslArgs ? { args: wslArgs } : {}),
         cwd: effectiveCwd,
+        wslTarget: trustedRecovery?.wslTarget,
         cols: options?.cols || 80,
         rows: options?.rows || 24,
         env: resolvedEnv,
         ...(execCommand !== undefined ? { exec: { command: execCommand } } : {}),
         ...(supervisionPolicy !== undefined ? { supervision: supervisionPolicy } : {}),
-      });
+      }, isWslShell(shell) ? { timeoutMs: WSL_RPC_TIMEOUT_MS } : undefined);
+
+      const createdCwd = (result as { cwd?: string })?.cwd;
+      if (isWslShell(shell) && createdCwd) effectiveCwd = createdCwd;
 
       // Attach to the session (makes daemon start the SessionPipe server)
       await daemonClient.rpc('daemon.attachSession', { id: sessionId });
@@ -568,7 +585,7 @@ export function registerPTYHandlers(
       return { id: sessionId, shell, cwd: effectiveCwd };
     }));
   } else {
-    ipcMain.handle(IPC.PTY_CREATE, wrapHandler(IPC.PTY_CREATE, (_event: Electron.IpcMainInvokeEvent, options?: PtyCreateOptions) => {
+    ipcMain.handle(IPC.PTY_CREATE, wrapHandler(IPC.PTY_CREATE, async (_event: Electron.IpcMainInvokeEvent, options?: PtyCreateOptions) => {
       if (options?.shell !== undefined && !isAllowedShell(options.shell)) {
         throw new Error(`PTY_CREATE: shell not allowed: ${options.shell}`);
       }
@@ -595,7 +612,12 @@ export function registerPTYHandlers(
         }
       }
 
-      const cwdResolution = resolvePtyCreateCwd(options?.cwd, options?.recoveryCwds);
+      // Same default-shell resolution as the daemon branch (issue #176), so
+      // the distro injection below sees the shell PTYManager will actually
+      // spawn even when the caller omitted one.
+      const shell = options?.shell
+        || (process.platform === 'win32' ? new ShellDetector().getDefault() : (process.env.SHELL || '/bin/bash'));
+      const cwdResolution = resolvePtyCreateCwdForShell(options?.cwd, options?.recoveryCwds, shell);
       const safeCwd = cwdResolution.safeCwd;
       const effectiveCwd = safeCwd ?? undefined;
       // Split off initialCommand — it's written into the shell post-create, not
@@ -603,18 +625,13 @@ export function registerPTYHandlers(
       // must not reach ptyManager.create, so build a clean spawn-options object
       // from only the local-relevant fields instead of spreading the payload.
       const { initialCommand, cols, rows, workspaceId, surfaceId, env, spawnKind } = options ?? {};
-      // Same default-shell resolution as the daemon branch (issue #176), so
-      // the distro injection below sees the shell PTYManager will actually
-      // spawn even when the caller omitted one.
-      const shell = options?.shell
-        || (process.platform === 'win32' ? new ShellDetector().getDefault() : (process.env.SHELL || '/bin/bash'));
       // #1103 — same distro injection as the daemon branch, so both modes
       // boot the same WSL distro for the same setting.
       const wslArgs = wslDistroArgs(shell, getDefaultWslDistro());
-      const instance = ptyManager.create({ shell, ...(wslArgs ? { shellArgs: wslArgs } : {}), cols, rows, workspaceId, surfaceId, env, cwd: effectiveCwd, spawnKind });
+      const instance = await ptyManager.createAsync({ shell, ...(wslArgs ? { shellArgs: wslArgs } : {}), cols, rows, workspaceId, surfaceId, env, cwd: effectiveCwd, spawnKind });
       logCwdResolution(instance.id, cwdResolution.incomingCwd, safeCwd, cwdResolution.source);
       ptyBridge.setupDataForwarding(instance.id);
-      const actualCwd = effectiveCwd || require('os').homedir();
+      const actualCwd = instance.cwd || effectiveCwd || require('os').homedir();
       updateCwd(instance.id, actualCwd);
       // Startup command: gate on the shell's first output (one-shot onData)
       // so it lands at a ready prompt, mirroring the daemon path. ptyManager
@@ -950,6 +967,8 @@ export function registerPTYHandlers(
         resumeAgent?: string;
         // X6 ③ — the captured resume binding (origin id + cwd + permission mode),
         // surfaced alongside resumeAgent (recovery-only, cwd-matched) for the pill.
+        args?: string[];
+        wslTarget?: WslTarget;
         resumeBinding?: ResumeBinding;
         // OSC 133 — true = a foreground command owns the PTY, false = at a shell
         // prompt, undefined = no shell integration. The resume chip's authoritative
@@ -1010,6 +1029,8 @@ export function registerPTYHandlers(
           ...(s.resumeAgent ? { resumeAgent: s.resumeAgent } : {}),
           // X6 ③ — carry the binding so the pill can build `--resume <id>`.
           ...(s.resumeBinding ? { resumeBinding: s.resumeBinding } : {}),
+          ...(s.args ? { args: s.args } : {}),
+          ...(s.wslTarget ? { wslTarget: s.wslTarget } : {}),
           // OSC 133 shell state — the resume chip's authoritative gate. Only
           // present when shell integration emits markers (else undefined → the
           // renderer falls back to its activity heuristic).
@@ -1045,7 +1066,7 @@ export function registerPTYHandlers(
     ipcMain.removeHandler(IPC.PTY_PROMOTE);
     ipcMain.handle(IPC.PTY_PROMOTE, wrapHandler(IPC.PTY_PROMOTE, async (_event: Electron.IpcMainInvokeEvent, id: string) => {
       if (!id) return { success: false, error: 'id is required' };
-      const res = await daemonClient.rpc('daemon.promoteSession', { id }) as { ok: boolean; error?: { message: string } };
+      const res = await daemonClient.rpc('daemon.promoteSession', { id }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; error?: { message: string } };
       if (res.ok) return { success: true };
       return { success: false, error: res.error?.message ?? 'promote failed' };
     }));
@@ -1060,9 +1081,11 @@ export function registerPTYHandlers(
           cwd?: string;
           spawnCwd?: string;
           resumeAgent?: string;
+          args?: string[];
+          wslTarget?: WslTarget;
           resumeBinding?: ResumeBinding;
         }>;
-        const session = sessions.find(s => s.id === id);
+        let session = sessions.find(s => s.id === id);
         if (!session || session.state === 'dead') {
           // RCA A1 — permanent failure: the daemon authoritatively reports the
           // session as absent or dead. Safe for the renderer to clear the
@@ -1075,6 +1098,17 @@ export function registerPTYHandlers(
             transient: false,
             ...(session ? { recovery: createDeadPaneRecovery(session) } : {}),
           };
+        }
+
+        if (session.state === 'suspended') {
+          try {
+            const result = await daemonClient.rpc('daemon.promoteSession', { id }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; error?: { message: string } };
+            if (!result.ok) return { success: false, recoveryPending: true, error: result.error?.message || 'WSL recovery failed. Check the target and retry.' };
+            const refreshed = await daemonClient.rpc('daemon.listSessions', {}) as typeof sessions;
+            session = refreshed.find(s => s.id === id) ?? session;
+          } catch (err) {
+            return { success: false, recoveryPending: true, error: err instanceof Error ? err.message : String(err) };
+          }
         }
 
         // 재접속 시 cwd를 즉시 복원한다(owner-reported: 앱 재시작 후 워크스페이스

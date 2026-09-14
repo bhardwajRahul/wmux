@@ -177,7 +177,7 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
       window.electronAPI.pty.create(withWorkspaceProfile(withDefaultShell({
         shell,
         ...(deadPaneRecovery
-          ? { recoveryCwds: { spawnCwd: deadPaneRecovery.spawnCwd, cwd: deadPaneRecovery.cwd } }
+          ? { recoveryCwds: { spawnCwd: deadPaneRecovery.spawnCwd, cwd: deadPaneRecovery.cwd, wslTarget: deadPaneRecovery.wslTarget, args: deadPaneRecovery.args, sourceSessionId: deadPaneRecovery.sourceSessionId } }
           : { cwd: respawnCwd }),
         cols,
         rows,
@@ -240,7 +240,19 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
   // `isActive` for the stacked/tab case (one tab visible at a time).
   const shown = visible ?? isActive;
   const isVisible = isWorkspaceVisible && shown;
-  const { terminal: terminalRef, terminalInstance, findNext, findPrevious, clearSearch } = useTerminal(containerRef, { ptyId, isVisible, scrollbackFile, onFirstData: scrollbackFile ? handleFirstData : undefined, onContextMenu: handleContextMenu,
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [retryingRecovery, setRetryingRecovery] = useState(false);
+  useEffect(() => { setRecoveryError(null); }, [ptyId]);
+  const retryRecovery = async () => {
+    if (!ptyId || retryingRecovery) return;
+    setRetryingRecovery(true);
+    try {
+      // Reuse the hook's full attach path, including geometry and unmuting.
+      await retryConnection();
+    } catch (error) { setRecoveryError(String(error)); }
+    finally { setRetryingRecovery(false); }
+  };
+  const { terminal: terminalRef, terminalInstance, findNext, findPrevious, clearSearch, retryConnection } = useTerminal(containerRef, { onRecoveryError: setRecoveryError, ptyId, isVisible, scrollbackFile, onFirstData: scrollbackFile ? handleFirstData : undefined, onContextMenu: handleContextMenu,
     // Only the pane-surface terminal owns ⌘G / Ctrl+G: useComposeShortcut
     // acts on the active leaf's pty, which is what this component renders.
     // FloatingPane and Deck's BrainTerminalEmbed deliberately do NOT opt in —
@@ -407,6 +419,16 @@ export default function TerminalComponent({ ptyId: externalPtyId, shell, cwd, on
         position: 'relative',
       }}
     >
+      {recoveryError && (
+        <div role="alert" className="absolute inset-x-2 top-2 z-20 rounded border border-[var(--border)] bg-[var(--bg-base)] p-3 text-sm text-[var(--text-primary)]">
+          <p className="break-words">{recoveryError}</p>
+          <p className="mt-1 text-[var(--text-muted)]">Your session and saved scrollback are retained.</p>
+          <button type="button" disabled={retryingRecovery} onClick={() => void retryRecovery()}
+            className="mt-2 rounded border border-[var(--border)] px-3 py-1 disabled:opacity-50">
+            {retryingRecovery ? 'Reconnecting…' : 'Retry connection'}
+          </button>
+        </div>
+      )}
       {/* Session restore overlay */}
       {restoring && (
         <div className="absolute inset-0 flex items-center justify-center text-[var(--text-muted)] text-sm font-mono z-10 pointer-events-none">

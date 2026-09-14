@@ -1,3 +1,7 @@
+import { isWslShell, resolveWslCwd, type WslTarget, type ResolvedWslCwd } from '../../shared/wsl';
+import { buildWslInjection } from '../../shared/wslIntegration';
+import { BASH_INIT } from '../../daemon/shell-integration';
+import { getWmuxDir } from '../../daemon/config';
 import * as pty from 'node-pty';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -21,6 +25,7 @@ export interface PTYInstance {
   id: string;
   process: pty.IPty;
   shell: string;
+  cwd?: string;
   /**
    * Workspace this PTY belongs to. Captured at create time so the EventBus
    * can scope process.* events without consulting the renderer state.
@@ -128,7 +133,34 @@ export class PTYManager {
     return { args, env };
   }
 
-  create(options?: {
+  private createGeneration = 0;
+
+  create(options?: Parameters<PTYManager['spawnPrepared']>[0]): PTYInstance {
+    if (isWslShell(options?.shell || this.getDefaultShell())) throw new Error('WSL creation requires createAsync');
+    return this.spawnPrepared(options);
+  }
+
+  async createAsync(options?: Parameters<PTYManager['spawnPrepared']>[0]): Promise<PTYInstance> {
+    const shell = options?.shell || this.getDefaultShell();
+    if (!isWslShell(shell)) return this.create(options);
+    const generation = this.createGeneration;
+    // Reserve the id before the (slow) WSL probe so dispose(id) inside the
+    // pending window cancels the spawn instead of leaving an orphan PTY.
+    const id = `pty-${++this.nextId}`;
+    this.pendingCreates.add(id);
+    try {
+      const wsl = await resolveWslCwd(shell, options?.cwd, options?.wslTarget, undefined, options?.shellArgs);
+      if (generation !== this.createGeneration || !this.pendingCreates.has(id)) throw new Error('PTY creation cancelled');
+      return this.spawnPrepared({ ...options, shell }, wsl, id);
+    } finally {
+      this.pendingCreates.delete(id);
+    }
+  }
+
+  /** Ids reserved by createAsync whose WSL probe has not finished yet. */
+  private pendingCreates = new Set<string>();
+
+  private spawnPrepared(options?: {
     shell?: string;
     /**
      * #1103 — validated WSL distro selection (`['-d', '<name>']`), prepended
@@ -137,6 +169,7 @@ export class PTYManager {
      */
     shellArgs?: string[];
     cwd?: string;
+    wslTarget?: WslTarget;
     cols?: number;
     rows?: number;
     workspaceId?: string;
@@ -149,15 +182,16 @@ export class PTYManager {
      * 'user-shell'만 env 투과, 나머지·미지정은 fail-closed로 gated.
      */
     spawnKind?: SpawnKind;
-  }): PTYInstance {
+  }, wsl?: ResolvedWslCwd, reservedId?: string): PTYInstance {
     if (this.instances.size >= MAX_PTY_INSTANCES) {
       throw new Error('Maximum PTY instances reached');
     }
-    const id = `pty-${++this.nextId}`;
+    const id = reservedId ?? `pty-${++this.nextId}`;
     const shell = options?.shell || this.getDefaultShell();
     // Same reason as the daemon spawn path: a caller-supplied cwd may carry a
     // leading `~` that no shell expanded.
-    const cwd = options?.cwd ? expandTilde(options.cwd) : os.homedir();
+    const cwd = wsl?.cwd ?? (options?.cwd ? expandTilde(options.cwd) : os.homedir());
+    const hostCwd = wsl ? os.homedir() : cwd;
 
     // Filter out sensitive and build-only variables to prevent leaking
     // internal state to child processes. Shared with DaemonSessionManager
@@ -216,18 +250,10 @@ export class PTYManager {
 
     // Detect shell type and inject hook
     const shellType = this.detectShellType(shell);
-    // #1103 — when a distro selection is present the shell is wsl.exe, which
-    // parses its OWN options first; the bash-family injection flags that
-    // detectShellType maps wsl onto (--rcfile) are not wsl.exe flags and would
-    // either error or run as the in-distro command. Daemon mode already
-    // injects nothing for wsl (classifyShell → null); this brings local mode
-    // in line instead of stacking args behind -d.
-    const skipHookInjection = (options?.shellArgs?.length ?? 0) > 0;
-    const hookInjection = skipHookInjection
-      ? { args: [] as string[], env: {} as Record<string, string> }
+    const hookInjection = wsl
+      ? buildWslInjection({ target: wsl.target, cwd, env, integrationDir: getWmuxDir(), bashInit: BASH_INIT })
       : this.buildHookInjection(shellType, env);
-    // The distro flag precedes everything.
-    const spawnArgs = [...(options?.shellArgs ?? []), ...hookInjection.args];
+    const spawnArgs = wsl ? hookInjection.args : [...(options?.shellArgs ?? []), ...hookInjection.args];
 
     // node-pty throws synchronously on a missing/invalid shell binary or an
     // unreadable cwd (common on macOS/Linux where the shell path differs from
@@ -247,7 +273,7 @@ export class PTYManager {
           name: 'xterm-256color',
           cols: options?.cols || 80,
           rows: options?.rows || 24,
-          cwd,
+          cwd: hostCwd,
           env: hookInjection.env,
           useConpty: true,
           ...(useBundled ? { useConptyDll: true } : {}),
@@ -267,6 +293,7 @@ export class PTYManager {
       id,
       process: ptyProcess,
       shell,
+      cwd,
       ...(options?.workspaceId ? { workspaceId: options.workspaceId } : {}),
     };
     this.instances.set(id, instance);
@@ -315,6 +342,7 @@ export class PTYManager {
   }
 
   dispose(id: string): void {
+    this.pendingCreates.delete(id);
     const instance = this.instances.get(id);
     if (instance) {
       this.removePidMap(instance.process.pid);
@@ -354,6 +382,7 @@ export class PTYManager {
   }
 
   disposeAll(): void {
+    this.createGeneration++;
     for (const id of Array.from(this.instances.keys())) {
       this.dispose(id);
     }
