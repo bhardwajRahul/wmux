@@ -376,6 +376,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     browserDiscardHidden: state.browserDiscardHidden,
     siteMemoryEnabled: state.siteMemoryEnabled,
     siteGuidesEnabled: state.siteGuidesEnabled,
+    siteGuidesAutoEnabled: state.siteGuidesAutoEnabled,
     startupDirectory: state.startupDirectory || undefined,
     scrollbackLines: state.scrollbackLines,
     scrollbackRestoreEnabled: state.scrollbackRestoreEnabled,
@@ -1273,6 +1274,8 @@ export default function AppLayout() {
       try {
         const saved = await window.electronAPI.session.load();
         if (!saved) {
+          // Nothing to restore; let the boot site-guides auto-enable proceed.
+          useStore.getState().markSessionSettingsLoaded();
           sessionLoadedRef.current = true;
           setSessionLoaded(true);
           // First ever launch — ask about auto-update
