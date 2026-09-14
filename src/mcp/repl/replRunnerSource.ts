@@ -35,8 +35,9 @@
 
 /**
  * Child program source. Kept dependency-free and small enough to travel as a
- * command-line argument on every platform (Windows caps a command line at
- * 32767 characters; this is well under 8 KB even base64-encoded).
+ * command-line argument on every platform: Windows caps a command line at
+ * 32767 characters, and a test pins the base64 form at 17,600 or less so an
+ * addition here cannot quietly spend that headroom.
  */
 export const REPL_RUNNER_SOURCE = String.raw`
 'use strict';
@@ -44,11 +45,29 @@ const vm = require('vm');
 const util = require('util');
 const path = require('path');
 const { createRequire } = require('module');
+const { AsyncLocalStorage } = require('async_hooks');
 
 // Capture everything the runner needs BEFORE user code runs. User code shares
 // this global context and may reassign process, console, or require; binding
 // early means a script that clobbers a global breaks only itself.
-const send = process.send.bind(process);
+// User code may not post a browserCall itself (its run id must come from the
+// eval): process.send and _send refuse that type unless this send calls them.
+const send = (() => {
+  const raw = process.send.bind(process);
+  let internal = false;
+  const guard = (fn) => function (msg) {
+    if (!internal && msg && msg.type === 'browserCall') {
+      throw new TypeError('process.send: "browserCall" messages are reserved; use browser.X(args)');
+    }
+    return fn.apply(process, arguments);
+  };
+  if (typeof process._send === 'function') process._send = guard(process._send);
+  process.send = guard(process.send);
+  return (msg) => {
+    internal = true;
+    try { return raw(msg); } finally { internal = false; }
+  };
+})();
 const stderrWrite = process.stderr.write.bind(process.stderr);
 
 // require() is module-scoped, so a script evaluated in the global context does
@@ -213,8 +232,70 @@ function fail(id, error, timeoutMs) {
   send({ id: id, ok: false, error: trimStack(error), kind: classify(error, timeoutMs) });
 }
 
+// browser.*: a call carries the id of the eval it came from (continuations
+// inherit the store), so a leftover timer can only carry an old id.
+const runStore = new AsyncLocalStorage();
+const browserCalls = new Map();
+let nextBrowserCall = 1;
+
+function browserCall(name, args) {
+  if (args !== undefined && (typeof args !== 'object' || args === null || Array.isArray(args))) {
+    return Promise.reject(new TypeError('browser.' + name + '(args): args must be a plain object'));
+  }
+  const callId = nextBrowserCall++;
+  const runId = runStore.getStore();
+  return new Promise((resolve, reject) => {
+    browserCalls.set(callId, { resolve: resolve, reject: reject, name: name });
+    try {
+      send({ type: 'browserCall', callId: callId, runId: runId, name: name, args: args || {} });
+    } catch (_) {
+      browserCalls.delete(callId);
+      reject(new TypeError('browser.' + name + '(args): args must be JSON-serializable'));
+    }
+  });
+}
+
+// Configurable so REPL code can still declare its own "let browser".
+function installBrowser(names) {
+  if (Object.prototype.hasOwnProperty.call(globalThis, 'browser')) return;
+  const browser = {};
+  for (const name of names) {
+    if (typeof name !== 'string') continue;
+    browser[name] = (args) => browserCall(name, args);
+  }
+  Object.defineProperty(globalThis, 'browser', {
+    value: Object.freeze(browser),
+    writable: true,
+    configurable: true,
+    enumerable: true,
+  });
+}
+
+function settleBrowserCall(msg) {
+  const entry = browserCalls.get(msg.callId);
+  if (!entry) return;
+  browserCalls.delete(msg.callId);
+  if (msg.ok) {
+    entry.resolve(msg.value);
+    return;
+  }
+  const error = new Error(String(msg.error));
+  error.name = 'BrowserToolError';
+  error.tool = entry.name;
+  entry.reject(error);
+}
+
 process.on('message', (msg) => {
+  if (msg && msg.type === 'browserResult') {
+    settleBrowserCall(msg);
+    return;
+  }
   if (!msg || typeof msg.code !== 'string') return;
+  if (Array.isArray(msg.browser)) installBrowser(msg.browser);
+  runStore.run(msg.id, () => evaluate(msg));
+});
+
+function evaluate(msg) {
   const id = msg.id;
   // The vm timeout is a watchdog on SYNCHRONOUS execution only. It is the layer
   // that stops a runaway loop WITHOUT losing session state; the parent's hard
@@ -250,7 +331,7 @@ process.on('message', (msg) => {
     return;
   }
   send({ id: id, ok: true, result: describe(value) });
-});
+}
 
 send({ ready: true });
 `;
