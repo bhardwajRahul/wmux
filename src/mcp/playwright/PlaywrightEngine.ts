@@ -15,6 +15,11 @@ import {
 } from './browserScope';
 import { attachPageCapture } from './pageCapture';
 import { reassertUserAgentEmulation } from './ua-emulation';
+import {
+  getOpenerKey,
+  openSurfaceForConnection,
+  resolveDefaultSurface,
+} from './surfaceRouting';
 
 export { WORKSPACE_SCOPE_UNRESOLVED_CODE } from './browserScope';
 
@@ -28,6 +33,13 @@ interface CdpTargetInfo {
    * page. See resolveCallerSurface().
    */
   workspaceId?: string;
+  /**
+   * Whether the CALLING connection opened this surface, as main recorded it.
+   * Absent when nobody claims it — restored after a restart, opened by a
+   * person, or opened before openers were recorded. Used by surfaceRouting to
+   * keep an unsaid target on the caller's own surface.
+   */
+  opener?: 'mine' | 'other';
 }
 
 interface CdpInfoResponse {
@@ -509,14 +521,18 @@ export class PlaywrightEngine {
    * reused by its lease and fallback RPCs (#695). This avoids a second identity
    * lookup and also scopes explicit-surface discovery on the main side.
    */
-  private async getPage(surfaceId?: string, workspaceId?: string): Promise<Page | null> {
+  private async getPage(
+    surfaceId?: string,
+    workspaceId?: string,
+    knownNoSurface?: boolean,
+  ): Promise<Page | null> {
     // Resolve the selection context (which workspace/surface this call targets)
     // BEFORE consulting any shared state, so the lock, fast-fail latch, and
     // auto-open latch are all scoped to THIS caller's workspace and can never
     // bleed into another's (#554). Context resolution needs only the control
     // RPC (browser.cdp.info); the CDP browser connection happens in
     // _getPageImpl as before.
-    const ctx = await this.resolveSelectionContext(surfaceId, workspaceId);
+    const ctx = await this.resolveSelectionContext(surfaceId, workspaceId, knownNoSurface);
 
     // External-backend contract (#517): the caller's workspace delegates opens
     // to the OS browser and owns no builtin webview target (callerHasNoSurface,
@@ -556,7 +572,7 @@ export class PlaywrightEngine {
    */
   async getPageForScope(scope: BrowserTargetScope): Promise<Page | null> {
     assertBrowserTargetScope(scope);
-    const page = await this.getPage(scope.surfaceId, scope.workspaceId);
+    const page = await this.getPage(scope.surfaceId, scope.workspaceId, scope.noSurface === true);
     // Chrome backend: main's webContents-side lifecycle capture cannot see
     // these tabs, so mirror navigations/closes engine-side (dogfood P1 — the
     // #1063 inline events went silent under 'chrome').
@@ -691,58 +707,41 @@ export class PlaywrightEngine {
     }
     if (!workspaceId) throw workspaceScopeUnresolved('workspace identity resolved to an empty id');
 
-    let info: CdpInfoResponse;
+    // One router for both entry points (surfaceRouting): the tool layer
+    // resolves the default before it takes a lease, and a direct engine call
+    // lands here — they must not be able to disagree about which surface a
+    // caller that named none is on.
+    let resolved: { kind: 'surface'; surfaceId: string } | { kind: 'none' };
     try {
-      // Pass our resolved workspace so main filters `targets` server-side
-      // (#580, Option 1). The response then carries only our own targets.
-      info = (await sendRpc('browser.cdp.info', { workspaceId })) as CdpInfoResponse;
+      resolved = await resolveDefaultSurface(workspaceId, {
+        // The response is the only place shellUrl and the backend marker
+        // arrive, so the router hands it back rather than making this a second
+        // round trip.
+        onInfo: (info) => this.cacheShellUrl(info as CdpInfoResponse),
+      });
     } catch (err) {
-      throw workspaceScopeUnresolved(
-        `browser.cdp.info unavailable: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      // Re-raise the router's refusal in this engine's own words: the message
+      // carries the remedy an agent reads, and it is logged on the way out.
+      if (isWorkspaceScopeUnresolvedError(err)) {
+        const reason = (err as Error).message.replace(
+          new RegExp(`^${WORKSPACE_SCOPE_UNRESOLVED_CODE}:\\s*`),
+          '',
+        );
+        throw workspaceScopeUnresolved(reason);
+      }
+      throw err;
     }
-    this.cacheShellUrl(info);
-
-    // A main that honored the scope request marks the response `targetsScoped`.
-    // Then an empty list unambiguously means "we own no live target" (kind:
-    // 'none'), and a present one is already ours — no client-side filter needed.
-    if (info.targetsScoped) {
-      const own = this.newestTarget(info.targets);
-      return own
-        ? { kind: 'surface', surfaceId: own.surfaceId, workspaceId }
-        : { kind: 'none', workspaceId };
-    }
-
-    // Legacy path: an older main ignored the param and returned every target.
-    //
-    // An EMPTY list from such a main is unambiguous no matter who it belongs to
-    // — there is no live guest anywhere — so it is 'none' (auto-open our own),
-    // which is what the old leniency was really protecting: a single-workspace
-    // setup with nothing to cross into.
-    if (info.targets.length === 0) return { kind: 'none', workspaceId };
-
-    // Targets exist but if NONE carry a workspaceId we cannot scope at all —
-    // and an unscopeable selection is a cross-workspace selection, so refuse.
-    // Matches how browser_tabs reports a main too old to scope
-    // (BROWSER_TABS_UNSUPPORTED) rather than falling back to something
-    // workspace-blind.
-    const anyTagged = info.targets.some(
-      (t) => typeof t.workspaceId === 'string' && t.workspaceId.length > 0,
-    );
-    if (!anyTagged) {
-      throw workspaceScopeUnresolved(
-        'the connected wmux main does not tag browser targets with a workspace',
-      );
-    }
-
-    const own = this.newestTarget(info.targets, workspaceId);
-    if (own) return { kind: 'surface', surfaceId: own.surfaceId, workspaceId };
-    return { kind: 'none', workspaceId };
+    return resolved.kind === 'surface'
+      ? { kind: 'surface', surfaceId: resolved.surfaceId, workspaceId }
+      : { kind: 'none', workspaceId };
   }
 
   /**
-   * The DEFAULT target when the caller pins no surfaceId: its MOST RECENTLY
-   * opened surface, never the oldest. listTargets() on both backends preserves
+   * The MOST RECENTLY opened surface of a target list, never the oldest.
+   * Still the tie-breaker inside selectRegisteredTarget; the default target of
+   * a call that named no surfaceId is decided one level up, per connection
+   * (surfaceRouting), because "newest in the workspace" is another agent's tab
+   * as often as it is the caller's. listTargets() on both backends preserves
    * creation order — the managers iterate their surface Map in insertion order —
    * so the last entry a workspace owns is the newest. Picking targets[0] (the
    * oldest) silently drove a leftover tab from a previous run: `browser_tabs new`
@@ -773,6 +772,7 @@ export class PlaywrightEngine {
   private async resolveSelectionContext(
     explicitSurfaceId?: string,
     workspaceId?: string,
+    knownNoSurface?: boolean,
   ): Promise<{ key: string; surfaceId?: string; callerHasNoSurface: boolean; workspaceId?: string }> {
     if (explicitSurfaceId) {
       return {
@@ -782,11 +782,43 @@ export class PlaywrightEngine {
         ...(workspaceId && { workspaceId }),
       };
     }
+    // The tool layer already resolved this caller to "nothing of mine exists"
+    // and said so. Re-asking would repeat a control-plane round trip that on
+    // an empty workspace costs main's full registration grace — twice per
+    // call, for the same answer.
+    if (knownNoSurface && workspaceId) {
+      return { key: this.contextKey(workspaceId), surfaceId: undefined, callerHasNoSurface: true, workspaceId };
+    }
     const owned = await this.resolveCallerSurface(workspaceId);
     if (owned.kind === 'surface') {
-      return { key: `ws:${owned.workspaceId}`, surfaceId: owned.surfaceId, callerHasNoSurface: false, workspaceId: owned.workspaceId };
+      return {
+        key: `ws:${owned.workspaceId}:surf:${owned.surfaceId}`,
+        surfaceId: owned.surfaceId,
+        callerHasNoSurface: false,
+        workspaceId: owned.workspaceId,
+      };
     }
-    return { key: `ws:${owned.workspaceId}`, surfaceId: undefined, callerHasNoSurface: true, workspaceId: owned.workspaceId };
+    return {
+      key: this.contextKey(owned.workspaceId),
+      surfaceId: undefined,
+      callerHasNoSurface: true,
+      workspaceId: owned.workspaceId,
+    };
+  }
+
+  /**
+   * The key for "this connection, in this workspace, with no surface yet".
+   *
+   * Per CONNECTION, not per workspace. The in-flight lock, the fast-fail latch
+   * and the auto-open latch all hang off this key, and two connections sharing
+   * one meant B could be handed A's in-flight page promise, A's discovery
+   * failure fast-failed B for ten seconds, and A's one-shot auto-open
+   * suppressed B's — the same "two agents, one default" confusion this routing
+   * exists to end, one layer down. A resolved surface needs no such marker:
+   * the surface id already distinguishes them.
+   */
+  private contextKey(workspaceId?: string): string {
+    return `ws:${workspaceId ?? ''}:conn:${getOpenerKey()}`;
   }
 
   private async _getPageImpl(
@@ -956,19 +988,25 @@ export class PlaywrightEngine {
   }
 
   /**
-   * Issue the auto-open browser.open RPC, pinned to the calling session's
-   * workspace. Fails closed: when no resolver is wired or identity cannot be
-   * resolved, NO RPC is sent (returns false) — a workspace-less browser.open
-   * would let the renderer fall back to the UI-active workspace (#190). The
-   * caller then proceeds to the normal "no page" retry/error path, surfacing
-   * the existing "Call browser_open first" guidance to the user.
-   */
-  /**
+   * Open a surface for the caller, pinned to the calling session's workspace.
+   * Fails closed: when no resolver is wired or identity cannot be resolved, NO
+   * RPC is sent (returns null) — a workspace-less open would let the renderer
+   * fall back to the UI-active workspace (#190). The caller then proceeds to
+   * the normal "no page" retry/error path, surfacing the existing "Call
+   * browser_open first" guidance to the user.
+   *
+   * `browser.tabs new`, not `browser.open`: on the builtin backend an open
+   * REUSES the workspace's first browser surface when one exists, which is how
+   * an auto-open for agent B used to hand back agent A's tab. `new` always
+   * creates, on every backend, so the surface this returns is the caller's own.
+   * An older main without the tabs method falls back to the open path.
+   *
    * @returns the surface that was opened (`surfaceId` absent if the reply did
    *   not name one), or null when the attempt was skipped fail-closed.
    *
    * The surfaceId matters: it is the ONE selection this engine can make without
-   * having to prove anything, because we are the ones who just asked for it.
+   * having to prove anything, because we are the ones who just asked for it —
+   * and it becomes this connection's pin, so the calls that follow stay on it.
    */
   private async attemptAutoOpen(resolvedWorkspaceId?: string): Promise<{ surfaceId?: string } | null> {
     let workspaceId = resolvedWorkspaceId;
@@ -991,8 +1029,9 @@ export class PlaywrightEngine {
       console.error('[PlaywrightEngine] Auto-open skipped: empty workspace id');
       return null;
     }
-    const reply = (await sendRpc('browser.open', { workspaceId })) as { surfaceId?: unknown } | undefined;
-    const surfaceId = typeof reply?.surfaceId === 'string' && reply.surfaceId ? reply.surfaceId : undefined;
+    // One open for both lanes (surfaceRouting): this one, and the RPC lane's
+    // own fallback (d) in browserScope. It pins what it opens.
+    const surfaceId = (await openSurfaceForConnection(workspaceId)) ?? undefined;
     return surfaceId ? { surfaceId } : {};
   }
 

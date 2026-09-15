@@ -4,6 +4,7 @@ import { validateNavigationUrl } from '../../../shared/types';
 import { sendRpc } from '../../wmux-client';
 import { PlaywrightEngine } from '../PlaywrightEngine';
 import {
+  ensureOwnSurfaceScope,
   requireBrowserTargetScope,
   sendScopedBrowserRpc,
   type BrowserToolDeps,
@@ -16,6 +17,7 @@ import { redactPasswordParams } from '../redact';
 import { recordAction } from '../../browser-replay/actionRing';
 import { refererFor } from '../../../shared/referer';
 import { NavigationNotCommittedError, navigateFromPage } from '../link-navigation';
+import { getOpenerKey, noteOpenedSurface } from '../surfaceRouting';
 import {
   browserTabsError,
   isBrowserTabsResult,
@@ -29,7 +31,7 @@ import {
 const optionalSurfaceId = z
   .string()
   .optional()
-  .describe('Omit for the active surface.');
+  .describe('Omit for the surface you opened last.');
 
 // Module-scope parameter shapes: hoisted out of the per-registration path so
 // every createWmuxServer() instance shares one set of zod schema objects
@@ -164,7 +166,25 @@ function tabsToolError(result: BrowserTabsErrorResult) {
   };
 }
 
-function publicTab(tab: BrowserTabDescriptor): BrowserTabDescriptor {
+/**
+ * Who opened this tab, from the caller's point of view.
+ *
+ * `true` — this connection opened it, so it is where an omitted surfaceId
+ * lands. `false` — another connection opened it: still reachable by passing
+ * its surfaceId (ownership is not a permission boundary), just never the
+ * silent default. `"unknown"` — nobody claims it (restored after a restart,
+ * opened by a person, or opened before openers were recorded), which makes it
+ * the fallback default when this connection has opened nothing.
+ *
+ * The opener key itself is dropped here: it answers exactly one question, and
+ * that answer is this field.
+ */
+function mineFlag(tab: BrowserTabDescriptor): boolean | 'unknown' {
+  if (tab.opener === undefined) return 'unknown';
+  return tab.opener === 'mine';
+}
+
+function publicTab(tab: BrowserTabDescriptor) {
   return {
     surfaceId: tab.surfaceId,
     paneId: tab.paneId,
@@ -174,6 +194,7 @@ function publicTab(tab: BrowserTabDescriptor): BrowserTabDescriptor {
     url: redactPasswordParams(tab.url),
     title: tab.title,
     selected: tab.selected,
+    mine: mineFlag(tab),
   };
 }
 
@@ -307,8 +328,16 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
                 ],
               };
             }
+            // Builtin RPC lane: settle WHICH surface first. This lane never
+            // asks for a Page, so nothing else in the call would resolve the
+            // caller's surface, and main answers an unnamed navigate with the
+            // workspace's first live session — another agent's tab as often as
+            // this one's (live dogfood: agent B's navigate landed on agent A's
+            // page). Resolving here also means the recorded action and the
+            // baseline keys below describe the surface actually navigated.
+            const target = await ensureOwnSurfaceScope(scope);
             // Use RPC for fast, reliable navigation (bypasses Playwright CDP discovery)
-            await sendScopedBrowserRpc('browser.navigate', scope, { url });
+            await sendScopedBrowserRpc('browser.navigate', target, { url });
             // The RPC resolves on commit (#756); the CDP Page.frameNavigated
             // that feeds the lifecycle ring races it. A short settle lets the
             // post-body drain catch this call's own events — a miss is only a
@@ -319,11 +348,11 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
             // pattern): on a redirect the requested URL is not the final one,
             // and the self-echo match needs the final URL to fire. Fall back
             // to the requested URL when the read fails mid-load.
-            finalUrl = await sendScopedBrowserRpc<{ value: string }>('browser.evaluate', scope, {
+            finalUrl = await sendScopedBrowserRpc<{ value: string }>('browser.evaluate', target, {
               expression: 'location.href',
             }).then((r) => r?.value || url).catch(() => url);
             recordAction(deps, {
-              scope,
+              scope: target,
               tool: 'browser_navigate',
               page: null,
               args: { url },
@@ -380,12 +409,16 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
                 content: [{ type: 'text' as const, text: `Went back. Current URL: ${redactPasswordParams(finalUrl)}` }],
               };
             }
-            await sendScopedBrowserRpc('browser.goBack', scope);
+            // Same reason as browser_navigate's builtin lane: this one never
+            // asks for a Page, so the surface is settled here rather than left
+            // for main to guess.
+            const target = await ensureOwnSurfaceScope(scope);
+            await sendScopedBrowserRpc('browser.goBack', target);
 
             await new Promise((resolve) => setTimeout(resolve, 300));
 
             // Get current URL
-            const urlResult = await sendScopedBrowserRpc<{ value: string }>('browser.evaluate', scope, {
+            const urlResult = await sendScopedBrowserRpc<{ value: string }>('browser.evaluate', target, {
               expression: 'location.href',
             });
 
@@ -411,7 +444,7 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_tabs',
-    'Manage browser surfaces in the calling workspace. Address one only by the opaque surfaceId from list or new, never by list position. select moves UI focus only and does NOT retarget the other browser tools, so pass surfaceId explicitly on follow-up calls. selected likewise reports UI focus (always false on the chrome backend), not tool targeting. Omitting surfaceId targets your MOST RECENTLY opened surface — a just-created new tab, or browser_open, becomes that default — so to act on any earlier tab pass its surfaceId explicitly.',
+    'Manage browser surfaces in the calling workspace. Address one only by the opaque surfaceId from list or new, never by list position. select moves UI focus only and does NOT retarget the other browser tools, so pass surfaceId explicitly on follow-up calls. selected likewise reports UI focus (always false on the chrome backend), not tool targeting. list rows carry mine: true (you opened it), false (another agent did), or "unknown" (nobody claims it). Omitting surfaceId targets the surface YOU most recently opened; if you opened none, one no other agent opened, or a new one — so to act on any earlier tab pass its surfaceId explicitly.',
     BROWSER_TABS_SHAPE,
     async ({ action, surfaceId, url }) => {
       const resolvedAction: BrowserTabsAction = action ?? 'list';
@@ -477,9 +510,19 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
           workspaceId,
           ...(surfaceId && { surfaceId }),
           ...(url !== undefined && { url }),
+          // Only `new` opens something, but the key rides along on every action
+          // so main can answer "is this one mine?" per row on `list` — as a
+          // verdict; the key itself never comes back.
+          openerKey: getOpenerKey(),
         });
         if (!isBrowserTabsResult(result)) {
           throw new Error('Invalid browser.tabs response from wmux main.');
+        }
+        // A tab this call created becomes this connection's default target,
+        // the same promise browser_open makes. Only creation moves it: select
+        // is UI focus, and close leaves the pin to be re-resolved.
+        if (result.ok && result.action === 'new' && 'tab' in result) {
+          noteOpenedSurface(workspaceId, result.tab.surfaceId);
         }
         return result.ok ? tabsToolSuccess(result) : tabsToolError(result);
       } catch (error) {

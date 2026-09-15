@@ -50,6 +50,8 @@ import {
   EXTERNAL_BACKEND_UNSUPPORTED_CODE,
   EXTERNAL_BACKEND_UNSUPPORTED_MESSAGE,
 } from '../../../shared/browserBackend';
+import { __resetSurfaceRoutingForTesting } from '../surfaceRouting';
+import { createConnectionScope, runInConnectionScope } from '../../connectionScope';
 
 /*
  * Regression tests for app-shell URL detection.
@@ -154,6 +156,9 @@ describe('PlaywrightEngine CDP session lifecycle', () => {
   beforeEach(() => {
     // Reset the singleton so each test gets a clean engine.
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -301,6 +306,9 @@ interface FakePage {
 describe('PlaywrightEngine runtime shell-URL handling (B)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -539,16 +547,88 @@ describe('PlaywrightEngine runtime shell-URL handling (B)', () => {
 });
 
 /*
+ * Selection-context keys, per connection.
+ *
+ * The in-flight page lock, the fast-fail latch and the auto-open latch all
+ * hang off the selection key. It used to be `ws:<workspace>` whenever the
+ * caller named no surface — one key for every connection in the workspace — so
+ * connection B could be handed A's in-flight page promise, A's discovery
+ * failure fast-failed B for ten seconds, and A's one-shot auto-open suppressed
+ * B's. That is the same "two agents, one default" confusion this routing
+ * exists to end, one layer down.
+ */
+describe('PlaywrightEngine selection keys', () => {
+  interface KeyInternals {
+    resolveSelectionContext(
+      surfaceId?: string,
+      workspaceId?: string,
+      knownNoSurface?: boolean,
+    ): Promise<{ key: string }>;
+  }
+  const keys = (engine: PlaywrightEngine) => engine as unknown as KeyInternals;
+
+  beforeEach(() => {
+    (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    __resetSurfaceRoutingForTesting();
+    mockSendRpc.mockReset();
+  });
+
+  it('gives two surfaceless connections different keys in ONE workspace', async () => {
+    const a = createConnectionScope();
+    const b = createConnectionScope();
+
+    const keyA = await runInConnectionScope(a, () =>
+      keys(PlaywrightEngine.getInstance()).resolveSelectionContext(undefined, 'ws-1', true),
+    );
+    const keyB = await runInConnectionScope(b, () =>
+      keys(PlaywrightEngine.getInstance()).resolveSelectionContext(undefined, 'ws-1', true),
+    );
+
+    expect(keyA.key).not.toBe(keyB.key);
+    expect(keyA.key).toContain('ws-1');
+  });
+
+  it('keys a resolved surface by the surface itself', async () => {
+    mockSendRpc.mockImplementation((method: string) =>
+      method === 'browser.cdp.info'
+        ? Promise.resolve({ targetsScoped: true, targets: [{ surfaceId: 'surf-1', opener: 'mine' }] })
+        : Promise.resolve({}),
+    );
+    const engine = PlaywrightEngine.getInstance();
+    scope(engine).setWorkspaceIdResolver(async () => 'ws-1');
+
+    const ctx = await keys(engine).resolveSelectionContext(undefined, 'ws-1');
+
+    expect(ctx.key).toBe('ws:ws-1:surf:surf-1');
+  });
+
+  it('asks nothing when the tool layer already reported no surface', async () => {
+    // The tool layer resolves before the lease; re-asking here would repeat a
+    // control-plane round trip that costs main's full registration grace on an
+    // empty workspace — twice per call, for the same answer.
+    mockSendRpc.mockResolvedValue({});
+    const engine = PlaywrightEngine.getInstance();
+
+    await keys(engine).resolveSelectionContext(undefined, 'ws-1', true);
+
+    expect(mockSendRpc).not.toHaveBeenCalled();
+  });
+});
+
+/*
  * Auto-open workspace routing invariants (#190).
  *
  * When getPage() finds no CDP-discoverable page, Strategy 4 auto-opens a
- * browser surface via the browser.open RPC. The renderer (useRpcBridge.ts)
- * binds a workspace-less browser.open to store.activeWorkspaceId at
- * IPC-handling time, so auto-open must carry the calling session's workspaceId
- * (resolved via the strict resolver wired by src/mcp/index.ts) to pin the
- * surface to the right workspace, and must fail closed — issue no browser.open
- * at all — when identity cannot be resolved, rather than open in an
- * unspecified workspace.
+ * browser surface. The renderer (useRpcBridge.ts) binds a workspace-less open
+ * to store.activeWorkspaceId at IPC-handling time, so auto-open must carry the
+ * calling session's workspaceId (resolved via the strict resolver wired by
+ * src/mcp/index.ts) to pin the surface to the right workspace, and must fail
+ * closed — issue no open at all — when identity cannot be resolved, rather
+ * than open in an unspecified workspace.
+ *
+ * The open itself goes through `browser.tabs new`, which always CREATES:
+ * `browser.open` reuses the workspace's first builtin surface, which is how an
+ * auto-open for one agent used to hand back another agent's tab.
  */
 
 // Minimal access to the engine's auto-open surface. setWorkspaceIdResolver is
@@ -565,23 +645,76 @@ function autoOpen(engine: PlaywrightEngine): AutoOpenInternals {
 describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
 
-  it('sends browser.open with the workspaceId from the wired resolver', async () => {
+  /** Every shape that can bring a browser surface into existence. */
+  const openCalls = () =>
+    mockSendRpc.mock.calls.filter(
+      (c) => c[0] === 'browser.open' || (c[0] === 'browser.tabs' && (c[1] as { action?: string })?.action === 'new'),
+    );
+
+  it('opens a NEW surface, with the workspaceId from the wired resolver', async () => {
     const engine = PlaywrightEngine.getInstance();
     autoOpen(engine).setWorkspaceIdResolver(async () => 'ws-caller-1');
-    mockSendRpc.mockResolvedValue({ ok: true, surfaceId: 'surf-new' });
+    mockSendRpc.mockResolvedValue({ ok: true, action: 'new', tab: { surfaceId: 'surf-new' } });
 
     // The reply's surfaceId comes back so the caller can pin the surface it
     // just asked for, without having to prove ownership of it afterwards.
     await expect(autoOpen(engine).attemptAutoOpen()).resolves.toEqual({ surfaceId: 'surf-new' });
 
-    expect(mockSendRpc).toHaveBeenCalledWith('browser.open', { workspaceId: 'ws-caller-1' });
+    expect(mockSendRpc).toHaveBeenCalledWith('browser.tabs', {
+      action: 'new',
+      workspaceId: 'ws-caller-1',
+      openerKey: expect.any(String),
+    });
+    // Never the reuse-shaped open: that is what handed one agent another's tab.
+    expect(mockSendRpc.mock.calls.filter((c) => c[0] === 'browser.open')).toHaveLength(0);
   });
 
-  it('fails closed — no browser.open RPC — when the resolver throws', async () => {
+  it.each([
+    ['a main too old for the method', 'Unknown method: browser.tabs'],
+    // browser.tabs can close surfaces, so the commander lane denies the whole
+    // method. browser.open is allowed there and carries the opener key too.
+    ['a lane that denies the method', 'COMMANDER_TEARDOWN_DENY: browser.tabs'],
+  ])('falls back to browser.open against %s', async (_case, message) => {
+    const engine = PlaywrightEngine.getInstance();
+    autoOpen(engine).setWorkspaceIdResolver(async () => 'ws-caller-1');
+    mockSendRpc.mockImplementation((method: string) => {
+      if (method === 'browser.tabs') return Promise.reject(new Error(message));
+      return Promise.resolve({ ok: true, surfaceId: 'surf-legacy' });
+    });
+
+    await expect(autoOpen(engine).attemptAutoOpen()).resolves.toEqual({ surfaceId: 'surf-legacy' });
+
+    expect(mockSendRpc).toHaveBeenCalledWith('browser.open', {
+      workspaceId: 'ws-caller-1',
+      openerKey: expect.any(String),
+    });
+  });
+
+  it('does not fall back when the method answered with a refusal', async () => {
+    // `ok:false` is a main that understands `new` and said no (pane cap, a
+    // backend with nothing to create). Retrying through the reuse-shaped open
+    // would walk straight into another agent's surface.
+    const engine = PlaywrightEngine.getInstance();
+    autoOpen(engine).setWorkspaceIdResolver(async () => 'ws-caller-1');
+    mockSendRpc.mockImplementation((method: string) =>
+      method === 'browser.tabs'
+        ? Promise.resolve({ ok: false, error: { code: 'BROWSER_TAB_CREATE_FAILED', message: 'pane cap' } })
+        : Promise.resolve({ ok: true, surfaceId: 'surf-other' }),
+    );
+
+    await expect(autoOpen(engine).attemptAutoOpen()).resolves.toEqual({});
+
+    expect(mockSendRpc.mock.calls.filter((c) => c[0] === 'browser.open')).toHaveLength(0);
+  });
+
+  it('fails closed — no open RPC — when the resolver throws', async () => {
     const engine = PlaywrightEngine.getInstance();
     autoOpen(engine).setWorkspaceIdResolver(async () => {
       throw new Error('Workspace identity unknown');
@@ -589,7 +722,7 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
 
     await expect(autoOpen(engine).attemptAutoOpen()).resolves.toBeNull();
 
-    expect(mockSendRpc.mock.calls.filter((c) => c[0] === 'browser.open')).toHaveLength(0);
+    expect(openCalls()).toHaveLength(0);
   });
 
   it('fails closed when the resolver returns an empty id', async () => {
@@ -598,7 +731,7 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
 
     await expect(autoOpen(engine).attemptAutoOpen()).resolves.toBeNull();
 
-    expect(mockSendRpc.mock.calls.filter((c) => c[0] === 'browser.open')).toHaveLength(0);
+    expect(openCalls()).toHaveLength(0);
   });
 
   it('fails closed when no resolver is wired', async () => {
@@ -606,7 +739,7 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
 
     await expect(autoOpen(engine).attemptAutoOpen()).resolves.toBeNull();
 
-    expect(mockSendRpc.mock.calls.filter((c) => c[0] === 'browser.open')).toHaveLength(0);
+    expect(openCalls()).toHaveLength(0);
   });
 
   it('getPage never issues a workspace-less browser.open when identity is unavailable', async () => {
@@ -687,9 +820,14 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
             : [],
         });
       }
-      if (method === 'browser.open') {
+      if (method === 'browser.tabs') {
+        // Routing sweeps the pane list before opening (a pane whose guest has
+        // not registered yet is invisible to cdp.info). This workspace has none.
+        if ((params as { action?: string } | undefined)?.action === 'list') {
+          return Promise.resolve({ ok: true, action: 'list', tabs: [] });
+        }
         opened = true;
-        return Promise.resolve({ ok: true });
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-new' } });
       }
       return Promise.resolve({});
     });
@@ -700,7 +838,11 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
     const page = await priv(engine).getPage();
 
     expect(page).toBe(webviewPage);
-    expect(mockSendRpc).toHaveBeenCalledWith('browser.open', { workspaceId: 'ws-caller-1' });
+    expect(mockSendRpc).toHaveBeenCalledWith('browser.tabs', {
+      action: 'new',
+      workspaceId: 'ws-caller-1',
+      openerKey: expect.any(String),
+    });
   }, 15_000);
 
   it('auto-open still returns a page against a main too old to tag targets', async () => {
@@ -750,7 +892,7 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
       contexts: vi.fn().mockImplementation(() => (opened ? [ctx] : [])),
       close: vi.fn().mockResolvedValue(undefined),
     });
-    mockSendRpc.mockImplementation((method: string) => {
+    mockSendRpc.mockImplementation((method: string, params?: unknown) => {
       if (method === 'browser.cdp.info') {
         // No `targetsScoped`, and the opened target carries no workspaceId —
         // this main does not tag anything.
@@ -760,9 +902,12 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
           targets: opened ? [{ surfaceId: 'surf-legacy', targetId: 'wc-legacy' }] : [],
         });
       }
-      if (method === 'browser.open') {
+      if (method === 'browser.tabs') {
+        if ((params as { action?: string } | undefined)?.action === 'list') {
+          return Promise.resolve({ ok: true, action: 'list', tabs: [] });
+        }
         opened = true;
-        return Promise.resolve({ ok: true, surfaceId: 'surf-legacy' });
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-legacy' } });
       }
       return Promise.resolve({});
     });
@@ -771,7 +916,11 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
     autoOpen(engine).setWorkspaceIdResolver(async () => 'ws-caller-1');
 
     await expect(priv(engine).getPage()).resolves.toBe(webviewPage);
-    expect(mockSendRpc).toHaveBeenCalledWith('browser.open', { workspaceId: 'ws-caller-1' });
+    expect(mockSendRpc).toHaveBeenCalledWith('browser.tabs', {
+      action: 'new',
+      workspaceId: 'ws-caller-1',
+      openerKey: expect.any(String),
+    });
   }, 15_000);
 
   it('auto-open refuses a target that is explicitly tagged to another workspace', async () => {
@@ -800,7 +949,7 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
       contexts: vi.fn().mockReturnValue([context]),
       close: vi.fn().mockResolvedValue(undefined),
     });
-    mockSendRpc.mockImplementation((method: string) => {
+    mockSendRpc.mockImplementation((method: string, params?: unknown) => {
       if (method === 'browser.cdp.info') {
         return Promise.resolve({
           cdpPort: 9222,
@@ -810,9 +959,12 @@ describe('PlaywrightEngine auto-open workspace routing (#190)', () => {
             : [],
         });
       }
-      if (method === 'browser.open') {
+      if (method === 'browser.tabs') {
+        if ((params as { action?: string } | undefined)?.action === 'list') {
+          return Promise.resolve({ ok: true, action: 'list', tabs: [] });
+        }
         opened = true;
-        return Promise.resolve({ ok: true, surfaceId: 'surf-new' });
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-new' } });
       }
       return Promise.resolve({});
     });
@@ -867,6 +1019,9 @@ describe('PlaywrightEngine read-path workspace scoping (#554)', () => {
 
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -970,6 +1125,9 @@ describe('PlaywrightEngine read-path workspace scoping (#554)', () => {
 describe('PlaywrightEngine fail-closed page selection (unresolvable caller)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -1103,6 +1261,9 @@ describe('PlaywrightEngine fail-closed page selection (unresolvable caller)', ()
 describe('PlaywrightEngine read-path workspace scoping — scoped cdp.info (#580)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -1127,7 +1288,12 @@ describe('PlaywrightEngine read-path workspace scoping — scoped cdp.info (#580
     scope(engine).setWorkspaceIdResolver(async () => 'ws-A');
 
     await scope(engine).resolveCallerSurface();
-    expect(mockSendRpc).toHaveBeenCalledWith('browser.cdp.info', { workspaceId: 'ws-A' });
+    expect(mockSendRpc).toHaveBeenCalledWith('browser.cdp.info', {
+      workspaceId: 'ws-A',
+      // So main can answer "is this target yours?" per row — as a verdict; the
+      // key itself never comes back.
+      openerKey: expect.any(String),
+    });
   });
 
   it('reports its own surface from a scoped response', async () => {
@@ -1189,9 +1355,12 @@ describe('PlaywrightEngine read-path workspace scoping — scoped cdp.info (#580
         // before and after the open (so it never resolves a foreign page).
         return Promise.resolve({ cdpPort: 9222, shellUrl, ...(ws && { targetsScoped: true }), targets: [] });
       }
-      if (method === 'browser.open') {
+      if (method === 'browser.tabs') {
+        if ((params as { action?: string } | undefined)?.action === 'list') {
+          return Promise.resolve({ ok: true, action: 'list', tabs: [] });
+        }
         opened = true;
-        return Promise.resolve({ ok: true });
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-own' } });
       }
       return Promise.resolve({});
     });
@@ -1202,7 +1371,11 @@ describe('PlaywrightEngine read-path workspace scoping — scoped cdp.info (#580
     await priv(engine).getPage();
 
     // Opened in the caller's OWN workspace — the isolation guarantee.
-    expect(mockSendRpc).toHaveBeenCalledWith('browser.open', { workspaceId: 'ws-B' });
+    expect(mockSendRpc).toHaveBeenCalledWith('browser.tabs', {
+      action: 'new',
+      workspaceId: 'ws-B',
+      openerKey: expect.any(String),
+    });
     // And it asked main to scope the target list to the caller.
     expect(mockSendRpc).toHaveBeenCalledWith('browser.cdp.info', { workspaceId: 'ws-B' });
     expect(opened).toBe(true);
@@ -1278,6 +1451,9 @@ describe('PlaywrightEngine read-path workspace scoping — scoped cdp.info (#580
 describe('PlaywrightEngine external backend contract (#517)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -1331,9 +1507,12 @@ describe('PlaywrightEngine external backend contract (#517)', () => {
           targets: [],
         });
       }
-      if (method === 'browser.open') {
+      if (method === 'browser.tabs') {
+        if ((params as { action?: string } | undefined)?.action === 'list') {
+          return Promise.resolve({ ok: true, action: 'list', tabs: [] });
+        }
         opened = true;
-        return Promise.resolve({ ok: true });
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-builtin' } });
       }
       return Promise.resolve({});
     });
@@ -1345,7 +1524,11 @@ describe('PlaywrightEngine external backend contract (#517)', () => {
     await expect(priv(engine).getPage()).resolves.toBeNull();
     // The builtin generic path still auto-opened in the caller's own workspace.
     expect(opened).toBe(true);
-    expect(mockSendRpc).toHaveBeenCalledWith('browser.open', { workspaceId: 'ws-builtin' });
+    expect(mockSendRpc).toHaveBeenCalledWith('browser.tabs', {
+      action: 'new',
+      workspaceId: 'ws-builtin',
+      openerKey: expect.any(String),
+    });
   }, 15_000);
 
   it('resolves normally in external mixed mode when the caller owns a live builtin target', async () => {
@@ -1412,6 +1595,9 @@ describe('PlaywrightEngine external backend contract (#517)', () => {
 describe('PlaywrightEngine chrome backend (Phase 2)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -1464,6 +1650,9 @@ describe('PlaywrightEngine chrome backend (Phase 2)', () => {
 describe('PlaywrightEngine ensureConnected workspace switch (Phase 2.5)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -1503,6 +1692,9 @@ describe('PlaywrightEngine ensureConnected workspace switch (Phase 2.5)', () => 
 describe('PlaywrightEngine live-Chrome ws endpoint (Phase 3)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -1577,6 +1769,9 @@ describe('PlaywrightEngine lifecycle mirror (chrome backend)', () => {
 describe('PlaywrightEngine live-Chrome attach (Phase 3)', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });
@@ -1667,6 +1862,9 @@ describe('PlaywrightEngine live-Chrome attach (Phase 3)', () => {
 describe('PlaywrightEngine dedicated-Chrome stable surface ids', () => {
   beforeEach(() => {
     (PlaywrightEngine as unknown as { instance: PlaywrightEngine | null }).instance = null;
+    // The per-connection pin lives in the module fallback here (no broker
+    // scope), so it would otherwise carry one case's surface into the next.
+    __resetSurfaceRoutingForTesting();
     mockSendRpc.mockReset();
     mockConnectOverCDP.mockReset();
   });

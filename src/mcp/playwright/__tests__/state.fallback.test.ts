@@ -8,15 +8,23 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 // Mock the RPC transport. __tests__/ -> playwright/ -> mcp/, so ../../wmux-client
 // resolves to src/mcp/wmux-client.
 // #517: tool handlers are wrapped in withAutomationLease, which issues
-// browser.lease.* RPCs around the real operation. Keep those transparent to
-// this suite's call-sequence assertions: lease traffic is answered inline
-// ({ token: null } → the helper proceeds unleased, no renew/release) and only
-// non-lease methods reach the recorded mock.
+// browser.lease.* RPCs around the real operation — and browser tools resolve
+// the surface a call that names none belongs to, one browser.cdp.info ahead of
+// that. Keep both transparent to this suite's call-sequence assertions:
+// infrastructure traffic is answered inline ({ token: null } → the helper
+// proceeds unleased, no renew/release; no targets → no surface to pin) and only
+// the operation's own methods reach the recorded mock.
 const { mockSendRpc } = vi.hoisted(() => ({ mockSendRpc: vi.fn() }));
 vi.mock('../../wmux-client', () => ({
   sendRpc: (method: string, ...args: unknown[]) =>
-    typeof method === 'string' && (method.startsWith('browser.lease.') || method === 'browser.lifecycle.get')
-      ? Promise.resolve({ token: null })
+    typeof method === 'string'
+    && (method.startsWith('browser.lease.')
+      || method === 'browser.lifecycle.get'
+      || method === 'browser.cdp.info'
+      || method === 'browser.tabs'
+      || method === 'browser.surface.adopt'
+      || method === 'browser.open')
+      ? Promise.resolve({ token: null, targets: [], ok: false })
       : mockSendRpc(method, ...args),
 }));
 
@@ -27,6 +35,7 @@ vi.mock('../PlaywrightEngine', () => ({
 }));
 
 import { registerStateTools } from '../tools/state';
+import { __resetSurfaceRoutingForTesting } from '../surfaceRouting';
 
 const browserToolDeps = { resolveWorkspaceId: vi.fn(async () => 'ws-test') };
 
@@ -54,6 +63,9 @@ const emulate = tools.get('browser_emulate')!;
 const resize = tools.get('browser_resize')!;
 
 beforeEach(() => {
+  // Per-connection pin: no broker scope here, so it lives in the module
+  // fallback and would leak between cases.
+  __resetSurfaceRoutingForTesting();
   browserToolDeps.resolveWorkspaceId.mockClear();
   browserToolDeps.resolveWorkspaceId.mockResolvedValue('ws-test');
   mockSendRpc.mockReset();

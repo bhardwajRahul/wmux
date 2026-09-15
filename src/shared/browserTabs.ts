@@ -15,6 +15,16 @@ export interface BrowserTabDescriptor {
    *  targeting — a browser tool with no surfaceId resolves a surface in the
    *  workspace regardless. Always false on the chrome backend (#1082). */
   selected: boolean;
+  /**
+   * Whether the CALLING connection opened this surface, as main recorded it.
+   * Absent when nobody claims it: restored after a restart, opened by a
+   * person, or opened before openers were recorded.
+   *
+   * A verdict, never an identity: main compares against what it recorded and
+   * reports only the answer, so no caller can learn — or replay — another
+   * connection's opener key.
+   */
+  opener?: 'mine' | 'other';
 }
 
 export const BROWSER_TABS_ERROR_CODES = [
