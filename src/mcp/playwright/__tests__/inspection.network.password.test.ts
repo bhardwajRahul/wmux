@@ -24,7 +24,7 @@ vi.mock('../PlaywrightEngine', () => ({
 }));
 
 import { registerInspectionTools } from '../tools/inspection';
-import { REDACTED_PASSWORD } from '../redact';
+import { REDACTED_CREDENTIAL, REDACTED_PASSWORD } from '../redact';
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   content: { type: 'text'; text: string }[];
@@ -84,17 +84,39 @@ describe('browser_network — request listing', () => {
 
   it('leaves ordinary URLs untouched', async () => {
     mockSendRpc.mockResolvedValue({
-      entries: [
-        { url: 'https://x.test/account/reset-password?token=abc123', method: 'POST', status: 200 },
-        { url: 'https://x.test/api/items?page=2', method: 'GET', status: 200 },
-      ],
+      entries: [{ url: 'https://x.test/api/items?page=2&sort=name', method: 'GET', status: 200 }],
     });
 
     const result = await network({});
 
-    expect(result.content[0].text).toContain('reset-password?token=abc123');
-    expect(result.content[0].text).toContain('api/items?page=2');
+    expect(result.content[0].text).toContain('api/items?page=2&sort=name');
     expect(result.content[0].text).not.toContain(REDACTED_PASSWORD);
+    expect(result.content[0].text).not.toContain(REDACTED_CREDENTIAL);
+  });
+
+  // #1354: the login flow that motivated this — an OAuth redirect chain the
+  // listing used to print with the authorization code and the tokens intact.
+  it('masks the OAuth authorization code and the tokens in a redirect chain', async () => {
+    mockSendRpc.mockResolvedValue({
+      entries: [
+        { url: 'https://idp.test/authorize?client_id=app-1&redirect_uri=https%3A%2F%2Fx.test%2Fcb', method: 'GET', status: 302 },
+        { url: 'https://x.test/cb?code=4%2F0AY0eSECRET&state=xyz789', method: 'GET', status: 302 },
+        { url: 'https://x.test/session#access_token=eyJhbGSECRET&id_token=eyJraWSECRET', method: 'GET', status: 200 },
+      ],
+    });
+
+    const result = await network({});
+    const text = result.content[0].text;
+
+    expect(text).not.toContain('SECRET');
+    expect(text).toContain(`code=${REDACTED_CREDENTIAL}`);
+    expect(text).toContain(`access_token=${REDACTED_CREDENTIAL}`);
+    expect(text).toContain(`id_token=${REDACTED_CREDENTIAL}`);
+    // The flow stays debuggable: hosts, paths, the non-secret parameters and
+    // the status codes all survive.
+    expect(text).toContain('idp.test/authorize?client_id=app-1');
+    expect(text).toContain('state=xyz789');
+    expect(text).toContain('"status": 302');
   });
 });
 
@@ -120,6 +142,21 @@ describe('browser_response_body', () => {
     expect(result.content[0].text).toBe(
       `username=alice&password=${REDACTED_PASSWORD}&csrf=t0ken`,
     );
+  });
+
+  it('masks the token-exchange response (#1354)', async () => {
+    mockSendRpc.mockResolvedValue({
+      body: '{"access_token":"ya29.SECRET","id_token":"eyJhSECRET","token_type":"Bearer","expires_in":3599}',
+    });
+
+    const result = await responseBody({ urlPattern: '*token*' });
+    const text = result.content[0].text;
+
+    expect(text).not.toContain('SECRET');
+    expect(text).toContain(`"access_token":"${REDACTED_CREDENTIAL}"`);
+    expect(text).toContain(`"id_token":"${REDACTED_CREDENTIAL}"`);
+    expect(text).toContain('"token_type":"Bearer"');
+    expect(text).toContain('"expires_in":3599');
   });
 
   it('returns an unrelated body byte for byte', async () => {
@@ -150,6 +187,23 @@ describe('browser_console', () => {
     // The level prefix and the surrounding message survive.
     expect(text).toContain('[log] POST /login');
     expect(text).toContain('[error] auth failed for');
+  });
+
+  it('masks a credential in a URL a page logged, and an Authorization header (#1354)', async () => {
+    mockSendRpc.mockResolvedValue({
+      entries: [
+        { level: 'error', text: 'Failed to load https://x.test/cb?code=4%2F0AY0eSECRET&state=xyz' },
+        { level: 'log', text: 'Authorization: Bearer eyJhbGciSECRET' },
+      ],
+    });
+
+    const text = (await consoleTool({})).content[0].text;
+
+    expect(text).not.toContain('SECRET');
+    expect(text).toContain(`code=${REDACTED_CREDENTIAL}`);
+    expect(text).toContain(`Authorization: ${REDACTED_CREDENTIAL}`);
+    expect(text).toContain('Failed to load https://x.test/cb');
+    expect(text).toContain('state=xyz');
   });
 
   it('passes ordinary log lines through byte for byte', async () => {

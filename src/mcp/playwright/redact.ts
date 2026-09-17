@@ -153,14 +153,142 @@ const URL_USERINFO_PASSWORD = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s/?#@:]+):[^\s/?#@]*@
  * 256 KB cap truncated, which no parser accepts — and the damage is bounded to
  * password-family keys, whose values are the one thing already being withheld.
  */
-export function redactPasswordParams(text: string): string {
-  if (!text) return text;
+function redactPasswordShapes(text: string): string {
   return text
     .replace(JSON_PASSWORD, `$1"${REDACTED_PASSWORD}"`)
     .replace(JSON_PASSWORD_TRUNCATED, `$1"${REDACTED_PASSWORD}`)
     .replace(FORM_PASSWORD, `$1$2=${REDACTED_PASSWORD}`)
     .replace(URL_USERINFO_PASSWORD, `$1:${REDACTED_PASSWORD}@`);
 }
+
+// ---------------------------------------------------------------------------
+// Non-password credentials (#1354)
+// ---------------------------------------------------------------------------
+
+/** Replacement text for any redacted non-password credential value. */
+export const REDACTED_CREDENTIAL = '[redacted:credential]';
+
+/**
+ * Parameter names that carry a credential which is NOT a password.
+ *
+ * An OAuth / SSO round trip never puts a password in a URL — it puts an
+ * authorization `code`, then an `access_token` / `id_token` / `refresh_token`,
+ * and a SAML round trip puts a whole signed assertion in `SAMLResponse`. Every
+ * one of them is a bearer credential: whoever reads it can act as the user
+ * until it expires. They were passing through browser_network, the console
+ * listing, response bodies and the persisted replay trace verbatim.
+ *
+ * Matched as a WHOLE key, unlike PASSWORD_KEY, which matches a stem inside a
+ * longer name. `token` as a stem would swallow `tokenizer`, `csrf_token`
+ * (worth keeping readable: it is per-form and useless off-page) and every
+ * `*_token_count` a JSON API reports. A whole-key match keeps the mask on the
+ * names that actually name a credential.
+ *
+ * `code` is the knowingly over-broad one: a page's country code or promo code
+ * is masked too. Accepted deliberately (issue #1354) — the value is opaque to
+ * the agent either way, the key stays visible, and the alternative is leaking
+ * authorization codes.
+ */
+const CREDENTIAL_KEY_NAMES: readonly string[] = [
+  'access_token',
+  'refresh_token',
+  'id_token',
+  'client_secret',
+  'session_state',
+  'samlresponse',
+  'api_key',
+  'apikey',
+  'authorization',
+  'signature',
+  'secret',
+  'token',
+  'auth',
+  'code',
+  'key',
+  'sig',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+];
+
+/**
+ * Longest name first, so the alternation cannot stop at `token` when the key is
+ * `id_token`. The boundaries make that unreachable anyway; the ordering keeps
+ * it true regardless of how the boundaries are later changed.
+ */
+const CREDENTIAL_KEY = `(?:${[...CREDENTIAL_KEY_NAMES]
+  .sort((a, b) => b.length - a.length)
+  .join('|')})`;
+
+/**
+ * `"access_token": <value>` at any nesting depth.
+ *
+ * Quoted STRING values only — unlike JSON_PASSWORD, which also masks a bare
+ * number because a numeric PIN is still a password. No bearer credential is
+ * transported as a JSON number, while `{"code": 404}` is what half the APIs on
+ * the web call their status field; masking that would blind the tool on bodies
+ * that carry no secret at all.
+ */
+const JSON_CREDENTIAL = new RegExp(
+  `("${CREDENTIAL_KEY}"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`,
+  'gi',
+);
+
+/** A JSON credential value the 256 KB capture cap cut mid-string. */
+const JSON_CREDENTIAL_TRUNCATED = new RegExp(`("${CREDENTIAL_KEY}"\\s*:\\s*)"[^"\\n]*$`, 'gim');
+
+/**
+ * `access_token=…` in a query string, a FRAGMENT, a form body, or a line of
+ * console output.
+ *
+ * `#` joins the boundary set that FORM_PASSWORD uses: the implicit-flow OAuth
+ * response puts the token after the fragment marker
+ * (`/callback#access_token=…&id_token=…`), which is precisely the shape the
+ * dogfood found in the network listing.
+ */
+const FORM_CREDENTIAL = new RegExp(`(^|[?&;#\\s])(${CREDENTIAL_KEY})=[^&;#\\s]*`, 'gi');
+
+/**
+ * A credential-bearing HTTP header, as a line of rendered header text:
+ * `Authorization: Bearer …`, `Cookie: …`, `Set-Cookie: …`, `X-Api-Key: …`.
+ *
+ * Line-anchored on purpose. A header name is a line-leading token wherever
+ * headers are rendered, and requiring that keeps prose ("the authorization:
+ * see the wiki") out of the mask. The header NAME survives — knowing that a
+ * request carried an `Authorization` header at all is most of what the network
+ * listing is read for.
+ */
+const CREDENTIAL_HEADER =
+  /(^|[\r\n])([ \t]*(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|api-key)[ \t]*:[ \t]*)[^\r\n]+/gi;
+
+/**
+ * Replace credential VALUES — password and non-password alike — in a URL, a
+ * request/response body, a console line, or a rendered header block.
+ *
+ * Password-family keys keep their own `[redacted:password]` marker; everything
+ * else gets `[redacted:credential]`, so a reader can tell which rule fired.
+ *
+ * Same known trade-off as the password path: these are regexes over text, not
+ * a parse, because the bodies most in need of masking are the ones the capture
+ * cap truncated, which no parser accepts.
+ */
+export function redactCredentialParams(text: string): string {
+  if (!text) return text;
+  return redactPasswordShapes(text)
+    .replace(JSON_CREDENTIAL, `$1"${REDACTED_CREDENTIAL}"`)
+    .replace(JSON_CREDENTIAL_TRUNCATED, `$1"${REDACTED_CREDENTIAL}`)
+    .replace(FORM_CREDENTIAL, `$1$2=${REDACTED_CREDENTIAL}`)
+    .replace(CREDENTIAL_HEADER, `$1$2${REDACTED_CREDENTIAL}`);
+}
+
+/**
+ * Historical name for {@link redactCredentialParams}.
+ *
+ * Kept as an alias so the call sites that already mask output (network,
+ * console, response bodies, snapshot listings, navigation echoes, the replay
+ * recorder) pick the wider rule up without churn.
+ */
+export const redactPasswordParams = redactCredentialParams;
 
 // ---------------------------------------------------------------------------
 // CDP: DOM → a11y bridge

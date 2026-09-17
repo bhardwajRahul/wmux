@@ -185,6 +185,23 @@ describe('recordAction', () => {
     expect(entry.step.unrecordable).toBe('redacted-url');
   });
 
+  // #1354: a trace is written to disk and kept for thirty days, so an OAuth
+  // code recorded verbatim outlives the session that leaked it.
+  it('masks an OAuth code recorded into a navigate step and holes it', () => {
+    recordAction(deps, {
+      scope,
+      tool: 'browser_navigate',
+      page: null,
+      args: { url: 'https://example.com/cb?code=4%2F0AY0eSECRET&state=xyz' },
+      url: 'https://example.com/cb',
+    });
+    const [entry] = ring.all();
+    const stored = JSON.stringify(entry);
+    expect(stored).not.toContain('SECRET');
+    expect(stored).toContain('[redacted:credential]');
+    expect(entry.step.unrecordable).toBe('redacted-url');
+  });
+
   it('leaves a clean navigate URL replayable', () => {
     recordAction(deps, {
       scope,
