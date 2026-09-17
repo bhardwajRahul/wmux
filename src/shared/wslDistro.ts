@@ -65,16 +65,27 @@ export function isWslDistroSpawnArgs(
 }
 
 /**
- * Parse `wsl --list --quiet` output into distro names. Invoked with
- * `WSL_UTF8=1`, the output is UTF-8; older/misbehaving installs still emit
- * UTF-16LE, which is decoded properly from the BUFFER (NUL-stripping a
- * utf8-mangled string destroys every non-ASCII distro name). Blank lines,
- * BOMs, and stray \r are tolerated; nothing matching the name charset
- * survives to the output by accident.
- * Docker-owned distros (`docker-desktop`, `docker-desktop-data`) sort LAST —
- * they are infrastructure, not workspaces (#1103's whole complaint).
+ * Decode bytes that wsl.exe ITSELF wrote: a `--list` listing (#1103), or the
+ * error text it prints when it refuses to start a distro (#1390).
+ *
+ * wsl.exe emits UTF-16LE unless it honours `WSL_UTF8=1`, and reading those
+ * bytes as UTF-8 loses the text in both directions: ASCII survives with a NUL
+ * between every character (`L\0i\0n\0u\0x\0`, the shape reported in #1390) and
+ * every non-ASCII character collapses to U+FFFD, unrecoverable afterwards. So
+ * decode from the BUFFER, at the boundary, once:
+ *
+ *   FF FE ...      UTF-16LE with BOM
+ *   EF BB BF ...   UTF-8 with BOM
+ *   any NUL byte   BOM-less UTF-16LE, what the inbox wsl.exe emits when it
+ *                  ignores WSL_UTF8; well-formed UTF-8 never carries a NUL
+ *   otherwise      UTF-8
+ *
+ * ONLY for wsl.exe's own output. Never run it over the stdout of a program
+ * wsl.exe LAUNCHED: those bytes belong to the Linux child, they are UTF-8, and
+ * a NUL there can be data (WSL_CWD_PROBE NUL-separates its fields on purpose).
+ * A string in is returned unchanged except for a leading BOM.
  */
-export function parseWslDistros(raw: string | Buffer): string[] {
+export function decodeWslOutput(raw: string | Buffer): string {
   let text: string;
   if (Buffer.isBuffer(raw)) {
     // BOM sniff: UTF-16LE (FF FE) vs UTF-8 (EF BB BF) vs bare bytes.
@@ -94,7 +105,21 @@ export function parseWslDistros(raw: string | Buffer): string[] {
   } else {
     text = raw.replace(/^\uFEFF/, '');
   }
-  const names = text
+  return text;
+}
+
+/**
+ * Parse `wsl --list --quiet` output into distro names. Invoked with
+ * `WSL_UTF8=1`, the output is UTF-8; older/misbehaving installs still emit
+ * UTF-16LE, which decodeWslOutput handles from the BUFFER (NUL-stripping a
+ * utf8-mangled string destroys every non-ASCII distro name). Blank lines,
+ * BOMs, and stray \r are tolerated; nothing matching the name charset
+ * survives to the output by accident.
+ * Docker-owned distros (`docker-desktop`, `docker-desktop-data`) sort LAST:
+ * they are infrastructure, not workspaces (#1103's whole complaint).
+ */
+export function parseWslDistros(raw: string | Buffer): string[] {
+  const names = decodeWslOutput(raw)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => WSL_DISTRO_NAME_RE.test(line));

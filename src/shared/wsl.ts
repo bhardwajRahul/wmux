@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { isWslDistroSpawnArgs } from './wslDistro';
+import { decodeWslOutput, isWslDistroSpawnArgs } from './wslDistro';
 import os from 'node:os';
 import { execFile } from 'node:child_process';
 
@@ -52,11 +52,21 @@ export async function resolveWslCwd(
     let output: string;
     try {
       output = await (probe ? probe(args) : new Promise<string>((resolve, reject) => {
-        execFile(shell, args, { encoding: 'utf8', timeout: WSL_PROBE_TIMEOUT_MS,
+        // BUFFER, not a forced encoding, because the two streams speak
+        // different encodings and only one of them is wsl.exe's (#1390):
+        //   stderr is wsl.exe's OWN diagnostic ("no distribution with the
+        //     supplied name", localized), UTF-16LE on any install that does
+        //     not honour WSL_UTF8. Forcing utf8 here is what stored
+        //     `L\0i\0n\0u\0x\0` in recoveryError and reported it as
+        //     SPAWN_FAILED, with every non-ASCII character already lost.
+        //   stdout belongs to the Linux child, is UTF-8, and is deliberately
+        //     NUL-SEPARATED by WSL_CWD_PROBE. Decode it as UTF-8 and never
+        //     sniff it: the NUL rule would read a successful probe as UTF-16.
+        execFile(shell, args, { encoding: 'buffer', timeout: WSL_PROBE_TIMEOUT_MS,
           maxBuffer: 16_384, windowsHide: true, cwd: os.homedir(),
         }, (error, stdout, stderr) => {
-          if (error) reject(new Error(stderr.trim() || error.message));
-          else resolve(stdout);
+          if (error) reject(new Error(decodeWslOutput(stderr).trim() || error.message));
+          else resolve(stdout.toString('utf8'));
         });
       }));
     } catch (error) {

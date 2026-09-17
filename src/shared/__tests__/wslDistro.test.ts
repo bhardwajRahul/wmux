@@ -5,6 +5,7 @@ import {
   wslDistroArgs,
   isWslDistroSpawnArgs,
   parseWslDistros,
+  decodeWslOutput,
 } from '../wslDistro';
 
 // #1103 — the distro choice travels as EXACTLY ['-d', '<name>'] and every
@@ -94,5 +95,47 @@ describe('parseWslDistros', () => {
   it('drops blank lines, duplicates, and names outside the charset', () => {
     expect(parseWslDistros('\n\nUbuntu\nUbuntu\n<Default>\nsome weird/name\n'))
       .toEqual(['Ubuntu']);
+  });
+});
+
+// #1390 — wsl.exe writes UTF-16LE. Every reader of its output goes through
+// decodeWslOutput, so a spawn failure reaches recoveryError as readable text
+// instead of the interleaved-NUL form the issue reported.
+describe('decodeWslOutput', () => {
+  const NUL = String.fromCharCode(0);
+  const BOM = String.fromCharCode(0xfeff);
+  // What wsl.exe prints on a box with no distro installed, localized.
+  const korean = '지정된 이름의 배포가 없습니다.\r\nError code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND';
+
+  it('decodes UTF-16LE with a BOM', () => {
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(korean, 'utf16le')]);
+    expect(decodeWslOutput(bytes)).toBe(korean);
+  });
+
+  it('decodes BOM-less UTF-16LE, the form that mangled recoveryError', () => {
+    const bytes = Buffer.from(korean, 'utf16le');
+    // The old path: utf8 over UTF-16LE bytes keeps ASCII with a NUL after
+    // every character and destroys the Korean outright.
+    expect(bytes.toString('utf8')).toContain(NUL);
+    expect(decodeWslOutput(bytes)).toBe(korean);
+    expect(decodeWslOutput(bytes)).not.toContain(NUL);
+  });
+
+  it('decodes the ASCII shape from the issue without interleaved NULs', () => {
+    expect(decodeWslOutput(Buffer.from('Linux', 'utf16le'))).toBe('Linux');
+  });
+
+  it('leaves genuine UTF-8 untouched, with or without a BOM', () => {
+    const message = 'wsl: 배포를 시작할 수 없습니다';
+    expect(decodeWslOutput(Buffer.from(message, 'utf8'))).toBe(message);
+    expect(decodeWslOutput(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(message, 'utf8')])))
+      .toBe(message);
+  });
+
+  it('answers empty for empty input and strips a BOM from a string', () => {
+    expect(decodeWslOutput(Buffer.alloc(0))).toBe('');
+    expect(decodeWslOutput('')).toBe('');
+    expect(decodeWslOutput(`${BOM}Ubuntu`)).toBe('Ubuntu');
+    expect(decodeWslOutput('plain text')).toBe('plain text');
   });
 });

@@ -3,8 +3,20 @@ const { exec } = vi.hoisted(() => ({ exec: vi.fn() }));
 vi.mock('node:child_process', () => ({ execFile: exec }));
 import { resolveWslCwd, WSL_PROBE_TIMEOUT_MS } from '../wsl';
 
-type Callback = (error: Error | null, stdout: string, stderr: string) => void;
-const finish = (call: number, cwd = '/project') => (exec.mock.calls[call][3] as Callback)(null, `Ubuntu\0user\0${cwd}\0`, '');
+type Callback = (error: Error | null, stdout: string | Buffer, stderr: string | Buffer) => void;
+/**
+ * Answer a pending probe the way node's execFile does: raw Buffers when the
+ * caller asked for `encoding: 'buffer'`, decoded strings for any other
+ * encoding. Honouring the requested encoding is what lets the #1390 tests
+ * below exercise the real decoding path instead of the mock's preference.
+ */
+const respond = (call: number, stdout: Buffer, stderr: Buffer, error: Error | null = null) => {
+  const { encoding } = exec.mock.calls[call][2] as { encoding: BufferEncoding | 'buffer' };
+  const shape = (bytes: Buffer) => (encoding === 'buffer' ? bytes : bytes.toString(encoding));
+  (exec.mock.calls[call][3] as Callback)(error, shape(stdout), shape(stderr));
+};
+const finish = (call: number, cwd = '/project') =>
+  respond(call, Buffer.from(`Ubuntu\0user\0${cwd}\0`, 'utf8'), Buffer.alloc(0));
 beforeEach(() => exec.mockReset());
 
 describe('asynchronous WSL probes', () => {
@@ -28,10 +40,58 @@ describe('asynchronous WSL probes', () => {
     const other = resolveWslCwd('wsl.exe', '/other', { distribution: 'Other', user: 'user' });
     expect(exec).toHaveBeenCalledTimes(2);
     const rejection = expect(failed).rejects.toThrow('directory missing');
-    (exec.mock.calls[0][3] as Callback)(new Error('failed'), '', 'directory missing');
+    respond(0, Buffer.alloc(0), Buffer.from('directory missing', 'utf8'), new Error('failed'));
     finish(1, '/other'); await other; await rejection;
     const retry = resolveWslCwd('wsl.exe', '/missing');
     expect(exec).toHaveBeenCalledTimes(3);
     finish(2, '/missing'); await retry;
+  });
+});
+
+// #1390 — the probe reads BYTES. wsl.exe's own failure text is UTF-16LE and
+// has to be decoded before it becomes the Error message the daemon stores in
+// recoveryError and returns as SPAWN_FAILED; the Linux child's stdout is UTF-8
+// with deliberate NUL separators and must never be sniffed as UTF-16.
+describe('wsl.exe output decoding', () => {
+  const NUL = String.fromCharCode(0);
+
+  it('decodes a UTF-16LE spawn failure instead of storing interleaved NULs', async () => {
+    const wslMessage = '지정된 이름의 배포가 없습니다.';
+    const failed = resolveWslCwd('wsl.exe', '/project-utf16').catch((error: Error) => error.message);
+    expect(exec.mock.calls[0][2].encoding).toBe('buffer');
+    respond(0, Buffer.alloc(0), Buffer.from(`${wslMessage}\r\n`, 'utf16le'), new Error('Command failed'));
+    const message = await failed;
+    expect(message).toContain(wslMessage);
+    expect(message).not.toContain(NUL);
+  });
+
+  it('decodes a UTF-16LE failure carrying a BOM', async () => {
+    const wslMessage = 'There is no distribution with the supplied name.';
+    const failed = resolveWslCwd('wsl.exe', '/project-bom').catch((error: Error) => error.message);
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(wslMessage, 'utf16le')]);
+    respond(0, Buffer.alloc(0), bytes, new Error('Command failed'));
+    const message = await failed;
+    expect(message).toContain(wslMessage);
+    expect(message).not.toContain(NUL);
+  });
+
+  it('passes genuine UTF-8 failure text through unchanged', async () => {
+    const wslMessage = 'wsl: 배포를 시작할 수 없습니다';
+    const failed = resolveWslCwd('wsl.exe', '/project-utf8').catch((error: Error) => error.message);
+    respond(0, Buffer.alloc(0), Buffer.from(wslMessage, 'utf8'), new Error('Command failed'));
+    expect(await failed).toContain(wslMessage);
+  });
+
+  it('falls back to the exec error when wsl.exe printed nothing', async () => {
+    const failed = resolveWslCwd('wsl.exe', '/project-silent').catch((error: Error) => error.message);
+    respond(0, Buffer.alloc(0), Buffer.alloc(0), new Error('spawn wsl.exe ENOENT'));
+    expect(await failed).toContain('spawn wsl.exe ENOENT');
+  });
+
+  it('keeps reading the NUL-separated probe stdout as UTF-8', async () => {
+    const cwd = '/home/개발자/프로젝트';
+    const probe = resolveWslCwd('wsl.exe', cwd);
+    respond(0, Buffer.from(`Ubuntu${NUL}개발자${NUL}${cwd}${NUL}`, 'utf8'), Buffer.alloc(0));
+    expect(await probe).toEqual({ cwd, target: { distribution: 'Ubuntu', user: '개발자' } });
   });
 });
