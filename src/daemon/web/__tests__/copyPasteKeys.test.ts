@@ -61,7 +61,7 @@ describe('newline keys', () => {
   it('Shift+Enter emits the win32-input-mode pair when the pane negotiated ?9001h', () => {
     expect(decideWebKey(kd({ key: 'Enter', code: 'Enter', shiftKey: true }), { remoteWin32Input: true })).toEqual({
       action: 'newline',
-      data: '\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_',
+      data: '\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_',
     });
   });
 
@@ -71,7 +71,7 @@ describe('newline keys', () => {
       remoteWin32Input: true,
     })).toEqual({
       action: 'newline',
-      data: '\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_',
+      data: '\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_',
     });
   });
 

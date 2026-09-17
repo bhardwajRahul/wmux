@@ -94,12 +94,22 @@ describe('resolveNewlineKeyByte — Shift+Enter (preserved behavior)', () => {
     ).toBe('\x1b[13;2u');
   });
 
-  it('emits the win32-input-mode pair when the pane negotiated ?9001h (#1152)', () => {
+  // #1363: the Unicode field carries LF, not CR — ConPTY drops the SHIFT
+  // modifier, so a record with Uc=13 reaches the TUI as a plain Enter and the
+  // prompt submits. Measured against a live Claude Code pane on Windows.
+  it('emits the win32-input-mode pair with Uc=10 when the pane negotiated ?9001h (#1152)', () => {
     expect(
       resolveNewlineKeyByte(ev({ key: 'Enter', shiftKey: true }), {
         protocol: { win32Input: true },
       }),
-    ).toBe('\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_');
+    ).toBe('\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_');
+  });
+
+  it('never encodes a carriage return into the win32 record', () => {
+    const byte = resolveNewlineKeyByte(ev({ key: 'Enter', shiftKey: true }), {
+      protocol: { win32Input: true },
+    });
+    expect(byte).not.toContain(';13;1;16;');
   });
 
   it('prefers win32-input-mode over kitty when both were seen', () => {
@@ -108,7 +118,7 @@ describe('resolveNewlineKeyByte — Shift+Enter (preserved behavior)', () => {
       resolveNewlineKeyByte(ev({ key: 'Enter', shiftKey: true }), {
         protocol: { win32Input: true, kitty: true },
       }),
-    ).toBe('\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_');
+    ).toBe('\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_');
   });
 
   it('hands Shift+Enter back to xterm when a mirror/web viewer saw no protocol', () => {

@@ -3,7 +3,6 @@ import {
   encodeEscape,
   isBareEscape,
   ESCAPE_CSI_U,
-  ESCAPE_WIN32,
 } from '../escapeKeys';
 
 describe('encodeEscape', () => {
@@ -16,12 +15,15 @@ describe('encodeEscape', () => {
     expect(encodeEscape({ kitty: true })).toBe(ESCAPE_CSI_U);
   });
 
-  it('emits the win32-input-mode pair when the pane negotiated ?9001h', () => {
-    expect(encodeEscape({ win32Input: true })).toBe(ESCAPE_WIN32);
+  // #1373: ConPTY converts a win32 KEY_EVENT record back into a bare ESC for
+  // the client, so the record pair was never worth its risk — and Escape went
+  // dead in Claude Code panes on 3.56.0. The bare byte is what 3.55.0 sent.
+  it('emits a bare ESC under win32-input-mode, not a key record', () => {
+    expect(encodeEscape({ win32Input: true })).toBe('\x1b');
   });
 
-  it('prefers win32-input-mode over kitty', () => {
-    expect(encodeEscape({ win32Input: true, kitty: true })).toBe(ESCAPE_WIN32);
+  it('still emits CSI-u when kitty is pushed alongside win32-input-mode', () => {
+    expect(encodeEscape({ win32Input: true, kitty: true })).toBe(ESCAPE_CSI_U);
   });
 
   it('does not re-encode unmodified Escape for modifyOtherKeys', () => {
