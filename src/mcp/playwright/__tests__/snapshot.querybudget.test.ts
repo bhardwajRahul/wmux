@@ -81,3 +81,58 @@ describe.skipIf(!CHROME)('browser_snapshot q on a large page (#1356)', () => {
     }
   }, 300_000);
 });
+
+// The same budget for `selector`, which kept paying the whole-page fetch until
+// #1371. Measured on the same fixture at SNAPSHOT_BENCH_SCALE=10, Chrome 141,
+// with the a11y tree already computed (see the warm-up below):
+//
+//   getFullAXTree alone                 3178 ms
+//   before   selector "#needle-row"     3352 ms
+//   after    selector "#needle-row"      291 ms
+//
+// The warm-up is not a thumb on the scale: Chrome computes a page's
+// accessibility tree once, on the first query of any kind, and BOTH paths pay
+// that (~3.4 s here) when they are that first query. What #1371 removes is the
+// per-snapshot cost of marshalling all 35 000 nodes to fetch ten of them, which
+// is what every snapshot after the first was paying.
+describe.skipIf(!CHROME)('browser_snapshot selector scope on a large page (#1371)', () => {
+  it('fetches the matched subtree instead of the whole tree', async () => {
+    const browser = await chromium.launch({ executablePath: CHROME });
+    try {
+      const page = await browser.newPage();
+      await page.goto(FIXTURE);
+      if (SCALE > 1) {
+        await page.evaluate((n: number) => {
+          const rows = document.getElementById('rows')!;
+          const html: string[] = [];
+          for (let i = 500; i < 500 * n; i++) {
+            html.push(
+              `<section role="group" aria-label="Row ${i}"><span>Widget ${i}</span>` +
+                `<span>value ${i}</span><button type="button">Open Widget ${i}</button>` +
+                `<a href="#r${i}">Details ${i}</a></section>`,
+            );
+          }
+          rows.insertAdjacentHTML('beforeend', html.join(''));
+        }, SCALE);
+      }
+
+      // One whole-page snapshot first: it is the measurement AND the warm-up,
+      // so the scope below is timed against a tree Chrome has already computed.
+      const whole0 = performance.now();
+      await generateSnapshot(page, {});
+      const whole = performance.now() - whole0;
+
+      const scoped0 = performance.now();
+      const scoped = await generateScopedSnapshot(page, '#needle-row', { format: 'ai' });
+      const scopedMs = performance.now() - scoped0;
+
+      // The scope still says what it always said — the row, whole.
+      expect(scoped).toContain('Unobtainium 250');
+      expect(scoped).toContain('Details 250');
+      expect(scoped).not.toContain('Widget 249');
+      expect(scopedMs).toBeLessThan(whole / 2);
+    } finally {
+      await browser.close();
+    }
+  }, 300_000);
+});
