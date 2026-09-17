@@ -82,7 +82,7 @@ const BROWSER_SNAPSHOT_SHAPE = {
     .string()
     .optional()
     .describe(
-      'Scope to the first match (e.g. "[role=dialog]"), falling back to a DOM listing of that element when the tree cannot be scoped.',
+      'Scope to the first match (e.g. "[role=dialog]") — the cheapest way to narrow a big page. Falls back to a DOM listing of that element when the tree cannot be scoped.',
     ),
   filter: z
     .enum(['interactive'])
@@ -91,7 +91,9 @@ const BROWSER_SNAPSHOT_SHAPE = {
   q: z
     .string()
     .optional()
-    .describe('Keep only nodes matching this text (or /regex/), plus their ancestors.'),
+    .describe(
+      'Text filter: keep only nodes matching this text (or /regex/), plus their ancestors. Literal text is searched in the page and costs about as little as a selector scope; a /regex/, or a page with iframes, still reads the whole tree first — prefer selector when you know where to look.',
+    ),
   full: z.boolean().optional().describe('Force the complete tree instead of a diff.'),
   surfaceId: optionalSurfaceId,
 };

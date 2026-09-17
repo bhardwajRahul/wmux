@@ -1444,6 +1444,175 @@ type CdpClient = {
   detach: () => Promise<void>;
 };
 
+// ---------------------------------------------------------------------------
+// `q` fast path
+// ---------------------------------------------------------------------------
+//
+// Profiled on a 35 000-node fixture (Chrome 141, 2026-09-17):
+//
+//   Accessibility.getFullAXTree            9872 ms   (35006 nodes)
+//   DOM.performSearch + getSearchResults    119 ms   (3 hits)
+//   Accessibility.getPartialAXTree           12 ms   (6 nodes)
+//
+// Everything downstream — buildTree, the `q` prune, serialisation — measured
+// under 30 ms together. So `q` was never slow because it filters late; it was
+// slow because it asks Chrome to compute and marshal the WHOLE accessibility
+// tree before there is anything to filter, which is the one stage that is 75x
+// the rest put together and the stage `selector` does not have to pay when it
+// degrades to the DOM listing (#1356).
+//
+// The fast path asks Chrome to find the text instead: one DOM search, then one
+// partial tree per hit, which arrives with the hit's ancestor chain already in
+// it. Everything after that is the code the slow path runs, unchanged — the
+// same buildTree, the same pruneChildrenToQuery, the same ref numbering off
+// backendDOMNodeId — so the ancestors and the ref numbers are what they were.
+//
+// It is deliberately narrow, and every condition it refuses falls back to the
+// full tree rather than returning a smaller answer:
+//
+//  - `/regex/` queries. DOM search takes literal text only.
+//  - A document with an `<iframe>`. Frame contents reach the tree through the
+//    graft, which needs the full fetch; a partial tree stops at the boundary.
+//  - Zero hits. A `q` naming a ROLE ("button") is invisible to a DOM text
+//    search, and that is exactly the query whose answer must not silently
+//    shrink — so no hits means the slow path runs and decides.
+//  - More hits, or more fetched nodes, than the budgets below: past them the
+//    round trips cost more than the one big fetch they replace.
+const MIN_Q_SEARCH_LENGTH = 2;
+const MAX_Q_SEARCH_HITS = 200;
+const MAX_Q_FETCHED_NODES = 2000;
+
+/** The four fields `queryMatcher` reads, from a raw CDP node. */
+function cdpSearchable(node: CdpAXNode): AXNode {
+  return {
+    role: node.role?.value ?? 'none',
+    name: node.name?.value ?? '',
+    ...(node.value?.value ? { value: String(node.value.value) } : {}),
+    ...(node.description?.value ? { description: String(node.description.value) } : {}),
+  };
+}
+
+/**
+ * Build the tree `q` needs out of partial fetches, or null to use the full one.
+ *
+ * Null is always safe: it means "this route cannot prove it would return what
+ * the full tree returns", and the caller then fetches the full tree exactly as
+ * before.
+ */
+async function fetchQueryMatchedTree(
+  client: CdpClient,
+  q: string,
+  passwordBackendIds: Set<number>,
+): Promise<BuiltTree | null> {
+  if (/^\/(.+)\/([gimsuy]*)$/.test(q)) return null;
+  if (q.trim().length < MIN_Q_SEARCH_LENGTH) return null;
+
+  try {
+    const doc = (await client.send('DOM.getDocument', { depth: 0 })) as {
+      root?: { nodeId?: number };
+    };
+    const rootNodeId = doc?.root?.nodeId;
+    if (!rootNodeId) return null;
+
+    // A frame's nodes only reach the tree through graftChildFrames, which needs
+    // the whole-page fetch. Refusing here is what keeps a framed page's `q`
+    // answer identical to what it was.
+    const frames = (await client.send('DOM.querySelectorAll', {
+      nodeId: rootNodeId,
+      selector: FRAME_ELEMENT_SELECTOR,
+    })) as { nodeIds?: number[] };
+    if ((frames?.nodeIds?.length ?? 0) > 0) return null;
+
+    const search = (await client.send('DOM.performSearch', {
+      query: q,
+      includeUserAgentShadowDOM: false,
+    })) as { searchId?: string; resultCount?: number };
+    const searchId = search?.searchId;
+    if (!searchId) return null;
+    const resultCount = search?.resultCount ?? 0;
+    let nodeIds: number[] = [];
+    if (resultCount > 0 && resultCount <= MAX_Q_SEARCH_HITS) {
+      const found = (await client.send('DOM.getSearchResults', {
+        searchId,
+        fromIndex: 0,
+        toIndex: resultCount,
+      })) as { nodeIds?: number[] };
+      nodeIds = found?.nodeIds ?? [];
+    }
+    await client.send('DOM.discardSearchResults', { searchId }).catch(() => { /* best-effort */ });
+    if (nodeIds.length === 0) return null;
+
+    // nodeId → backendNodeId, then the hit's own AX node with its ancestors.
+    const collected = new Map<string, CdpAXNode>();
+    const hits: CdpAXNode[] = [];
+    const seenBackend = new Set<number>();
+    for (const nodeId of nodeIds) {
+      const described = (await client.send('DOM.describeNode', { nodeId })) as {
+        node?: { backendNodeId?: number };
+      };
+      const backendNodeId = described?.node?.backendNodeId;
+      if (backendNodeId === undefined || seenBackend.has(backendNodeId)) continue;
+      seenBackend.add(backendNodeId);
+      const partial = (await client.send('Accessibility.getPartialAXTree', {
+        backendNodeId,
+        fetchRelatives: true,
+      })) as { nodes?: CdpAXNode[] };
+      for (const node of partial?.nodes ?? []) {
+        if (!collected.has(node.nodeId)) collected.set(node.nodeId, node);
+        if (node.backendDOMNodeId === backendNodeId) hits.push(node);
+      }
+      if (collected.size > MAX_Q_FETCHED_NODES) return null;
+    }
+    if (collected.size === 0) return null;
+
+    // A matched node keeps its whole subtree in the pruned output, so the
+    // subtree has to be here. Expanded from the MATCHING nodes only —
+    // `fetchRelatives` also hands back the ancestors' other children, and
+    // expanding those would walk back to the full tree one round trip at a
+    // time. Unmatched siblings that came along are dropped by the same prune
+    // that drops them on the slow path.
+    const plan = queryMatcher(q);
+    const frontier = [
+      ...hits,
+      ...[...collected.values()].filter((n) => plan.matches(cdpSearchable(n))),
+    ];
+    const expanded = new Set<string>();
+    while (frontier.length > 0) {
+      const node = frontier.pop()!;
+      if (expanded.has(node.nodeId)) continue;
+      expanded.add(node.nodeId);
+      const missing = (node.childIds ?? []).some((id) => !collected.has(id));
+      if (!missing) {
+        for (const id of node.childIds ?? []) {
+          const child = collected.get(id);
+          if (child) frontier.push(child);
+        }
+        continue;
+      }
+      const kids = (await client.send('Accessibility.getChildAXNodes', {
+        id: node.nodeId,
+      })) as { nodes?: CdpAXNode[] };
+      for (const child of kids?.nodes ?? []) {
+        if (!collected.has(child.nodeId)) collected.set(child.nodeId, child);
+        frontier.push(collected.get(child.nodeId)!);
+      }
+      if (collected.size > MAX_Q_FETCHED_NODES) return null;
+    }
+
+    // buildTree reads nodes[0] as the document root, so the root has to lead —
+    // a partial tree lists the requested node first and its ancestors after it.
+    const nodes = [...collected.values()];
+    const rootIndex = nodes.findIndex((n) => n.parentId === undefined || !collected.has(n.parentId));
+    if (rootIndex === -1) return null;
+    const [root] = nodes.splice(rootIndex, 1);
+    return buildTree([root, ...nodes], passwordBackendIds);
+  } catch {
+    // performSearch unavailable (an older target, the RPC lane's stand-in), a
+    // detached session, a refused domain — the full tree is the answer.
+    return null;
+  }
+}
+
 /** Fetch and build the full a11y tree over an already-open CDP session. */
 async function fetchAccessibilityTree(
   client: CdpClient,
@@ -1453,6 +1622,13 @@ async function fetchAccessibilityTree(
    * a selector scope cannot be combined with a frame route (see resolveRef).
    */
   graftInto?: { page: Page; extraSessions: CdpClient[] },
+  /**
+   * The caller's `q`, when there is one. Lets the fetch itself be narrowed to
+   * the text the caller asked about instead of the whole document — see
+   * fetchQueryMatchedTree, which returns null whenever it cannot guarantee the
+   * full tree's answer, leaving the fetch below exactly as it was (#1356).
+   */
+  query?: string,
 ): Promise<BuiltTree | null> {
   // Enable the Accessibility domain before querying. Without it, getFullAXTree
   // is racy on heavy pages — the domain computes the tree lazily on enable.
@@ -1463,6 +1639,13 @@ async function fetchAccessibilityTree(
   // id space both domains share. Reused across the retry below — the document
   // does not change identity in 250 ms.
   const passwordBackendIds = await getPasswordFieldBackendIds(client);
+
+  if (query) {
+    const searched = await fetchQueryMatchedTree(client, query, passwordBackendIds);
+    // No graft: the fast path only serves a document with no frames in it, so
+    // there is nothing for graftChildFrames to find.
+    if (searched && !isRootOnly(searched.root)) return searched;
+  }
 
   let built = buildTree(
     (await client.send('Accessibility.getFullAXTree') as { nodes: CdpAXNode[] }).nodes,
@@ -1937,6 +2120,8 @@ interface SnapshotSource {
 async function getAccessibilityTree(
   page: Page,
   wantDomFacts: boolean,
+  /** The caller's `q`. See fetchAccessibilityTree's own `query` parameter. */
+  query?: string,
 ): Promise<SnapshotSource> {
   // Sessions opened for out-of-process frames during the graft. Detached here
   // rather than inside the walk so one frame's cleanup cannot abort the rest.
@@ -1945,7 +2130,8 @@ async function getAccessibilityTree(
     return await withCdpSession<SnapshotSource>(
       page,
       async (client) => {
-        const tree = (await fetchAccessibilityTree(client, { page, extraSessions }))?.root ?? null;
+        const tree =
+          (await fetchAccessibilityTree(client, { page, extraSessions }, query))?.root ?? null;
         // On the same session as the tree, so the DOM the attributes are read
         // from is the DOM the a11y nodes were computed against. Its own
         // failures are swallowed inside — a missing label abstains.
@@ -2005,6 +2191,7 @@ export async function generateSnapshot(
   const { tree, occlusion, ownLabels, editableRoots } = await getAccessibilityTree(
     page,
     format === 'ai',
+    options?.q,
   );
 
   // A null tree (no CDP session / getFullAXTree threw / zero nodes) OR a root-only
