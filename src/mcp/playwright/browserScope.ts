@@ -283,16 +283,36 @@ export async function sendScopedBrowserRpc<T = unknown>(
  * Main's builtin-reuse path already post-checks exactly this shape
  * (browser.rpc.ts, "Reported, not swallowed"). Doing it here, at the one
  * funnel every scoped browser RPC passes through, retires the whole class
- * rather than navigate's instance of it. A success shape is never rewritten:
- * `ok === true` passes through untouched, and no browser method answers a
- * top-level `error` string on a path that worked.
+ * rather than navigate's instance of it.
+ *
+ * Both of wmux's returned-failure conventions count: the bare
+ * `{ error: string }` the renderer bridge and main's own refusals use, and the
+ * `{ ok: false, error: { code, message } }` `browser.tabs` answers with.
+ *
+ * A success is never rewritten. `ok === true` short-circuits, and a payload
+ * that merely CARRIES data under some other key is untouched — the check reads
+ * `error` and nothing else. The invariant it rests on (no browser method
+ * answers a top-level `error` on a path that worked) is pinned by a test in
+ * browserScope.errorPayload.test.ts rather than by this comment alone.
  */
 function rejectErrorPayload(result: unknown): unknown {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
   const shape = result as { ok?: unknown; error?: unknown };
   if (shape.ok === true) return result;
-  if (typeof shape.error === 'string' && shape.error.length > 0) throw new Error(shape.error);
+  const message = describeReturnedFailure(shape.error);
+  if (message) throw new Error(message);
   return result;
+}
+
+/** The human-readable half of either returned-failure convention, or null. */
+function describeReturnedFailure(error: unknown): string | null {
+  if (typeof error === 'string') return error.length > 0 ? error : null;
+  if (!error || typeof error !== 'object') return null;
+  const structured = error as { code?: unknown; message?: unknown };
+  const text = typeof structured.message === 'string' ? structured.message : '';
+  const code = typeof structured.code === 'string' ? structured.code : '';
+  if (text && code) return `${code}: ${text}`;
+  return text || code || null;
 }
 
 /**

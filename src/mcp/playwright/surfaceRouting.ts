@@ -235,9 +235,10 @@ export function scopeTargets(
  */
 async function surfaceListing(
   workspaceId: string,
+  timeoutMs?: number,
 ): Promise<{ status: 'listed'; surfaceIds: string[] } | { status: 'unknown' }> {
   try {
-    const result = (await sendRpc('browser.tabs', { action: 'list', workspaceId })) as
+    const result = (await sendRpc('browser.tabs', { action: 'list', workspaceId }, timeoutMs)) as
       | { ok?: unknown; action?: unknown; tabs?: Array<{ surfaceId?: unknown; opener?: unknown }> }
       | undefined;
     if (result?.ok !== true || result.action !== 'list' || !Array.isArray(result.tabs)) {
@@ -362,9 +363,11 @@ export class SurfaceNotRegisteredError extends Error {
   constructor(public readonly surfaceId: string) {
     super(
       `BROWSER_SURFACE_NOT_REGISTERED: a browser surface was opened for you (${surfaceId}) but ` +
-        'never became addressable — main lists no CDP target for it and this workspace\'s pane ' +
-        'list does not contain it. Nothing was navigated. Retry, or open one explicitly with ' +
-        'browser_open.',
+        'never became addressable — main lists no CDP target for it and this workspace does not ' +
+        // Not "nothing was navigated": this is thrown from the shared open
+        // path, so it reaches browser_click, browser_screenshot and the rest
+        // as often as browser_navigate.
+        'hold it. Nothing was done. Retry, or open one explicitly with browser_open.',
     );
     this.name = 'SurfaceNotRegisteredError';
   }
@@ -394,11 +397,14 @@ type SurfaceReadiness = 'registered' | 'unconfirmed' | 'absent';
  * (#1328). So the timeout asks the control plane, which knows a pane before
  * its guest registers a CDP target, and only the two answers TOGETHER convict:
  *
- *   cdp.info lists it ──────────────────────────────► registered
+ *   cdp.info lists it ─────────────────────────────► registered
  *   cdp.info throws ───────────────────────────────► unconfirmed  (cannot ask)
  *   6s, no listing ──┬── tabs list unreadable ─────► unconfirmed  (cannot ask)
  *                    ├── tabs list HAS it ─────────► unconfirmed  (slow guest)
- *                    └── tabs list lacks it ───────► absent       (never existed)
+ *                    └── tabs list lacks it
+ *                          ├── workspace owns it ──► unconfirmed  (stashed)
+ *                          ├── cannot check ───────► unconfirmed
+ *                          └── workspace has not ──► absent       (never existed)
  */
 async function awaitSurfaceRegistered(
   workspaceId: string,
@@ -420,9 +426,55 @@ async function awaitSurfaceRegistered(
     if (Date.now() >= deadline) break;
     await new Promise((resolve) => setTimeout(resolve, SURFACE_READY_POLL_MS));
   }
-  const listing = await surfaceListing(workspaceId);
+  const listing = await surfaceListing(workspaceId, CONVICTION_PROBE_TIMEOUT_MS);
   if (listing.status === 'unknown') return 'unconfirmed';
-  return listing.surfaceIds.includes(surfaceId) ? 'unconfirmed' : 'absent';
+  if (listing.surfaceIds.includes(surfaceId)) return 'unconfirmed';
+  return (await workspaceOwnsSurface(workspaceId, surfaceId)) === false ? 'absent' : 'unconfirmed';
+}
+
+/**
+ * How long each conviction probe may take.
+ *
+ * Short on purpose. These run only after the readiness wait has already spent
+ * its 6s, and the state that produces a phantom surface — a wedged or
+ * restarting main — is exactly the state where `sendRpc`'s default budget (10s
+ * per attempt, three attempts, plus the pipe-path loop and the TCP fallback)
+ * would add half a minute to a tool call the agent is blocked on. A probe that
+ * cannot answer quickly answers "cannot check", which acquits.
+ */
+const CONVICTION_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Does this workspace OWN the surface — stashed panes included?
+ *
+ * `browser.tabs list` walks the VISIBLE pane tree (renderer/utils/browserTabs
+ * uses `getLeafPanes(rootPane)`, not `getWorkspaceLeafPanes`), and a stashed
+ * browser pane has no mounted webview either, so a surface stashed inside the
+ * readiness window looks identical to one that was never created. It is not:
+ * it exists, it is unstashable, and convicting it would drop the pin and open
+ * a fresh pane on every retry.
+ *
+ * `surface.list` with `includeStashed` is the question actually being asked.
+ * Three answers, like every other check here: `false` only when the list was
+ * read and does not hold it. A lane that denies the method, a malformed reply,
+ * or an EMPTY list (which `surface.list` also returns for a workspace it could
+ * not resolve) is `undefined` — cannot check, so acquit.
+ */
+async function workspaceOwnsSurface(
+  workspaceId: string,
+  surfaceId: string,
+): Promise<boolean | undefined> {
+  try {
+    const rows = (await sendRpc(
+      'surface.list',
+      { workspaceId, includeStashed: true },
+      CONVICTION_PROBE_TIMEOUT_MS,
+    )) as Array<{ id?: unknown }> | undefined;
+    if (!Array.isArray(rows) || rows.length === 0) return undefined;
+    return rows.some((row) => row?.id === surfaceId);
+  } catch {
+    return undefined;
+  }
 }
 
 async function openSurface(workspaceId: string): Promise<string | null> {
@@ -506,7 +558,10 @@ export async function resolveDefaultSurface(
       // somebody else is working in.
       return { kind: 'surface', surfaceId: pick.surfaceId };
     }
-    clearPinnedSurface();
+    // Conditional, for the same reason the open path's drop is: an awaited
+    // listing sits between reading this pin and clearing it, and another call
+    // of this connection may have opened and pinned a real surface meanwhile.
+    clearPinIfSurface(workspaceId, pick.surfaceId);
     // The pin was the only reason the other steps were skipped, so run them
     // now that it is gone — against the targets already in hand.
     pick = pickDefaultSurface(scoped, workspaceId, null);

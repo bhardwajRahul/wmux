@@ -357,8 +357,18 @@ describe('resolveDefaultSurface over the transport', () => {
  * plane, and only the two answers together convict.
  */
 describe('waiting for a freshly opened surface', () => {
-  /** A main whose `browser.tabs new` answers `surf-new` and then `tabs`/`cdp` say `listed`. */
-  function mainAnswering(listed: { cdp: string[]; tabs: string[] | 'unreadable' }) {
+  /**
+   * A main whose `browser.tabs new` answers `surf-new`, and which then reports
+   * the three sources the verdict reads: CDP targets, the visible pane tree
+   * (`browser.tabs list`), and what the workspace OWNS including stashed panes
+   * (`surface.list`). `owns` defaults to the agent's own terminal alone, which
+   * is the "this surface does not exist" answer.
+   */
+  function mainAnswering(listed: {
+    cdp: string[];
+    tabs: string[] | 'unreadable';
+    owns?: string[] | 'unreadable';
+  }) {
     mockSendRpc.mockImplementation((method: string, params: { action?: string } = {}) => {
       if (method === 'browser.cdp.info') {
         return Promise.resolve({
@@ -378,6 +388,12 @@ describe('waiting for a freshly opened surface', () => {
               action: 'list',
               tabs: listed.tabs.map((surfaceId) => ({ surfaceId })),
             });
+      }
+      if (method === 'surface.list') {
+        const owns = listed.owns ?? [];
+        return owns === 'unreadable'
+          ? Promise.reject(new Error('method denied'))
+          : Promise.resolve([{ id: 'surf-agent-terminal' }, ...owns.map((id) => ({ id }))]);
       }
       return Promise.resolve({ ok: true });
     });
@@ -433,6 +449,42 @@ describe('waiting for a freshly opened surface', () => {
     await expect(settle(openSurfaceForConnection(WS, { awaitReady: true }))).resolves.toBe(
       'surf-new',
     );
+  });
+
+  it('keeps a surface the workspace owns but has stashed out of the visible tree', async () => {
+    // `browser.tabs list` walks the VISIBLE tree, so a stashed pane is missing
+    // from it and from the CDP targets alike. It still exists.
+    mainAnswering({ cdp: [], tabs: [], owns: ['surf-new'] });
+
+    await expect(settle(openSurfaceForConnection(WS, { awaitReady: true }))).resolves.toBe(
+      'surf-new',
+    );
+    expect(getPinnedSurface()).toEqual({ workspaceId: WS, surfaceId: 'surf-new' });
+  });
+
+  it('keeps a surface whose ownership could not be established', async () => {
+    mainAnswering({ cdp: [], tabs: [], owns: 'unreadable' });
+
+    await expect(settle(openSurfaceForConnection(WS, { awaitReady: true }))).resolves.toBe(
+      'surf-new',
+    );
+  });
+
+  it('bounds every conviction probe, so a wedged main cannot stretch the refusal', async () => {
+    // The default sendRpc budget is 10s per attempt, three attempts, plus the
+    // pipe-path loop and the TCP fallback — half a minute added to a call the
+    // agent is blocked on, on exactly the main state that produces a phantom.
+    mainAnswering({ cdp: [], tabs: [] });
+
+    await expect(
+      settle(openSurfaceForConnection(WS, { awaitReady: true })),
+    ).rejects.toThrow('BROWSER_SURFACE_NOT_REGISTERED');
+
+    const probes = mockSendRpc.mock.calls.filter(
+      (c) => (c[0] === 'browser.tabs' && c[1]?.action === 'list') || c[0] === 'surface.list',
+    );
+    expect(probes.length).toBeGreaterThan(0);
+    for (const probe of probes) expect(probe[2]).toBe(2_000);
   });
 
   it('returns as soon as the target registers, without asking the pane list', async () => {

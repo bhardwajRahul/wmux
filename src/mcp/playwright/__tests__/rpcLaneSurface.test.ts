@@ -318,20 +318,31 @@ describe('a surface that is not addressable yet', () => {
  * `{error}` (rather than throwing) arrives as a perfectly successful result.
  */
 describe('a surface that never becomes addressable', () => {
-  /** Main that answers `browser.tabs new` with a surface it then never has. */
-  function mainWithPhantomSurface(ghost = 'surf-ghost') {
+  /**
+   * Main that answers `browser.tabs new` with a surface it then never has.
+   *
+   * `owned` is what `surface.list` reports for the workspace, stashed panes
+   * included — the third question, which is what tells a surface that was
+   * never created apart from one stashed out of the visible tree seconds after
+   * it was made. The workspace always owns the agent's own terminal, so the
+   * list is never empty (an empty one means "could not resolve", which acquits).
+   */
+  function mainWithPhantomSurface(ghost = 'surf-ghost', owned: string[] = []) {
     const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
     mockSendRpc.mockImplementation((method: string, params: Record<string, unknown> = {}) => {
       calls.push({ method, params });
       if (method === 'browser.cdp.info') {
         return Promise.resolve({ targetsScoped: true, workspaceBackend: 'builtin', targets: [] });
       }
-      // The pane tree does not have it either: nothing was ever created.
+      // The visible pane tree does not have it either.
       if (method === 'browser.tabs' && params.action === 'list') {
         return Promise.resolve({ ok: true, action: 'list', tabs: [] });
       }
       if (method === 'browser.tabs' && params.action === 'new') {
         return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: ghost } });
+      }
+      if (method === 'surface.list') {
+        return Promise.resolve([{ id: 'surf-agent-terminal' }, ...owned.map((id) => ({ id }))]);
       }
       if (method === 'browser.lease.acquire') return Promise.resolve({ token: null });
       if (method === 'browser.lifecycle.get') return Promise.resolve({ entries: [] });
@@ -385,6 +396,67 @@ describe('a surface that never becomes addressable', () => {
     expect(
       calls.filter((c) => c.method === 'browser.tabs' && c.params.action === 'new'),
     ).toHaveLength(2);
+  });
+
+  it('proceeds when the surface is only STASHED out of the visible tree', async () => {
+    // `browser.tabs list` walks the VISIBLE pane tree, and a stashed pane has
+    // no mounted webview either — so a surface stashed inside the readiness
+    // window looks exactly like one that was never created. It is not: it
+    // exists and is unstashable, and convicting it would drop the pin and
+    // leak a fresh pane on every retry.
+    const calls = mainWithPhantomSurface('surf-stashed', ['surf-stashed']);
+
+    const result = await settleWithTimers(
+      tools().get('browser_navigate')!({ url: 'https://a.test/' }),
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(calls.find((c) => c.method === 'browser.navigate')?.params.surfaceId).toBe('surf-stashed');
+  });
+
+  it('proceeds when ownership cannot be established either', async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    mockSendRpc.mockImplementation((method: string, params: Record<string, unknown> = {}) => {
+      calls.push({ method, params });
+      if (method === 'browser.cdp.info') {
+        return Promise.resolve({ targetsScoped: true, workspaceBackend: 'builtin', targets: [] });
+      }
+      if (method === 'browser.tabs' && params.action === 'list') {
+        return Promise.resolve({ ok: true, action: 'list', tabs: [] });
+      }
+      if (method === 'browser.tabs' && params.action === 'new') {
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-opaque' } });
+      }
+      // A lane that denies surface.list, or a main too old to answer it.
+      if (method === 'surface.list') return Promise.reject(new Error('method denied'));
+      if (method === 'browser.lease.acquire') return Promise.resolve({ token: null });
+      if (method === 'browser.lifecycle.get') return Promise.resolve({ entries: [] });
+      if (method === 'browser.evaluate') return Promise.resolve({ value: 'https://a.test/' });
+      return Promise.resolve({ ok: true });
+    });
+
+    const result = await settleWithTimers(
+      tools().get('browser_navigate')!({ url: 'https://a.test/' }),
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(calls.find((c) => c.method === 'browser.navigate')?.params.surfaceId).toBe('surf-opaque');
+  });
+
+  it('refuses a non-navigate tool with a message that does not claim a navigation', async () => {
+    // The throw comes from the shared open path (the automation lease settles
+    // the surface before every browser tool's body), so the refusal reaches
+    // browser_click as readily as browser_navigate.
+    mainWithPhantomSurface();
+
+    const result = await settleWithTimers(
+      tools().get('browser_type')!({ selector: '#q', text: 'hello' }),
+    );
+
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain('BROWSER_SURFACE_NOT_REGISTERED');
+    expect(text).not.toContain('Nothing was navigated');
   });
 
   it('proceeds when the pane list HAS the surface — a slow guest is not a failure', async () => {
