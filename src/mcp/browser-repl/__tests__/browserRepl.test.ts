@@ -23,7 +23,13 @@ import {
   HINT_LINE_MAX_BYTES,
   HINT_MAX_LINES,
 } from '../BrowserReplSession';
-import { createBrowserReplCatalog, disposeBrowserRepl, formatBrowserReplOutcome } from '../tool';
+import {
+  CLIENT_BACKGROUND_MS,
+  backgroundWarning,
+  createBrowserReplCatalog,
+  disposeBrowserRepl,
+  formatBrowserReplOutcome,
+} from '../tool';
 import { IMAGE_CAP_NOTE, RUN_IMAGE_TOTAL_BYTES } from '../runCollect';
 import { MAX_SCREENSHOT_BASE64_BYTES } from '../../resultCap';
 import { ActionRing, recordAction, type ActionRingDeps } from '../../browser-replay/actionRing';
@@ -440,6 +446,57 @@ describe('browser_repl session', () => {
     expect(caught.result?.text).toBe('BrowserToolError:click');
   });
 
+  it('[#1360] keeps the steps that ran and names the one that failed', async () => {
+    const h = harness({ click: async () => fail('nothing at ref=3') });
+    const bridge = createBrowserBridge(h.tools, {});
+    const session = newSession();
+
+    const out = await session.run(
+      'await browser.snapshot(); await browser.extract_text(); await browser.click({ ref: "3" }); 1',
+      10_000,
+      bridge,
+    );
+
+    expect(out.ok).toBe(false);
+    // The two successful calls are still in the result, and the third is named.
+    expect(out.ledger).toHaveLength(3);
+    expect(out.callCount).toBe(3);
+    expect(out.failedStep).toBe(3);
+    expect(out.failedCall).toBe('click');
+  });
+
+  it('[#1360] reports no failing step when the snippet itself threw', async () => {
+    const h = harness();
+    const bridge = createBrowserBridge(h.tools, {});
+    const session = newSession();
+
+    const out = await session.run('await browser.snapshot(); null.x', 10_000, bridge);
+
+    expect(out.ok).toBe(false);
+    expect(out.callCount).toBe(1);
+    expect(out.failedStep).toBeUndefined();
+  });
+
+  it('[#1360] names the FIRST failure when the snippet caught one and carried on', async () => {
+    const h = harness({ click: async () => fail('nothing at ref=3') });
+    const bridge = createBrowserBridge(h.tools, {});
+    const session = newSession();
+
+    const out = await session.run(
+      [
+        'try { await browser.click({ ref: "3" }) } catch {}',
+        'await browser.snapshot();',
+        'try { await browser.click({ ref: "4" }) } catch {}',
+        'throw new Error("done");',
+      ].join('\n'),
+      10_000,
+      bridge,
+    );
+
+    expect(out.failedStep).toBe(1);
+    expect(out.failedCall).toBe('click');
+  });
+
   it('exposes only whitelisted tools on the browser object', async () => {
     const h = harness();
     const bridge = createBrowserBridge(h.tools, {});
@@ -699,6 +756,77 @@ describe('formatBrowserReplOutcome', () => {
         "'done'",
       ].join('\n'),
     );
+  });
+
+  // #1360: "an error mid-script discards every result collected up to that
+  // point". The ledger, console and hints were always there; nothing said so,
+  // and nothing named the step that broke.
+  it('names the failing step and says the earlier ones ran', () => {
+    const text = formatBrowserReplOutcome({
+      ok: false,
+      elapsedMs: 40,
+      ledger: ['snapshot() ok 5ms', 'click(ref:"3") ok 4ms', 'fill(ref:"9") FAILED nothing there'],
+      callCount: 3,
+      failedStep: 3,
+      failedCall: 'fill',
+      console: { text: '', truncated: false, totalBytes: 0, elidedBytes: 0 },
+      error: 'BrowserToolError: browser.fill: nothing there',
+      timedOut: false,
+      freshRuntime: false,
+    });
+
+    expect(text).toContain('--- calls ---');
+    expect(text).toContain('1. snapshot() ok 5ms');
+    expect(text).toContain('failed at step 3 (browser.fill)');
+    expect(text).toContain('the 2 step(s) before it did run');
+  });
+
+  it('says the error came from the snippet when every call succeeded', () => {
+    const text = formatBrowserReplOutcome({
+      ok: false,
+      elapsedMs: 9,
+      ledger: ['snapshot() ok 5ms'],
+      callCount: 1,
+      console: { text: '', truncated: false, totalBytes: 0, elidedBytes: 0 },
+      error: 'TypeError: rows is not iterable',
+      timedOut: false,
+      freshRuntime: false,
+    });
+
+    expect(text).toContain('every one of the 1 browser call(s) above succeeded');
+    expect(text).not.toContain('failed at step');
+  });
+
+  it('adds nothing when the run had no browser calls at all', () => {
+    const text = formatBrowserReplOutcome({
+      ok: false,
+      elapsedMs: 2,
+      ledger: [],
+      callCount: 0,
+      console: { text: '', truncated: false, totalBytes: 0, elidedBytes: 0 },
+      error: 'SyntaxError: unexpected token',
+      timedOut: false,
+      freshRuntime: false,
+    });
+
+    expect(text).not.toContain('failed at step');
+    expect(text).not.toContain('succeeded');
+  });
+});
+
+describe('browser_repl backgrounding warning (#1360)', () => {
+  it('says nothing for a run that stays in the foreground', () => {
+    expect(backgroundWarning(CLIENT_BACKGROUND_MS)).toBe('');
+    expect(backgroundWarning(60_000)).toBe('');
+  });
+
+  it('names what survives, since no handle can be polled for a backgrounded run', () => {
+    const warning = backgroundWarning(CLIENT_BACKGROUND_MS + 1);
+
+    expect(warning).toContain('background');
+    expect(warning).toContain('no handle to poll');
+    expect(warning).toContain('globalThis');
+    expect(warning).toContain(`timeout:${CLIENT_BACKGROUND_MS}`);
   });
 });
 

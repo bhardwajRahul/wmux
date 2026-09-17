@@ -15,6 +15,8 @@ import {
   type RegisterWmuxToolsOptions,
 } from '../toolCatalog';
 import {
+  ACTION_RING_CAPACITY,
+  ACTION_RING_MAX_BYTES,
   MAX_STEPS_PER_TRACE,
   hasUnrecordableStep,
   isQuarantined,
@@ -187,6 +189,9 @@ export function createReplayToolCatalog(deps: BrowserToolDeps) {
       'it without reading a single snapshot, which is where the saving is. A run that cannot find ' +
       'an element stops at that step and reports why, leaving the page there for you to finish live. ' +
       'Steps that typed into a password field are never stored and make a flow unrunnable. ' +
+      `Recording is a ring: the last ${ACTION_RING_CAPACITY} actions (or ${ACTION_RING_MAX_BYTES / 1024} KiB of them, whichever ` +
+      `comes first) are still available to save, and one trace holds ${MAX_STEPS_PER_TRACE} steps — so save a long ` +
+      'session in parts, naming each tail with steps:<n>, rather than once at the end. ' +
       'Needs the chrome browser backend: the builtin webview can fall back to a DOM snapshot that ' +
       'mints no accessibility refs, and a flow recorded then saves but can never run.',
     inputSchema: BROWSER_REPLAY_SHAPE,
