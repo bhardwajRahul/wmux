@@ -217,6 +217,32 @@ function refNotFound(ref: string, page: Page | null): string {
 }
 
 /**
+ * What browser_select says about an element that is not a native `<select>`.
+ *
+ * Custom dropdowns — a `div` with `role=combobox` over a `role=listbox` — are
+ * out of this tool's reach by construction: there are no `<option>` elements to
+ * set `selected` on, and the widget's own JS owns the value. The two-click
+ * sequence IS the supported way, and naming it turns a dead end into the next
+ * step (#1360). Before, Playwright's "Element is not a <select> element" and
+ * the RPC lane's "ref not found" both sent the caller back to re-snapshot a
+ * page that was perfectly fine.
+ */
+function notNativeSelect(ref: string): string {
+  return (
+    `ref=${ref} is not a native <select>; click the trigger then the option. ` +
+    `browser_select only drives <select>/<option>. For a custom dropdown: ` +
+    `browser_click the trigger, browser_snapshot to get the option refs, then ` +
+    `browser_click the option.`
+  );
+}
+
+/** Playwright's refusal for selectOption on a non-`<select>` element. */
+function notASelectElement(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /not a <select> element|Element is not a select/i.test(message);
+}
+
+/**
  * What a hover reports under a touchscreen preset.
  *
  * The move still goes out, deliberately. A touchscreen cannot hover, so the
@@ -1780,7 +1806,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
   // -----------------------------------------------------------------------
   server.tool(
     'browser_select',
-    'Select option(s) in a <select> element by value.',
+    'Select option(s) in a native <select> element by value. A custom dropdown (div/listbox) is not supported here — click its trigger, then click the option.',
     BROWSER_SELECT_SHAPE,
     async ({ ref, values, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
@@ -1789,7 +1815,16 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
         if (page) {
           const el = await resolveRef(page, ref);
           if (!el) throw new Error(refNotFound(ref, page));
-          await el.selectOption(values);
+          try {
+            await el.selectOption(values);
+          } catch (error) {
+            // Playwright's own message is "Element is not a <select> element",
+            // which tells the caller what the element is NOT and leaves them
+            // retrying the same tool (#1360). The workaround is two clicks, so
+            // say that instead.
+            if (notASelectElement(error)) throw new Error(notNativeSelect(ref));
+            throw error;
+          }
         } else {
           // Deliberately still a DOM assignment, unlike hover and drag above.
           // A native <select> opens an OS-drawn popup that lives outside the
@@ -1801,12 +1836,16 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
           const escapedValues = JSON.stringify(values);
           const val = await rpcEval(`(() => {
             const el = document.querySelector('[data-wmux-ref="${safeRef}"]');
-            if (!el || el.tagName !== 'SELECT') return 'not_found';
+            if (!el) return 'not_found';
+            // Distinguished from a miss (#1360): "the ref is gone" and "the ref
+            // is a custom dropdown" need different things from the caller.
+            if (el.tagName !== 'SELECT') return 'not_select';
             const vals = ${escapedValues};
             [...el.options].forEach(o => { o.selected = vals.includes(o.value); });
             el.dispatchEvent(new Event('change', { bubbles: true }));
             return 'ok';
           })()`, scope);
+          if (val === 'not_select') throw new Error(notNativeSelect(ref));
           if (val === 'not_found') throw new Error(refNotFound(ref, page));
         }
 

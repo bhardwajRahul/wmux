@@ -351,8 +351,28 @@ export const MAX_FILE_BYTES = 512 * 1024;
 export const TRACE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** Consecutive failures at one step before a trace stops being served. */
 export const QUARANTINE_FAIL_STREAK = 2;
-/** Actions held in the per-connection recording ring. */
-export const ACTION_RING_CAPACITY = 40;
+/**
+ * Actions held in the per-connection recording ring.
+ *
+ * 200, not 40 (#1360): one browser_repl call routinely drives a hundred steps,
+ * and a 125-call session could not be saved at all — the flow the agent wanted
+ * to record had already fallen out of the front of the ring by the time it knew
+ * the flow had worked. 200 covers a session of that size with room over.
+ */
+export const ACTION_RING_CAPACITY = 200;
+
+/**
+ * ...and a byte ceiling, because the count alone stopped being a memory bound
+ * once it grew fivefold. A step's arguments are clamped individually
+ * (clampArgValue) but a `fill` of twenty long fields is still a large step, and
+ * 200 of those is not what a recording ring should be allowed to pin. Over the
+ * ceiling the OLDEST entries go, exactly as they do over the count — the tail
+ * is what a save cuts from.
+ *
+ * Sized under MAX_FILE_BYTES: a ring that could not fit on disk would record a
+ * flow only to have the save refuse it.
+ */
+export const ACTION_RING_MAX_BYTES = 256 * 1024;
 
 // ── URL key ────────────────────────────────────────────────────────────────
 
