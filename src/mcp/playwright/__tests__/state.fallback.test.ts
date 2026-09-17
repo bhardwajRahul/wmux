@@ -242,10 +242,21 @@ describe('browser_emulate RPC fallback', () => {
   });
 
   it('signals device reset when device is null', async () => {
-    mockSendRpc.mockResolvedValue({ applied: ['device=reset (use browser_resize to set viewport)'] });
-    await emulate({ device: null });
+    // #1357: the packaged handler restores the viewport, disables touch and
+    // reloads, then reports what the page actually says. The tool renders that
+    // summary verbatim, so the caller sees the real state on this lane too.
+    mockSendRpc.mockResolvedValue({
+      applied: [
+        'device=reset (viewport 1280x720 restored, reloaded)',
+        'probe=1280x720 dpr=1 maxTouchPoints=0',
+      ],
+    });
+    const res = await emulate({ device: null });
     const params = mockSendRpc.mock.calls[0][1] as Record<string, unknown>;
     expect(params.deviceReset).toBe(true);
     expect(params.deviceMetrics).toBeUndefined();
+    expect(res.content[0].text).toContain('device=reset (viewport 1280x720 restored, reloaded)');
+    expect(res.content[0].text).toContain('probe=1280x720 dpr=1 maxTouchPoints=0');
+    expect(res.content[0].text).not.toContain('use browser_resize to set viewport');
   });
 });

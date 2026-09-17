@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { validateNavigationUrl } from '../../../shared/types';
+import { validateResolvedNavigationUrl } from '../../../shared/navigationPolicy';
 import { sendRpc } from '../../wmux-client';
 import { PlaywrightEngine } from '../PlaywrightEngine';
 import {
@@ -270,6 +271,20 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
             // over Playwright instead. Builtin keeps the fast RPC lane.
             const engine = PlaywrightEngine.getInstance();
             if ((await engine.resolveWorkspaceBackend(scope.workspaceId)) === 'chrome') {
+              // #1359: this lane drives the page directly and never reaches
+              // main's `browser.navigate`, which is where the resolving half of
+              // the URL policy runs. Without this call, one URL got two
+              // verdicts — `browser_tabs new` (always an RPC) refused the
+              // hostname its DNS answer put in a blocked range, while
+              // `browser_navigate` loaded it. Same policy, same answer.
+              //
+              // Only a POSITIVE block refuses here: a host that does not
+              // resolve is left to the browser, which names the failure better
+              // than this guard can (and there is nothing to reach anyway).
+              const resolvedCheck = await validateResolvedNavigationUrl(url);
+              if (!resolvedCheck.valid && !resolvedCheck.unresolved) {
+                throw new Error(`URL blocked: ${resolvedCheck.reason}`);
+              }
               const page = await engine.getPageForScope(scope);
               if (!page) throw new Error('browser_navigate: no chrome page resolved for this scope.');
               // A person reaching this URL by clicking a link arrives with the

@@ -303,6 +303,56 @@ describe('browser navigation MCP workspace contract', () => {
     expect(mockSendRpc).not.toHaveBeenCalled();
   });
 
+  // #1359 — one URL, one verdict.
+  //
+  // `browser_tabs new` and `browser_navigate` must never disagree about a URL:
+  // the dogfood hit a tab that refused an intranet host the open tab was
+  // already showing. Both tools read the same policy function, so this pins
+  // that they keep reading it — and that the refusal names the way out.
+  describe('URL policy parity between tabs new and navigate', () => {
+    async function verdicts(url: string) {
+      mockSendRpc.mockImplementation(
+        leasedRouter([], (method) =>
+          method === 'browser.evaluate' ? { value: url } : undefined,
+        ),
+      );
+      const tabs = await browserTabs({ action: 'new', url });
+      mockSendRpc.mockClear();
+      const navigate = await browserNavigate({ url });
+      return {
+        tabsBlocked: tabs.isError === true && tabs.content[0].text.includes('BROWSER_TAB_URL_BLOCKED'),
+        navigateBlocked:
+          navigate.isError === true && navigate.content[0].text.includes('URL blocked:'),
+        tabsText: tabs.content[0].text,
+        navigateText: navigate.content[0].text,
+      };
+    }
+
+    it.each([
+      ['http://10.0.0.1/', true],
+      ['http://172.16.0.1/', true],
+      ['http://192.168.1.1/', true],
+      ['http://169.254.1.1/', true],
+      ['http://localhost/', false],
+    ])('%s is blocked=%s for both tools', async (url, blocked) => {
+      const result = await verdicts(url);
+
+      expect(result.tabsBlocked).toBe(blocked);
+      expect(result.navigateBlocked).toBe(blocked);
+    });
+
+    it.each([
+      'http://10.0.0.1/',
+      'http://172.16.0.1/',
+      'http://192.168.1.1/',
+    ])('tells the caller how to allow %s, in both tools', async (url) => {
+      const result = await verdicts(url);
+
+      expect(result.tabsText).toContain('WMUX_ALLOW_PRIVATE_NETWORK=1');
+      expect(result.navigateText).toContain('WMUX_ALLOW_PRIVATE_NETWORK=1');
+    });
+  });
+
   it('reports an older main as unsupported instead of falling back to global enumeration', async () => {
     mockSendRpc.mockRejectedValue(new Error('Unknown method: browser.tabs'));
 

@@ -1355,6 +1355,48 @@ export function clonePaneTreeFresh(pane: Pane): Pane {
 
 type UrlValidationResult = { valid: boolean; reason?: string };
 
+/**
+ * The one opt-in that widens the navigation policy: RFC1918 private ranges
+ * (10/8, 172.16/12, 192.168/16 and their IPv6 ULA analogue fc00::/7).
+ *
+ * #1359: every entry point that loads a URL — browser_navigate, browser_tabs
+ * new, browser_open, replay — must reach the same verdict for the same URL, so
+ * the switch is read here, inside the single policy function, and never
+ * duplicated at a call site.
+ *
+ * Link-local (169.254.0.0/16, fe80::/10), the null address and non-127.0.0.1
+ * loopback stay blocked even with the opt-in: the SSRF hardening this policy
+ * exists for is aimed at cloud metadata (169.254.169.254), which an intranet
+ * user has no reason to reach through an agent.
+ */
+export const ALLOW_PRIVATE_NETWORK_ENV = 'WMUX_ALLOW_PRIVATE_NETWORK';
+
+/**
+ * How a caller turns the private ranges on. Appended to every block reason the
+ * opt-in would lift, so a refusal carries its own remedy.
+ *
+ * Both processes are named because they both run this check: the MCP server
+ * (preflight, in the agent's process) and wmux main (after DNS resolution).
+ */
+const ALLOW_PRIVATE_NETWORK_HINT =
+  `set ${ALLOW_PRIVATE_NETWORK_ENV}=1 in the environment that launches wmux and the agent to allow private ranges`;
+
+function privateNetworkAllowed(): boolean {
+  // `process` is absent in the renderer bundle; an absent switch means off.
+  const value =
+    typeof process !== 'undefined' ? process.env?.[ALLOW_PRIVATE_NETWORK_ENV] : undefined;
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function blockedPrivate(range: string): UrlValidationResult {
+  return {
+    valid: false,
+    reason: `Blocked private IP address (${range}) — ${ALLOW_PRIVATE_NETWORK_HINT}`,
+  };
+}
+
 function parseIpv4Octets(address: string): number[] | null {
   const parts = address.split('.');
   if (parts.length !== 4) return null;
@@ -1380,17 +1422,17 @@ function validateIpv4NavigationAddress(address: string): UrlValidationResult {
 
   // Block 10.0.0.0/8
   if (octets[0] === 10) {
-    return { valid: false, reason: 'Blocked private IP address (10.0.0.0/8)' };
+    return privateNetworkAllowed() ? { valid: true } : blockedPrivate('10.0.0.0/8');
   }
 
   // Block 172.16.0.0/12 (172.16.x.x – 172.31.x.x)
   if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) {
-    return { valid: false, reason: 'Blocked private IP address (172.16.0.0/12)' };
+    return privateNetworkAllowed() ? { valid: true } : blockedPrivate('172.16.0.0/12');
   }
 
   // Block 192.168.0.0/16
   if (octets[0] === 192 && octets[1] === 168) {
-    return { valid: false, reason: 'Blocked private IP address (192.168.0.0/16)' };
+    return privateNetworkAllowed() ? { valid: true } : blockedPrivate('192.168.0.0/16');
   }
 
   // Block 169.254.0.0/16 (link-local, includes cloud metadata 169.254.169.254)
@@ -1475,13 +1517,30 @@ function validateIpv6NavigationAddress(address: string): UrlValidationResult {
 
   const firstGroup = Number.parseInt(expanded[0], 16);
   if ((firstGroup & 0xfe00) === 0xfc00) {
-    return { valid: false, reason: 'Blocked private IPv6 address (fc00::/7)' };
+    return privateNetworkAllowed()
+      ? { valid: true }
+      : {
+          valid: false,
+          reason: `Blocked private IPv6 address (fc00::/7) — ${ALLOW_PRIVATE_NETWORK_HINT}`,
+        };
   }
   if ((firstGroup & 0xffc0) === 0xfe80) {
     return { valid: false, reason: 'Blocked link-local IPv6 address (fe80::/10)' };
   }
 
   return { valid: true };
+}
+
+/**
+ * The address-level half of the navigation policy, for callers that already
+ * hold a literal IP — notably the main-process guard, which re-checks every
+ * address a hostname resolved to (#1359: it used to carry its own copy of
+ * these ranges, which had drifted from this one).
+ */
+export function validateNavigationAddress(address: string): UrlValidationResult {
+  return address.includes(':')
+    ? validateIpv6NavigationAddress(address)
+    : validateIpv4NavigationAddress(address);
 }
 
 /**

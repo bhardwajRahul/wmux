@@ -42,6 +42,7 @@ import {
   type BrowserToolDeps,
 } from '../browserScope';
 import { recordAction } from '../../browser-replay/actionRing';
+import { getScreenshotScale } from '../screenshotRefs';
 
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
@@ -70,6 +71,14 @@ const BROWSER_CLICK_SHAPE = {
     .number()
     .optional()
     .describe('Viewport CSS px, only when ref/smartRef is omitted. Needs x.'),
+  imageX: z
+    .number()
+    .optional()
+    .describe('Pixel read off the last browser_screenshot; divided by that capture\'s scale. Needs imageY.'),
+  imageY: z
+    .number()
+    .optional()
+    .describe('Pixel read off the last browser_screenshot; divided by that capture\'s scale. Needs imageX.'),
   smartRef: z
     .number()
     .optional()
@@ -205,6 +214,32 @@ function refNotFound(ref: string, page: Page | null): string {
     `a number from browser_smart_snapshot goes in smartRef instead. ` +
     `Run browser_snapshot to get current refs.`
   );
+}
+
+/**
+ * What browser_select says about an element that is not a native `<select>`.
+ *
+ * Custom dropdowns — a `div` with `role=combobox` over a `role=listbox` — are
+ * out of this tool's reach by construction: there are no `<option>` elements to
+ * set `selected` on, and the widget's own JS owns the value. The two-click
+ * sequence IS the supported way, and naming it turns a dead end into the next
+ * step (#1360). Before, Playwright's "Element is not a <select> element" and
+ * the RPC lane's "ref not found" both sent the caller back to re-snapshot a
+ * page that was perfectly fine.
+ */
+function notNativeSelect(ref: string): string {
+  return (
+    `ref=${ref} is not a native <select>; click the trigger then the option. ` +
+    `browser_select only drives <select>/<option>. For a custom dropdown: ` +
+    `browser_click the trigger, browser_snapshot to get the option refs, then ` +
+    `browser_click the option.`
+  );
+}
+
+/** Playwright's refusal for selectOption on a non-`<select>` element. */
+function notASelectElement(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /not a <select> element|Element is not a select/i.test(message);
 }
 
 /**
@@ -735,11 +770,18 @@ function requireSingleMatch(selector: string, count: number): void {
 }
 
 /** Resolve an address on the Playwright lane. Throws with the reason it failed. */
-async function resolveTypeTarget(page: Page, addr: RefAddress): Promise<TypeTarget> {
+async function resolveTypeTarget(
+  page: Page,
+  addr: RefAddress,
+  notes?: string[],
+): Promise<TypeTarget> {
   if (addr.smartRef !== undefined) {
     // Throws StaleSmartRefError rather than typing into a substitute — the same
-    // guarantee browser_click({smartRef}) gives.
-    return (await resolveSmartRefLocator(page, addr.smartRef)) as unknown as TypeTarget;
+    // guarantee browser_click({smartRef}) gives. A ref from an earlier snapshot
+    // that still names exactly one element is recovered, with a note (#1355).
+    return (await resolveSmartRefLocator(page, addr.smartRef, {
+      ...(notes && { notes }),
+    })) as unknown as TypeTarget;
   }
   if (addr.selector !== undefined) {
     requireCssSelector(addr.selector);
@@ -1166,22 +1208,45 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
   // -----------------------------------------------------------------------
   server.tool(
     'browser_click',
-    'Click an element by ref (browser_snapshot) or smartRef (browser_smart_snapshot), or — when neither is available — at x/y. Coordinates are VIEWPORT CSS PIXELS: divide a browser_screenshot pixel by the devicePixelRatio that shot reports. A fullPage or element screenshot is in a different coordinate space and cannot be used for x/y at all. Coordinates need a live page (chrome backend); the RPC lane is ref-only.',
+    'Click an element by ref (browser_snapshot) or smartRef (browser_smart_snapshot), or — when neither is available — at x/y. x/y are VIEWPORT CSS PIXELS; to click something you can see in a screenshot pass imageX/imageY instead and the pixels are divided by that capture\'s reported scale for you. A fullPage or element screenshot is in a different coordinate space and cannot be used for coordinates at all. Coordinates need a live page (chrome backend); the RPC lane is ref-only.',
     BROWSER_CLICK_SHAPE,
-    async ({ ref, smartRef, x, y, double, modifiers, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ ref, smartRef, x, y, imageX, imageY, double, modifiers, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
+        // Image-space coordinates are viewport coordinates once divided by the
+        // scale the last viewport screenshot of this surface reported (#1358).
+        // Converted up front so everything below sees one coordinate space.
+        let clickX = x;
+        let clickY = y;
+        let imageNote = '';
+        if (imageX !== undefined || imageY !== undefined) {
+          if (ref !== undefined || smartRef !== undefined || x !== undefined || y !== undefined) {
+            throw new Error('Pass imageX/imageY alone — not with ref, smartRef, x or y.');
+          }
+          if (imageX === undefined || imageY === undefined) {
+            throw new Error('Image-space clicks need both imageX and imageY.');
+          }
+          const known = getScreenshotScale(browserScopeKey(scope));
+          if (!known) {
+            throw new Error(
+              'No screenshot scale is known for this surface: take a viewport browser_screenshot first (fullPage and element captures set no scale), then pass imageX/imageY.',
+            );
+          }
+          clickX = Math.round((imageX / known.scale) * 100) / 100;
+          clickY = Math.round((imageY / known.scale) * 100) / 100;
+          imageNote = ` (image px (${imageX}, ${imageY}) / scale ${known.scale})`;
+        }
         // Coordinate clicking is an ESCAPE HATCH, not a second addressing mode:
         // a ref survives a re-render and a coordinate does not, so a call that
         // carries both is a mistake worth refusing rather than silently
         // resolving in favour of one.
         // mirrors browser-use tools/service.py coordinate clicking (set_coordinate_clicking)
-        const hasCoords = x !== undefined || y !== undefined;
+        const hasCoords = clickX !== undefined || clickY !== undefined;
         if (hasCoords && (ref !== undefined || smartRef !== undefined)) {
           throw new Error(
             'Pass either ref/smartRef or x/y, not both — a ref survives a re-render and a coordinate does not.',
           );
         }
-        if (hasCoords && (x === undefined || y === undefined)) {
+        if (hasCoords && (clickX === undefined || clickY === undefined)) {
           throw new Error('Coordinate clicks need both x and y (viewport CSS pixels).');
         }
 
@@ -1209,7 +1274,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
         if (hasCoords && page) {
           // Refuse a coordinate the viewport does not contain instead of
           // clicking nothing and reporting success.
-          (await viewportBoundsCheck(page))(x as number, y as number);
+          (await viewportBoundsCheck(page))(clickX as number, clickY as number);
 
           // Same popup contract as a ref click — a coordinate click on a link
           // with target=_blank opens a popup just as readily.
@@ -1220,13 +1285,13 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
               : null;
           try {
             await withModifiers(page, modifierKeys, () =>
-              page.mouse.click(x as number, y as number, {
+              page.mouse.click(clickX as number, clickY as number, {
                 ...(double && { clickCount: 2 }),
               }),
             );
             // Keep the tracker honest: the next ref click should approach from
             // here, not from wherever the pointer was before this one.
-            setLastPointer(page, { x: x as number, y: y as number });
+            setLastPointer(page, { x: clickX as number, y: clickY as number });
             const note = coordWatch ? await coordWatch.note() : '';
             // Coordinate clicks are deliberately NOT recorded: a coordinate
             // does not survive a re-render, so a trace built on one replays a
@@ -1236,7 +1301,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
               content: [
                 {
                   type: 'text' as const,
-                  text: `Clicked${double ? ' (double)' : ''} at viewport CSS px (${x}, ${y})${modifiersNote(modifierKeys)}${note}`,
+                  text: `Clicked${double ? ' (double)' : ''} at viewport CSS px (${clickX}, ${clickY})${imageNote}${modifiersNote(modifierKeys)}${note}`,
                 },
               ],
             };
@@ -1270,7 +1335,10 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
               // DOM node identity now, so the cache is no longer a dense 1..n
               // range. Throws StaleSmartRefError rather than clicking a
               // substitute when the ref no longer names one live element.
-              const locator = await resolveSmartRefLocator(page, smartRef);
+              // A ref from an earlier snapshot that still names exactly one
+              // element resolves through its descriptor and says so (#1355).
+              const refNotes: string[] = [];
+              const locator = await resolveSmartRefLocator(page, smartRef, { notes: refNotes });
               const dispatch = await withModifiers(page, modifierKeys, () =>
                 clickWithApproach(page as unknown as ApproachPage, locator, !!double, tap),
               );
@@ -1291,7 +1359,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
                 });
               }
               return {
-                content: [{ type: 'text' as const, text: `Clicked${double ? ' (double)' : ''} element smartRef=${smartRef}${modifiersNote(modifierKeys)}${dispatchNote(!!tapper, double, dispatch)}${await popupNote()}` }],
+                content: [{ type: 'text' as const, text: `Clicked${double ? ' (double)' : ''} element smartRef=${smartRef}${modifiersNote(modifierKeys)}${dispatchNote(!!tapper, double, dispatch)}${refNotes.map((n) => `\n${n}`).join('')}${await popupNote()}` }],
               };
             }
 
@@ -1361,9 +1429,10 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
         // navigate the page out from under a later lookup.
         let isPassword: boolean;
         let segments: string[];
+        const refNotes: string[] = [];
 
         if (page) {
-          const el = await resolveTypeTarget(page, addr);
+          const el = await resolveTypeTarget(page, addr, refNotes);
           isPassword = await isPasswordElement(el);
           segments = await typeIntoTarget(page, el, text, { humanlike, newlineKey });
           if (submit) await page.keyboard.press('Enter');
@@ -1413,7 +1482,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
           content: [
             {
               type: 'text' as const,
-              text: `Typed "${echoed}" into element ${describeAddress(addr)}${lineNote}${submit ? ' and submitted' : ''}`,
+              text: `Typed "${echoed}" into element ${describeAddress(addr)}${lineNote}${submit ? ' and submitted' : ''}${refNotes.map((n) => `\n${n}`).join('')}`,
             },
           ],
         };
@@ -1737,7 +1806,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
   // -----------------------------------------------------------------------
   server.tool(
     'browser_select',
-    'Select option(s) in a <select> element by value.',
+    'Select option(s) in a native <select> element by value. A custom dropdown (div/listbox) is not supported here — click its trigger, then click the option.',
     BROWSER_SELECT_SHAPE,
     async ({ ref, values, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
@@ -1746,7 +1815,16 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
         if (page) {
           const el = await resolveRef(page, ref);
           if (!el) throw new Error(refNotFound(ref, page));
-          await el.selectOption(values);
+          try {
+            await el.selectOption(values);
+          } catch (error) {
+            // Playwright's own message is "Element is not a <select> element",
+            // which tells the caller what the element is NOT and leaves them
+            // retrying the same tool (#1360). The workaround is two clicks, so
+            // say that instead.
+            if (notASelectElement(error)) throw new Error(notNativeSelect(ref));
+            throw error;
+          }
         } else {
           // Deliberately still a DOM assignment, unlike hover and drag above.
           // A native <select> opens an OS-drawn popup that lives outside the
@@ -1758,12 +1836,16 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
           const escapedValues = JSON.stringify(values);
           const val = await rpcEval(`(() => {
             const el = document.querySelector('[data-wmux-ref="${safeRef}"]');
-            if (!el || el.tagName !== 'SELECT') return 'not_found';
+            if (!el) return 'not_found';
+            // Distinguished from a miss (#1360): "the ref is gone" and "the ref
+            // is a custom dropdown" need different things from the caller.
+            if (el.tagName !== 'SELECT') return 'not_select';
             const vals = ${escapedValues};
             [...el.options].forEach(o => { o.selected = vals.includes(o.value); });
             el.dispatchEvent(new Event('change', { bubbles: true }));
             return 'ok';
           })()`, scope);
+          if (val === 'not_select') throw new Error(notNativeSelect(ref));
           if (val === 'not_found') throw new Error(refNotFound(ref, page));
         }
 

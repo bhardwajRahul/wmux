@@ -222,6 +222,32 @@ describe('browser_smart_snapshot auto-diff (RPC lane)', () => {
     expect(second).toContain('Item 30');
   });
 
+  it('[fix #1360] says WHY it is a full listing instead of looking broken', async () => {
+    getPage.mockResolvedValue(null);
+    mockSendRpc.mockResolvedValue(rpcPayload());
+
+    await snapshot();
+    const second = await snapshot();
+
+    // The tool promised "a repeat call returns a diff"; on this lane it never
+    // could, and returned the full tree in silence.
+    expect(second).toContain('no diff on this backend');
+    expect(second).toContain('chrome backend diffs');
+  });
+
+  it('[fix #1360] does not add the note when full:true asked for the whole listing', async () => {
+    getPage.mockResolvedValue(null);
+    mockSendRpc.mockResolvedValue(rpcPayload());
+
+    expect(await snapshot({ full: true })).not.toContain('no diff on this backend');
+  });
+
+  it('[fix #1360] the CDP lane, which does diff, carries no such note', async () => {
+    getPage.mockResolvedValue(makePage(tree(ROWS)));
+
+    expect(await snapshot()).not.toContain('no diff on this backend');
+  });
+
   it('does not leave a baseline the CDP lane will diff against', async () => {
     // The two lanes number their refs differently, so a positional listing is
     // not a baseline an identity listing may be compared with. The lane marker

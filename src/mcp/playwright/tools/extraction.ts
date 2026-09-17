@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { PlaywrightEngine } from '../PlaywrightEngine';
 import { withAutomationLease } from '../automationLease';
 import { getSmartSnapshot, getSmartSnapshotViaEval, smartPageToken } from '../dom-intelligence';
-import { extractMarkdown, extractStructuredData } from '../markdown-extractor';
+import { extractMarkdown, extractStructuredDataWithNotes } from '../markdown-extractor';
 import { resolveEvaluator, rpcEvaluator } from '../page-eval';
 import { formatSnapshotResult } from '../snapshotDiff';
 import { getSnapshotBaseline, setSnapshotBaseline, snapshotSurfaceKey } from '../snapshotCache';
@@ -89,7 +89,7 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_smart_snapshot',
-    'Indexed interactive elements plus clean page text. Pass a returned ref to browser_click as smartRef. A repeat call returns a diff; pass full:true for the whole listing.',
+    'Indexed interactive elements plus clean page text. Pass a returned ref to browser_click as smartRef. On the chrome backend a repeat call returns a diff (full:true forces the whole listing); the packaged RPC lane numbers refs by position, so it returns the full listing every time and says so.',
     BROWSER_SMART_SNAPSHOT_SHAPE,
     async ({ maxContentLength, full, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
@@ -162,10 +162,17 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
         // The content summary is cut at maxContentLength, so a diff — "(no
         // changes)" most of all — speaks only for what fits (review 10).
         const truncated = snapshot.content.endsWith('... (truncated)');
-        const note =
+        let note =
           rendered.usedDiff && truncated
             ? `\n(page text is capped at ${capLength} characters; anything past the cut is not compared)`
             : '';
+        // #1360: "a repeat call returns a diff" is true only where refs are
+        // keyed on DOM identity. On this lane they are positional, so the tool
+        // silently returned the full tree every time and looked broken. Say
+        // which it is instead of leaving the caller to infer it.
+        if (!page && !full) {
+          note += '\n(no diff on this backend: refs here are numbered by walk position, so a single insertion renumbers the listing and a diff would be noise. The chrome backend diffs.)';
+        }
 
         return {
           content: [{ type: 'text' as const, text: rendered.text + note }],
@@ -228,13 +235,19 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
         // RPC fallback when not (packaged builds, issue #105).
         const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
 
-        const records = await extractStructuredData(page, scope, goal, fields);
+        const { records, notes } = await extractStructuredDataWithNotes(page, scope, goal, fields);
+
+        // Caveats ride along after the JSON, the same way browser_snapshot
+        // appends its truncation note (issue #1353): a positional column guess
+        // or a one-field-only mapping is still a result, but the agent has to
+        // know it is a guess.
+        const note = notes.length > 0 ? `\n\n(${notes.join('; ')})` : '';
 
         return {
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify(records, null, 2),
+              text: JSON.stringify(records, null, 2) + note,
             },
           ],
         };

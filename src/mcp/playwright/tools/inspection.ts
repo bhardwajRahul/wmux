@@ -12,7 +12,8 @@ import {
   noteFrameRefsForScope,
   resolveRef,
 } from '../snapshot';
-import { buildDomSnapshotExpression } from '../dom-intelligence';
+import { buildDomSnapshotExpression, readDomSnapshotPayload } from '../dom-intelligence';
+import { nextRefFor, priorRefDescriptors, recordRefGeneration } from '../refDescriptors';
 import { pageEvaluator, rpcEvaluator } from '../page-eval';
 import { formatSnapshotResult } from '../snapshotDiff';
 import { getSnapshotBaseline, setSnapshotBaseline, snapshotSurfaceKey } from '../snapshotCache';
@@ -21,6 +22,13 @@ import { evaluateWithGesture } from '../user-gesture';
 import { evaluateIsolated } from '../isolated-eval';
 import { detectDangerousPatterns } from '../security';
 import { redactPasswordParams } from '../redact';
+import {
+  attachFailedResourceUrls,
+  collapseRepeats,
+  filterNetwork,
+  resolveNthIndex,
+  type NetworkRow,
+} from '../inspectionFilters';
 import { sanitizeRef } from './interaction';
 import {
   allowScopedRpcFallback,
@@ -35,8 +43,33 @@ import {
   type CaptureWindow,
   type ConsoleEntry,
 } from '../pageCapture';
-import { clampScreenshotCeilingBytes, MAX_SCREENSHOT_MAXBYTES } from '../../resultCap';
-import { formatRefBoxTable, refBoxCandidates } from '../screenshotRefs';
+import { clampScreenshotCeilingBytes } from '../../resultCap';
+import {
+  formatRefBoxTable,
+  recallShrinkRung,
+  refBoxCandidates,
+  rememberScreenshotScale,
+  rememberShrinkRung,
+} from '../screenshotRefs';
+import {
+  coordinateBasis,
+  fitScreenshot,
+  screenshotGeometry,
+  type FittedImage,
+  type ShrinkRung,
+  type Viewport,
+} from '../screenshotScale';
+
+/**
+ * Descriptor-history key for the DOM interactive listing (#1355).
+ *
+ * Per surface, because that is what a listing describes, and per selector,
+ * because a scoped listing numbers refs inside one subtree — its descriptors
+ * describe a different listing from the unscoped one's.
+ */
+function domListingKey(scope: BrowserTargetScope, selector: string | undefined): string {
+  return `dom:${browserScopeKey(scope)}:${selector ?? ''}`;
+}
 
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
@@ -68,7 +101,7 @@ const BROWSER_SNAPSHOT_SHAPE = {
     .string()
     .optional()
     .describe(
-      'Scope to the first match (e.g. "[role=dialog]"), falling back to a DOM listing of that element when the tree cannot be scoped.',
+      'Scope to the first match (e.g. "[role=dialog]") — the cheapest way to narrow a big page. Falls back to a DOM listing of that element when the tree cannot be scoped.',
     ),
   filter: z
     .enum(['interactive'])
@@ -77,7 +110,9 @@ const BROWSER_SNAPSHOT_SHAPE = {
   q: z
     .string()
     .optional()
-    .describe('Keep only nodes matching this text (or /regex/), plus their ancestors.'),
+    .describe(
+      'Text filter: keep only nodes matching this text (or /regex/), plus their ancestors. Literal text is searched in the page and costs about as little as a selector scope; a /regex/, or a page with iframes, still reads the whole tree first — prefer selector when you know where to look.',
+    ),
   full: z.boolean().optional().describe('Force the complete tree instead of a diff.'),
   surfaceId: optionalSurfaceId,
 };
@@ -130,7 +165,23 @@ const BROWSER_NETWORK_SHAPE = {
   filter: z
     .string()
     .optional()
-    .describe('URL glob, e.g. "*api*".'),
+    .describe('URL glob to keep, e.g. "*api*".'),
+  exclude: z
+    .string()
+    .optional()
+    .describe('URL glob to drop, applied after filter — e.g. "*/poll*".'),
+  status: z
+    .string()
+    .optional()
+    .describe('Status filter: "404", or a class such as "4xx"/"5xx".'),
+  method: z
+    .string()
+    .optional()
+    .describe('HTTP method, case-insensitive.'),
+  collapse: z
+    .boolean()
+    .optional()
+    .describe('Fold identical url+method+status rows into one "xN" row (default true).'),
   clear: z
     .boolean()
     .optional()
@@ -142,7 +193,16 @@ const BROWSER_NETWORK_SHAPE = {
 const BROWSER_RESPONSE_BODY_SHAPE = {
   urlPattern: z
     .string()
-    .describe('URL glob, e.g. "*api/users*".'),
+    .optional()
+    .describe('URL glob, e.g. "*api/users*". Omit when passing requestId.'),
+  requestId: z
+    .number()
+    .optional()
+    .describe('The "id" browser_network printed for the request; takes priority over urlPattern.'),
+  nth: z
+    .number()
+    .optional()
+    .describe('Which match: 1 is the first, -1 the last (default).'),
   surfaceId: optionalSurfaceId,
   maxBytes: maxBytesParam,
 };
@@ -217,6 +277,64 @@ async function readCapture<T>(
   }
 }
 
+type NetworkSummary = { url: string; method: string; status?: number };
+
+/**
+ * The network buffer for a scope, from whichever lane serves it.
+ *
+ * Shared by browser_network and by browser_console (which needs it to put the
+ * URL back on a "Failed to load resource" line) and by browser_response_body
+ * (which resolves an `id`/`nth` against the same ordering the listing printed).
+ */
+async function readNetworkEntries(
+  scope: BrowserTargetScope,
+  clear?: boolean,
+): Promise<{ entries: NetworkSummary[]; window?: CaptureWindow }> {
+  return readCapture<{ entries: NetworkSummary[]; window?: CaptureWindow }>(
+    scope,
+    async () => {
+      // Main-process CDP capture, enabled when the guest attached.
+      const result = await sendScopedBrowserRpc<{
+        entries: NetworkSummary[];
+        since?: number;
+        missedBefore?: boolean;
+      }>('browser.network.get', scope, { ...(clear && { clear: true }) });
+      return {
+        entries: result.entries ?? [],
+        ...(typeof result.since === 'number' && {
+          window: { since: result.since, missedBefore: result.missedBefore === true },
+        }),
+      };
+    },
+    (page) => {
+      const state = ensurePageCapture(page);
+      const entries: NetworkSummary[] = state.network;
+      const window = state.networkWindow;
+      if (clear) clearNetworkCapture(state);
+      return { entries, window };
+    },
+  );
+}
+
+/**
+ * The one captured request a browser_response_body call names.
+ *
+ * `requestId` is the 1-based position the listing printed, so it addresses one
+ * exact request; otherwise `nth` counts over the glob's matches (-1, the
+ * default, being the most recent).
+ */
+function pickNetworkEntry(
+  entries: readonly NetworkSummary[],
+  args: { urlPattern?: string; requestId?: number; nth?: number },
+): NetworkSummary | null {
+  if (args.requestId !== undefined) return entries[args.requestId - 1] ?? null;
+  if (args.urlPattern === undefined) return null;
+  const pattern = args.urlPattern;
+  const matches = entries.filter((e) => matchesGlob(e.url, pattern));
+  const index = resolveNthIndex(matches.length, args.nth);
+  return index < 0 ? null : matches[index];
+}
+
 /**
  * State the collection window whenever it is known, so an empty buffer stops
  * reading like a clean page (#1081). Two different facts hide behind "nothing
@@ -272,7 +390,12 @@ function formatConsole(entries: ConsoleEntry[], window?: CaptureWindow): string 
 }
 
 /**
- * Filter by URL glob and render the {url, method, status} summary JSON.
+ * Filter and render the {id, url, method, status} summary JSON.
+ *
+ * `id` lets browser_response_body name one exact request instead of a glob that
+ * matched twelve. Identical rows are folded into one carrying `repeated: "xN"`
+ * unless `collapse:false` — a page polling one endpoint used to bury every
+ * other request in the listing (#1360).
  *
  * Request bodies are never captured, so the only credential that can reach this
  * listing is one a page put in the query string of a GET — which redaction
@@ -281,19 +404,36 @@ function formatConsole(entries: ConsoleEntry[], window?: CaptureWindow): string 
  */
 function formatNetwork(
   entries: Array<{ url: string; method: string; status?: number }>,
-  filter?: string,
+  options: {
+    filter?: string;
+    exclude?: string;
+    status?: string;
+    method?: string;
+    collapse?: boolean;
+  },
   window?: CaptureWindow,
 ): string {
-  const filtered = filter ? entries.filter((e) => matchesGlob(e.url, filter)) : entries;
-  const summary = filtered.map((e) => ({
+  // `id` is the 1-based position in the CAPTURE buffer, not in the filtered
+  // listing: browser_response_body resolves it against the same buffer, so a
+  // filter must not renumber the rows out from under a follow-up call.
+  const numbered = entries.map((e, i) => ({ ...e, id: i + 1 }));
+  const filtered = filterNetwork(numbered, options) as Array<
+    { url: string; method: string; status?: number; id: number }
+  >;
+  const rows: NetworkRow[] = filtered.map((e) => ({
+    id: e.id,
     url: redactPasswordParams(e.url),
     method: e.method,
     status: e.status ?? '(pending)',
   }));
-  if (summary.length === 0) {
+  const collapsed = options.collapse === false ? rows : collapseRepeats(rows);
+  if (collapsed.length === 0) {
     const detail = describeWindow(window, 'requests');
     return detail ? `No network requests. ${detail}` : 'No network requests collected.';
   }
+  const summary = collapsed.map(({ count, ...row }) =>
+    count === undefined ? row : { ...row, repeated: `x${count}` },
+  );
   return JSON.stringify(summary, null, 2) + windowFootnote(window, 'requests');
 }
 
@@ -358,11 +498,21 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             // mark any live Page's a11y refMap stale so resolveRef cannot use it.
             scopeRoute = '|dom';
             const evaluate = page ? pageEvaluator(page) : rpcEvaluator(scope);
+            // Stable numbering (#1355): an element still in the subtree keeps
+            // the number the previous listing gave it, so opening a dropdown no
+            // longer renumbers every ref the agent is holding.
+            const domKey = domListingKey(scope, selector);
+            const payload = readDomSnapshotPayload(await evaluate(
+              buildDomSnapshotExpression(selector, {
+                ...(filter && { filter }),
+                stable: { prior: priorRefDescriptors(domKey, 0), nextRef: nextRefFor(domKey, 0) },
+                withEntries: true,
+              }),
+            ));
             // The DOM listing carries the page URL and every link href verbatim,
             // so it gets the same URL redaction the network listing does.
-            text = redactPasswordParams(
-              String(await evaluate(buildDomSnapshotExpression(selector, { filter }))),
-            );
+            text = redactPasswordParams(String(payload.text));
+            if (payload.entries.length > 0) recordRefGeneration(domKey, 0, payload.entries);
             if (text.startsWith('No element matches selector:')) {
               // A miss is an error, not a snapshot — and must never become the
               // diff baseline for the next call (review consensus).
@@ -394,11 +544,18 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
           // Same expression the page-mode root-only fallthrough runs (snapshot.ts),
           // via the shared buildDomSnapshotExpression() helper — filter honored,
           // aria noted, same as there (#1066).
-          const result = await sendScopedBrowserRpc<{ value: string }>('browser.evaluate', scope, {
-            expression: buildDomSnapshotExpression(undefined, { filter }),
+          const domKey = domListingKey(scope, undefined);
+          const result = await sendScopedBrowserRpc<{ value: unknown }>('browser.evaluate', scope, {
+            expression: buildDomSnapshotExpression(undefined, {
+              ...(filter && { filter }),
+              stable: { prior: priorRefDescriptors(domKey, 0), nextRef: nextRefFor(domKey, 0) },
+              withEntries: true,
+            }),
           });
+          const payload = readDomSnapshotPayload(result.value);
           // Same URL redaction as the scoped DOM listing above.
-          text = redactPasswordParams(result.value);
+          text = redactPasswordParams(payload.text);
+          if (payload.entries.length > 0) recordRefGeneration(domKey, 0, payload.entries);
           if (format === 'aria') {
             text = `(note: aria format unavailable — no live page, returning the DOM interactive listing)\n${text}`;
           }
@@ -463,124 +620,24 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // browser_screenshot
   // -----------------------------------------------------------------------
 
-  /**
-   * The coordinate basis of a screenshot, stated in the result.
-   *
-   * browser_click x/y are VIEWPORT CSS pixels, while a PNG is in device pixels
-   * — off by the devicePixelRatio on every retina display — and a fullPage or
-   * element shot is not in viewport space at all. Without this line an agent
-   * reading pixels off the image clicks the wrong place and cannot tell why.
-   * Adding a text part changes the result shape (image-only before), which is
-   * called out in the changelog.
-   */
-  const coordinateBasis = (
-    kind: 'viewport' | 'fullPage' | 'element' | 'unsupported',
-    dpr: number | null,
-  ): string => {
-    if (kind === 'fullPage') {
-      return 'Coordinates in this image are DOCUMENT coordinates — NOT usable for browser_click x/y (which are viewport CSS px). Take a viewport screenshot (omit fullPage) if you need to click by coordinate.';
-    }
-    if (kind === 'element') {
-      return 'Coordinates in this image are ELEMENT-relative — NOT usable for browser_click x/y (which are viewport CSS px).';
-    }
-    if (kind === 'unsupported') {
-      return 'This backend does not support coordinate clicks (browser_click resolves elements by ref here), so no coordinate can be read off this image.';
-    }
-    return dpr === null
-      ? 'This is a viewport capture. browser_click x/y are viewport CSS px; this image may be scaled by the display\'s devicePixelRatio, which could not be read here — divide image pixels by it before clicking.'
-      : `This is a viewport capture at devicePixelRatio ${dpr}. browser_click x/y are viewport CSS px = image pixels / ${dpr}.`;
-  };
-
-  /** Read the ratio at capture time, so the note describes THIS image. */
-  const readDpr = async (page: Page | null): Promise<number | null> => {
+  /** Read the live viewport in CSS px, so the factor describes THIS image. */
+  const readViewport = async (page: Page | null): Promise<Viewport | null> => {
     if (!page) return null;
-    // devicePixelRatio is a property of the frame, not of the main world's
-    // globals, so the isolated world reads the same number.
-    const value = await evaluateIsolated(page, 'window.devicePixelRatio').catch(() => null);
-    return typeof value === 'number' && value > 0 ? value : null;
+    // innerWidth/innerHeight are frame properties, not main-world globals, so
+    // the isolated world reads the same numbers. viewportSize() is null on
+    // every connectOverCDP page, hence the page read rather than the API.
+    const size = await evaluateIsolated(page, '[window.innerWidth, window.innerHeight]').catch(
+      () => null,
+    );
+    if (!Array.isArray(size) || typeof size[0] !== 'number' || typeof size[1] !== 'number') {
+      return null;
+    }
+    return size[0] > 0 && size[1] > 0 ? { width: size[0], height: size[1] } : null;
   };
 
-  /**
-   * One rung of the downscale ladder: a re-encode the lane can actually
-   * perform. `scale` is relative to the ORIGINAL capture, so the note the
-   * caller reads ("scaled to 0.5") is the number they divide image pixels by
-   * on top of the coordinate basis already stated.
-   */
-  interface ShrinkRung {
-    readonly scale: number;
-    readonly quality: number;
-  }
-
-  /**
-   * Owner decision: browser_screenshot NEVER refuses. Over the base64 ceiling
-   * the image is re-encoded smaller — JPEG first, then progressively scaled —
-   * and the result SAYS what was applied, so a caller reading coordinates off
-   * the pixels can compensate exactly. A refusal used to protect the
-   * coordinate contract by removing the capability; stating the factor
-   * protects it while keeping the capability.
-   */
-  const SHRINK_LADDER: readonly ShrinkRung[] = Object.freeze([
-    { scale: 1, quality: 80 },
-    { scale: 0.75, quality: 80 },
-    { scale: 0.5, quality: 75 },
-    { scale: 0.35, quality: 70 },
-    { scale: 0.25, quality: 60 },
-  ]);
-
-  /** What a shrink produced, plus the sentence describing it. */
-  interface FittedImage {
-    readonly data: string;
-    readonly mimeType: string;
-    /** Empty when the original PNG was already within the ceiling. */
-    readonly note: string;
-  }
-
-  /**
-   * Walk the ladder until a rung fits under `ceiling`. A rung that a lane
-   * cannot perform returns null and ends the walk; the smallest payload seen
-   * is returned either way, because handing back a too-large image with an
-   * honest note still beats refusing (and the text cap never touches image
-   * content, so the caller's own ceiling is the only bound that applies).
-   */
-  const fitScreenshot = async (
-    original: string,
-    ceiling: number,
-    shrink: (rung: ShrinkRung) => Promise<string | null>,
-  ): Promise<FittedImage> => {
-    if (original.length <= ceiling) {
-      return { data: original, mimeType: 'image/png', note: '' };
-    }
-    let best = { data: original, mimeType: 'image/png', scale: 1, quality: 0 };
-    for (const rung of SHRINK_LADDER) {
-      const data = await shrink(rung).catch(() => null);
-      if (data === null) break;
-      if (data.length < best.data.length) {
-        best = { data, mimeType: 'image/jpeg', scale: rung.scale, quality: rung.quality };
-      }
-      if (data.length <= ceiling) break;
-    }
-    if (best.mimeType === 'image/png') {
-      // No lane knob produced anything smaller. Say so rather than pretending.
-      return {
-        data: best.data,
-        mimeType: 'image/png',
-        note:
-          `This image is ${(best.data.length / (1024 * 1024)).toFixed(1)} MiB of base64, over the ` +
-          `${(ceiling / (1024 * 1024)).toFixed(1)} MiB ceiling, and this capture path offers no ` +
-          'downscale. Narrow the capture (omit fullPage, or scope to an element with ref).',
-      };
-    }
-    const fits = best.data.length <= ceiling ? '' : ' It is still over the ceiling — narrow the capture.';
-    return {
-      data: best.data,
-      mimeType: best.mimeType,
-      note:
-        `Downscaled to fit the ${(ceiling / (1024 * 1024)).toFixed(1)} MiB ceiling: JPEG q${best.quality}` +
-        `${best.scale === 1 ? ' at full size' : `, scaled to ${best.scale}`}. Divide image pixels by ` +
-        `${best.scale} before applying the coordinate basis above.${fits}` +
-        ` Pass maxBytes (up to ${MAX_SCREENSHOT_MAXBYTES / (1024 * 1024)} MiB) for the original.`,
-    };
-  };
+  /** Ladder memo key: the rung is only reused for the same surface shape. */
+  const viewportKey = (viewport: Viewport | null): string =>
+    viewport ? `${viewport.width}x${viewport.height}` : 'unknown';
 
   /** Playwright lanes can simply re-capture at the rung's format and scale. */
   const shrinkViaPlaywright = (
@@ -601,7 +658,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
 
   server.tool(
     'browser_screenshot',
-    'Screenshot the page or one element as a base64-encoded PNG. Requires browser_open first, even if a browser panel is already visible.',
+    'Screenshot the page or one element as a base64-encoded PNG. Requires browser_open first, even if a browser panel is already visible. A viewport capture states ONE scale (image px per viewport CSS px, device pixel ratio and any downscale already folded in) plus a screenshotScale JSON line: click with browser_click imageX/imageY, or divide by that scale yourself. fullPage and element captures are not in click coordinates at all.',
     BROWSER_SCREENSHOT_SHAPE,
     async ({ fullPage, ref, surfaceId, maxBytes, refs }) => withAutomationLease(deps, surfaceId, async (scope) => {
       const ceiling = clampScreenshotCeilingBytes(maxBytes);
@@ -646,13 +703,18 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
         if (!ref && (await engine.resolveWorkspaceBackend(scope.workspaceId)) === 'chrome') {
           const page = await engine.getPageForScope(scope);
           if (page) {
-            // Read the ratio immediately before the capture: a display change
+            // Read the viewport immediately before the capture: a resize
             // between the two would otherwise mislabel the image.
-            const dpr = fullPage ? null : await readDpr(page);
+            const viewport = fullPage ? null : await readViewport(page);
             const buf = await page.screenshot({ ...(fullPage && { fullPage: true }), type: 'png' });
+            const scopeKey = browserScopeKey(scope);
+            const memoKey = `${scopeKey}|${fullPage ? 'full' : 'viewport'}`;
             const fitted = await fitScreenshot(
               buf.toString('base64'),
-              ceiling,
+              {
+                maxBytes: ceiling,
+                rememberedScale: recallShrinkRung(memoKey, viewportKey(viewport), ceiling),
+              },
               shrinkViaPlaywright((rung) =>
                 page.screenshot({
                   ...(fullPage && { fullPage: true }),
@@ -664,7 +726,12 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
                 }),
               ),
             );
-            const basis = coordinateBasis(fullPage ? 'fullPage' : 'viewport', dpr);
+            rememberShrinkRung(memoKey, viewportKey(viewport), ceiling, fitted.scale);
+            // Measured on the bytes that are actually returned, so the one
+            // factor already contains the device ratio and the rung above.
+            const geometry = fullPage ? null : screenshotGeometry(fitted.data, viewport);
+            if (geometry) rememberScreenshotScale(scopeKey, geometry);
+            const basis = coordinateBasis(fullPage ? 'fullPage' : 'viewport', geometry);
             return imageResult(fitted, refs ? `${basis}\n\n${await refsTable(page)}` : basis);
           }
         }
@@ -679,7 +746,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             const buffer = (await el.screenshot()) as Buffer;
             const fitted = await fitScreenshot(
               buffer.toString('base64'),
-              ceiling,
+              { maxBytes: ceiling },
               shrinkViaPlaywright((rung) =>
                 el.screenshot({ type: 'jpeg', quality: rung.quality }) as Promise<Buffer>,
               ),
@@ -701,14 +768,25 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
         // only place this lane's pixels exist. A daemon that predates the
         // parameters answers with the same PNG, which fitScreenshot reads as
         // "no knob" and reports honestly instead of refusing.
-        const fitted = await fitScreenshot(result.data, ceiling, async (rung) => {
-          const shrunk = await sendScopedBrowserRpc<{ data: string; mimeType?: string }>(
-            'browser.screenshot',
-            scope,
-            { ...(fullPage && { fullPage }), format: 'jpeg', quality: rung.quality, scale: rung.scale },
-          );
-          return shrunk.mimeType === 'image/jpeg' ? shrunk.data : null;
-        });
+        const rpcMemoKey = `${browserScopeKey(scope)}|rpc|${fullPage ? 'full' : 'viewport'}`;
+        const fitted = await fitScreenshot(
+          result.data,
+          {
+            maxBytes: ceiling,
+            // This lane cannot read a viewport, so the rung is remembered under
+            // a fixed key: it still stops drifting between calls.
+            rememberedScale: recallShrinkRung(rpcMemoKey, 'unknown', ceiling),
+          },
+          async (rung) => {
+            const shrunk = await sendScopedBrowserRpc<{ data: string; mimeType?: string }>(
+              'browser.screenshot',
+              scope,
+              { ...(fullPage && { fullPage }), format: 'jpeg', quality: rung.quality, scale: rung.scale },
+            );
+            return shrunk.mimeType === 'image/jpeg' ? shrunk.data : null;
+          },
+        );
+        rememberShrinkRung(rpcMemoKey, 'unknown', ceiling, fitted.scale);
         // The RPC lane cannot click by coordinate at all, so telling the
         // caller how to convert pixels here would contradict itself.
         const basis = coordinateBasis(fullPage ? 'fullPage' : 'unsupported', null);
@@ -802,7 +880,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_console',
-    'Read console messages. Collection starts when the page is opened/attached, not at this call; clear:true resets.',
+    'Read console messages. Collection starts when the page is opened/attached, not at this call; clear:true resets. A "Failed to load resource" line gets the failing URL appended from the network buffer, which Chrome leaves off the message itself.',
     BROWSER_CONSOLE_SHAPE,
     async ({ level, clear, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
@@ -835,7 +913,16 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
           },
         );
 
-        const text = formatConsole(filterConsole(entries, level), window);
+        const selected = filterConsole(entries, level);
+        // Only when a line actually needs a URL: the extra buffer read is free
+        // on the (overwhelmingly common) page that logged no failed resource.
+        const network = selected.some((e) => /failed to load resource/i.test(e.text))
+          ? await readNetworkEntries(scope).then((r) => r.entries).catch(() => [])
+          : [];
+        const text = formatConsole(
+          attachFailedResourceUrls(selected, network) as ConsoleEntry[],
+          window,
+        );
 
         return {
           content: [{ type: 'text' as const, text }],
@@ -855,40 +942,17 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_network',
-    'Read network requests. Collection starts when the page is opened/attached, not at this call; clear:true resets.',
+    'Read network requests. Collection starts when the page is opened/attached, not at this call; clear:true resets. Each row carries an "id" browser_response_body accepts; identical rows fold into one with "repeated":"xN".',
     BROWSER_NETWORK_SHAPE,
-    async ({ filter, clear, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ filter, exclude, status, method, collapse, clear, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
-        type NetworkSummary = { url: string; method: string; status?: number };
-        const { entries, window } = await readCapture<{
-          entries: NetworkSummary[];
-          window?: CaptureWindow;
-        }>(
-          scope,
-          async () => {
-            // Main-process CDP capture, enabled when the guest attached.
-            const result = await sendScopedBrowserRpc<{
-              entries: NetworkSummary[];
-              since?: number;
-              missedBefore?: boolean;
-            }>('browser.network.get', scope, { ...(clear && { clear: true }) });
-            return {
-              entries: result.entries ?? [],
-              ...(typeof result.since === 'number' && {
-                window: { since: result.since, missedBefore: result.missedBefore === true },
-              }),
-            };
-          },
-          (page) => {
-            const state = ensurePageCapture(page);
-            const entries: NetworkSummary[] = state.network;
-            const window = state.networkWindow;
-            if (clear) clearNetworkCapture(state);
-            return { entries, window };
-          },
-        );
+        const { entries, window } = await readNetworkEntries(scope, clear);
 
-        const text = formatNetwork(entries, filter, window);
+        const text = formatNetwork(
+          entries,
+          { filter, exclude, status, method, collapse },
+          window,
+        );
 
         return {
           content: [{ type: 'text' as const, text }],
@@ -908,29 +972,55 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_response_body',
-    'Response body of a captured network request matching a URL glob.',
+    'Response body of a captured network request, by URL glob or by the "id" browser_network printed. With several matches, nth picks one — the last by default, which is the response after the filter change you just made.',
     BROWSER_RESPONSE_BODY_SHAPE,
-    async ({ urlPattern, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ urlPattern, requestId, nth, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
+        if (urlPattern === undefined && requestId === undefined) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Pass urlPattern (a URL glob) or requestId (the "id" a browser_network row printed).',
+              },
+            ],
+            isError: true,
+          };
+        }
+        const what =
+          requestId !== undefined ? `id ${requestId}` : `pattern "${urlPattern}"`;
         const body = await readCapture<string | null>(
           scope,
           async () => {
-            // Main matches and returns the body from its CDP capture buffer.
+            // Main's buffer cannot be indexed over RPC, so the id / nth is
+            // resolved against the listing first and asked for by exact URL.
+            // Same ordering the listing printed, because it is the same read.
+            let pattern = urlPattern;
+            if (requestId !== undefined || (nth !== undefined && nth !== -1)) {
+              const { entries } = await readNetworkEntries(scope);
+              const target = pickNetworkEntry(entries, { urlPattern, requestId, nth });
+              if (!target) return null;
+              pattern = target.url;
+            }
+            if (pattern === undefined) return null;
             const result = await sendScopedBrowserRpc<{ body: string | null }>('browser.responseBody.get', scope, {
-              urlPattern,
+              urlPattern: pattern,
             });
             return result.body ?? null;
           },
           (page) => {
             const state = ensurePageCapture(page);
-            // Find the last matching entry with a captured body
-            for (let i = state.network.length - 1; i >= 0; i--) {
-              const candidate = state.network[i].response?.body;
-              if (candidate !== undefined && matchesGlob(state.network[i].url, urlPattern)) {
-                return candidate;
-              }
+            if (requestId !== undefined) {
+              const entry = state.network[requestId - 1];
+              return entry?.response?.body ?? null;
             }
-            return null;
+            // Only entries whose body was actually retained can be answered
+            // with, so `nth` counts over those and not over every request.
+            const withBody = state.network.filter(
+              (e) => e.response?.body !== undefined && matchesGlob(e.url, urlPattern!),
+            );
+            const index = resolveNthIndex(withBody.length, nth);
+            return index < 0 ? null : withBody[index].response!.body!;
           },
         );
 
@@ -939,7 +1029,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             content: [
               {
                 type: 'text' as const,
-                text: `No response body found for pattern "${urlPattern}". Ensure the request has been made and the response was captured.`,
+                text: `No response body found for ${what}. Ensure the request has been made and the response was captured.`,
               },
             ],
           };

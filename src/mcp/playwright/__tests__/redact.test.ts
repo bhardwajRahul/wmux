@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   PASSWORD_FIELD_SELECTOR,
+  REDACTED_CREDENTIAL,
   REDACTED_PASSWORD,
   getPasswordFieldBackendIds,
   isPasswordFieldNode,
+  redactCredentialParams,
   redactPasswordParams,
 } from '../redact';
 
@@ -124,8 +126,12 @@ describe('redactPasswordParams — form bodies and query strings', () => {
   });
 
   it('leaves a path segment that merely reads like a password key alone', () => {
-    const url = 'https://x.test/account/reset-password?token=abc123';
-    expect(redactPasswordParams(url)).toBe(url);
+    // The PATH keeps reading `reset-password`; only the token VALUE goes. The
+    // token itself is a credential — it logs its holder in — so it is masked
+    // under the credential rule rather than the password one (#1354).
+    expect(redactPasswordParams('https://x.test/account/reset-password?id=7')).toBe(
+      'https://x.test/account/reset-password?id=7',
+    );
   });
 
   it('treats whitespace as a key boundary, for prose like console output', () => {
@@ -191,6 +197,119 @@ describe('redactPasswordParams — URL userinfo', () => {
   it('leaves a username-only URL alone', () => {
     const url = 'https://alice@x.test/dashboard';
     expect(redactPasswordParams(url)).toBe(url);
+  });
+});
+
+describe('redactCredentialParams — OAuth / SSO credentials (#1354)', () => {
+  it('masks the authorization code in a callback URL and keeps the rest readable', () => {
+    const out = redactCredentialParams(
+      'https://x.test/oauth/callback?code=4%2F0AY0eSECRET&state=xyz789&scope=openid',
+    );
+    expect(out).not.toContain('SECRET');
+    expect(out).toBe(
+      `https://x.test/oauth/callback?code=${REDACTED_CREDENTIAL}&state=xyz789&scope=openid`,
+    );
+  });
+
+  it('masks tokens the implicit flow returns in the FRAGMENT', () => {
+    const out = redactCredentialParams(
+      'https://x.test/cb#access_token=eyJhbGSECRET&id_token=eyJraWSECRET&token_type=Bearer&expires_in=3600',
+    );
+    expect(out).not.toContain('SECRET');
+    expect(out).toBe(
+      `https://x.test/cb#access_token=${REDACTED_CREDENTIAL}&id_token=${REDACTED_CREDENTIAL}` +
+        '&token_type=Bearer&expires_in=3600',
+    );
+  });
+
+  it('masks a token exchange JSON body', () => {
+    const out = redactCredentialParams(
+      '{"access_token":"ya29.SECRET","id_token":"eyJhSECRET","refresh_token":"1//0gSECRET",' +
+        '"token_type":"Bearer","expires_in":3599}',
+    );
+    expect(out).not.toContain('SECRET');
+    expect(out).toContain(`"access_token":"${REDACTED_CREDENTIAL}"`);
+    expect(out).toContain(`"id_token":"${REDACTED_CREDENTIAL}"`);
+    expect(out).toContain(`"refresh_token":"${REDACTED_CREDENTIAL}"`);
+    // Everything that is not a credential survives byte for byte.
+    expect(out).toContain('"token_type":"Bearer"');
+    expect(out).toContain('"expires_in":3599');
+  });
+
+  it('masks a form-encoded token request body', () => {
+    const out = redactCredentialParams(
+      'grant_type=authorization_code&code=AUTHSECRET&client_id=app-1&client_secret=CSSECRET',
+    );
+    expect(out).not.toContain('SECRET');
+    expect(out).toBe(
+      `grant_type=authorization_code&code=${REDACTED_CREDENTIAL}&client_id=app-1` +
+        `&client_secret=${REDACTED_CREDENTIAL}`,
+    );
+  });
+
+  it('masks a SAML assertion and a session_state', () => {
+    const out = redactCredentialParams('SAMLResponse=PHNhbWxSECRET&session_state=abcSECRET');
+    expect(out).not.toContain('SECRET');
+    expect(out).toBe(
+      `SAMLResponse=${REDACTED_CREDENTIAL}&session_state=${REDACTED_CREDENTIAL}`,
+    );
+  });
+
+  it('masks a reset token — a reset link logs its holder in', () => {
+    const out = redactCredentialParams('https://x.test/account/reset-password?token=abc123');
+    expect(out).toBe(`https://x.test/account/reset-password?token=${REDACTED_CREDENTIAL}`);
+  });
+
+  it('masks credential header VALUES and keeps the header names', () => {
+    const headers = [
+      'GET /api/me HTTP/1.1',
+      'Authorization: Bearer eyJhbGciSECRET',
+      'X-Api-Key: sk-liveSECRET',
+      'Cookie: session=abcSECRET; theme=dark',
+      'Set-Cookie: session=defSECRET; HttpOnly',
+      'Accept: application/json',
+    ].join('\n');
+
+    const out = redactCredentialParams(headers);
+
+    expect(out).not.toContain('SECRET');
+    expect(out).toContain(`Authorization: ${REDACTED_CREDENTIAL}`);
+    expect(out).toContain(`X-Api-Key: ${REDACTED_CREDENTIAL}`);
+    expect(out).toContain(`Cookie: ${REDACTED_CREDENTIAL}`);
+    expect(out).toContain(`Set-Cookie: ${REDACTED_CREDENTIAL}`);
+    // A header that carries no credential is untouched, and so is the line that
+    // says which request this was.
+    expect(out).toContain('Accept: application/json');
+    expect(out).toContain('GET /api/me HTTP/1.1');
+  });
+
+  it('keeps password-family keys on their own marker', () => {
+    const out = redactCredentialParams('password=hunter2&access_token=tokSECRET');
+    expect(out).toBe(
+      `password=${REDACTED_PASSWORD}&access_token=${REDACTED_CREDENTIAL}`,
+    );
+  });
+
+  it('matches whole keys only: a name that merely contains one is left alone', () => {
+    const body = '{"tokenizer":"bpe","token_count":42,"decoded":"hello"}';
+    expect(redactCredentialParams(body)).toBe(body);
+    expect(redactCredentialParams('a=1&mycode=2&codes=3')).toBe('a=1&mycode=2&codes=3');
+  });
+
+  it('leaves an ordinary JSON status body readable', () => {
+    const body = '{"code":404,"message":"not found"}';
+    expect(redactCredentialParams(body)).toBe(body);
+  });
+
+  it('masks a credential the capture cap cut mid-value', () => {
+    const marker = ['', '... [truncated 4096 chars]'].join('\n');
+    const out = redactCredentialParams(`{"user":"alice","access_token":"ya29.SEC${marker}`);
+    expect(out).not.toContain('SEC"');
+    expect(out).toBe(`{"user":"alice","access_token":"${REDACTED_CREDENTIAL}${marker}`);
+  });
+
+  it('is exported under the historical name as well', () => {
+    expect(redactPasswordParams).toBe(redactCredentialParams);
   });
 });
 

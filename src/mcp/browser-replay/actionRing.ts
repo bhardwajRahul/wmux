@@ -5,6 +5,7 @@ import { redactPasswordParams } from '../playwright/redact';
 import { isActionRecordingSuppressed } from './recordingSuppression';
 import {
   ACTION_RING_CAPACITY,
+  ACTION_RING_MAX_BYTES,
   NO_AXIS,
   clampArgValue,
   normalizeUrlKey,
@@ -61,13 +62,36 @@ export interface RecordedAction {
   at: number;
 }
 
+/** Roughly what one entry costs to hold, for the ring's byte ceiling. */
+function entryBytes(action: RecordedAction): number {
+  try {
+    return JSON.stringify(action).length;
+  } catch {
+    // A step is plain data by construction, so this cannot normally happen —
+    // charge a nominal cost rather than let a recording problem throw.
+    return 256;
+  }
+}
+
 export class ActionRing {
   private readonly entries: RecordedAction[] = [];
+  /** Running total of entryBytes(), so a push is O(1) rather than O(n). */
+  private bytes = 0;
+  private readonly sizes: number[] = [];
 
   push(action: RecordedAction): void {
     this.entries.push(action);
-    if (this.entries.length > ACTION_RING_CAPACITY) {
-      this.entries.splice(0, this.entries.length - ACTION_RING_CAPACITY);
+    const size = entryBytes(action);
+    this.sizes.push(size);
+    this.bytes += size;
+    // Two ceilings, oldest-first on both (#1360): the count, and the bytes the
+    // count no longer bounds now that it is 200.
+    while (
+      this.entries.length > ACTION_RING_CAPACITY ||
+      (this.entries.length > 1 && this.bytes > ACTION_RING_MAX_BYTES)
+    ) {
+      this.entries.shift();
+      this.bytes -= this.sizes.shift() ?? 0;
     }
   }
 
@@ -78,6 +102,8 @@ export class ActionRing {
 
   clear(): void {
     this.entries.length = 0;
+    this.sizes.length = 0;
+    this.bytes = 0;
   }
 
   /**

@@ -63,6 +63,17 @@ export interface BrowserReplRunOutcome {
   readonly console: TruncatedText;
   readonly result?: TruncatedText;
   readonly error?: string;
+  /**
+   * The ledger number of the first `browser.*` call that FAILED, and its name.
+   *
+   * A snippet that throws at step 40 used to report only the exception, and the
+   * 39 calls that had already succeeded were left for the caller to count off
+   * the ledger by hand — or, when the throw came from somewhere else entirely,
+   * to look for a failed step that was never there (#1360). Absent when every
+   * call the run made succeeded.
+   */
+  readonly failedStep?: number;
+  readonly failedCall?: string;
   /** True when the run was killed by the deadline; the worker is gone. */
   readonly timedOut: boolean;
   /** True when this run started a new worker (first run, or after a timeout/crash). */
@@ -210,9 +221,17 @@ export class BrowserReplSession {
     const started = Date.now();
     const ledger: string[] = [];
     let callCount = 0;
-    const record = (line: string) => {
+    // First failure only: the snippet may catch and carry on, and the step that
+    // broke the flow is the one the caller is looking for.
+    let failedStep: number | undefined;
+    let failedCall: string | undefined;
+    const record = (line: string, failure?: string) => {
       callCount++;
       if (ledger.length < LEDGER_MAX_LINES) ledger.push(line);
+      if (failure !== undefined && failedStep === undefined) {
+        failedStep = callCount;
+        failedCall = failure;
+      }
     };
     const hintCollector = new RunHintCollector();
     const hints = hintCollector.lines;
@@ -228,8 +247,13 @@ export class BrowserReplSession {
       images: images.images,
       imagesElided: images.elided,
     });
+    /** The first failed call, folded into every outcome shape below. */
+    const failure = () => ({
+      ...(failedStep !== undefined && { failedStep, failedCall }),
+    });
     const abort = (error: string) => ({
       ...withHintCount(),
+      ...failure(),
       callCount,
       ok: false,
       elapsedMs: Date.now() - started,
@@ -272,7 +296,7 @@ export class BrowserReplSession {
     return new Promise<BrowserReplRunOutcome>((resolve) => {
       let settled = false;
       const finish = (
-        outcome: Omit<BrowserReplRunOutcome, 'ledger' | 'hints' | 'hintsElided' | 'callCount' | 'freshRuntime' | 'previousDeath' | 'elapsedMs' | 'console'>,
+        outcome: Omit<BrowserReplRunOutcome, 'ledger' | 'hints' | 'hintsElided' | 'callCount' | 'freshRuntime' | 'previousDeath' | 'elapsedMs' | 'console' | 'failedStep' | 'failedCall'>,
       ) => {
         if (settled) return;
         settled = true;
@@ -288,7 +312,7 @@ export class BrowserReplSession {
           this.straggling.add(pending);
           void pending.finally(() => this.straggling.delete(pending));
         }
-        resolve({ ...withHintCount(), ...outcome, callCount, elapsedMs: Date.now() - started, console: consoleBuf.render() });
+        resolve({ ...withHintCount(), ...failure(), ...outcome, callCount, elapsedMs: Date.now() - started, console: consoleBuf.render() });
       };
 
       const timer = setTimeout(() => {
@@ -325,7 +349,7 @@ export class BrowserReplSession {
             };
             const pending = bridge(name, args).then(
               (outcome) => {
-                record(outcome.ledger);
+                record(outcome.ledger, outcome.ok ? undefined : name);
                 if (!outcome.ok) {
                   reply({ ok: false, error: outcome.error });
                   return;
@@ -340,7 +364,7 @@ export class BrowserReplSession {
               // is a bug in the bridge itself. Still answer, or the script hangs.
               (error: unknown) => {
                 const message = error instanceof Error ? error.message : String(error);
-                record(`${name}(…) THREW ${message}`);
+                record(`${name}(…) THREW ${message}`, name);
                 reply({ ok: false, error: `browser.${name}: bridge failure: ${message}` });
               },
             );
