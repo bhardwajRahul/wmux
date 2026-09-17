@@ -112,13 +112,14 @@ function isFunctionExpression(source: string): boolean {
   );
 }
 
-/** Setup errors (no target / dead WebContents / external backend) are not
+/** Setup errors (no target / dead WebContents / external backend / a surface
+ *  that was opened for this caller and never registered, #1328) are not
  *  transient navigation races — re-raise them immediately instead of polling
  *  until the deadline. EXTERNAL_BACKEND_UNSUPPORTED (#517) is permanent by
  *  definition: the workspace delegates opens to the OS browser, so no target
  *  will ever appear and polling (forever, with timeout: 0) cannot succeed. */
 function isSetupError(message: string): boolean {
-  return /no webview target registered|WebContents unavailable|EXTERNAL_BACKEND_UNSUPPORTED|CHROME_BACKEND_RPC_UNSUPPORTED/i.test(message);
+  return /no webview target registered|WebContents unavailable|EXTERNAL_BACKEND_UNSUPPORTED|CHROME_BACKEND_RPC_UNSUPPORTED|BROWSER_SURFACE_NOT_REGISTERED/i.test(message);
 }
 
 function sleep(ms: number): Promise<void> {

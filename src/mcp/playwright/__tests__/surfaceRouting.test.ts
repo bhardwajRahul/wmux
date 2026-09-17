@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /*
  * Where a browser call that named no surfaceId lands.
@@ -344,5 +344,105 @@ describe('resolveDefaultSurface over the transport', () => {
   it('refuses an empty workspace id', async () => {
     await expect(resolveDefaultSurface('')).rejects.toThrow('WORKSPACE_SCOPE_UNRESOLVED');
     expect(mockSendRpc).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * #1328 — the readiness wait's three verdicts.
+ *
+ * The wait used to end silently on timeout, so a surface that was ANSWERED and
+ * never existed was pinned and handed to the call anyway. Failing on a timeout
+ * alone would be worse: a builtin pane registers its guest a moment after it is
+ * created, and a slow one is not a missing one. So the timeout asks the control
+ * plane, and only the two answers together convict.
+ */
+describe('waiting for a freshly opened surface', () => {
+  /** A main whose `browser.tabs new` answers `surf-new` and then `tabs`/`cdp` say `listed`. */
+  function mainAnswering(listed: { cdp: string[]; tabs: string[] | 'unreadable' }) {
+    mockSendRpc.mockImplementation((method: string, params: { action?: string } = {}) => {
+      if (method === 'browser.cdp.info') {
+        return Promise.resolve({
+          targetsScoped: true,
+          workspaceBackend: 'builtin',
+          targets: listed.cdp.map((surfaceId) => ({ surfaceId })),
+        });
+      }
+      if (method === 'browser.tabs' && params.action === 'new') {
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-new' } });
+      }
+      if (method === 'browser.tabs' && params.action === 'list') {
+        return listed.tabs === 'unreadable'
+          ? Promise.reject(new Error('method denied'))
+          : Promise.resolve({
+              ok: true,
+              action: 'list',
+              tabs: listed.tabs.map((surfaceId) => ({ surfaceId })),
+            });
+      }
+      return Promise.resolve({ ok: true });
+    });
+  }
+
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /**
+   * Advance past the readiness deadline while the open is in flight.
+   *
+   * The outcome is captured rather than re-thrown from a derived promise: a
+   * rejection parked until the loop ends is an unhandled rejection to node,
+   * and vitest fails the run on it.
+   */
+  async function settle<T>(call: Promise<T>): Promise<T> {
+    let outcome: { ok: true; value: T } | { ok: false; error: unknown } | undefined;
+    void call.then(
+      (value) => { outcome = { ok: true, value }; },
+      (error) => { outcome = { ok: false, error }; },
+    );
+    for (let i = 0; i < 300 && !outcome; i++) await vi.advanceTimersByTimeAsync(100);
+    if (!outcome) throw new Error('the call never settled');
+    if (outcome.ok) return outcome.value;
+    throw outcome.error;
+  }
+
+  it('refuses, and drops the pin, when neither lane has ever heard of it', async () => {
+    mainAnswering({ cdp: [], tabs: [] });
+
+    await expect(
+      settle(openSurfaceForConnection(WS, { awaitReady: true })),
+    ).rejects.toThrow('BROWSER_SURFACE_NOT_REGISTERED');
+    // Left in place it would aim every later unsaid call of this connection at
+    // a surface that does not exist.
+    expect(getPinnedSurface()).toBeNull();
+  });
+
+  it('keeps a surface the pane list knows — a late guest is not a missing one', async () => {
+    mainAnswering({ cdp: [], tabs: ['surf-new'] });
+
+    await expect(settle(openSurfaceForConnection(WS, { awaitReady: true }))).resolves.toBe(
+      'surf-new',
+    );
+    expect(getPinnedSurface()).toEqual({ workspaceId: WS, surfaceId: 'surf-new' });
+  });
+
+  it('keeps a surface it could not ask about', async () => {
+    // The commander lane refuses `browser.tabs` outright. "Cannot check" must
+    // never read as "never existed".
+    mainAnswering({ cdp: [], tabs: 'unreadable' });
+
+    await expect(settle(openSurfaceForConnection(WS, { awaitReady: true }))).resolves.toBe(
+      'surf-new',
+    );
+  });
+
+  it('returns as soon as the target registers, without asking the pane list', async () => {
+    mainAnswering({ cdp: ['surf-new'], tabs: [] });
+
+    await expect(settle(openSurfaceForConnection(WS, { awaitReady: true }))).resolves.toBe(
+      'surf-new',
+    );
+    expect(
+      mockSendRpc.mock.calls.filter((c) => c[0] === 'browser.tabs' && c[1]?.action === 'list'),
+    ).toHaveLength(0);
   });
 });

@@ -123,6 +123,18 @@ export function clearPinnedSurface(): void {
   writePin(null);
 }
 
+/**
+ * Drop the pin only while it still names this surface.
+ *
+ * A blanket clear would take a pin another call of this same connection has
+ * already moved on to — the phantom surface below is discovered seconds after
+ * it was opened, and an interleaved open may have pinned a real one since.
+ */
+export function clearPinIfSurface(workspaceId: string, surfaceId: string): void {
+  const pin = readPin();
+  if (pin && pin.workspaceId === workspaceId && pin.surfaceId === surfaceId) writePin(null);
+}
+
 /** Test seam: forget the module-fallback identity (single-child path only). */
 export function __resetSurfaceRoutingForTesting(): void {
   moduleOpenerKey = undefined;
@@ -326,8 +338,36 @@ export async function openSurfaceForConnection(
   // browser_navigate opened its own pane and was refused a millisecond later.
   // (The page lane does its own settling after an auto-open, so it does not
   // ask and does not pay for this twice.)
-  if (opts.awaitReady) await awaitSurfaceRegistered(workspaceId, opened);
+  if (opts.awaitReady) {
+    const readiness = await awaitSurfaceRegistered(workspaceId, opened);
+    if (readiness === 'absent') {
+      // The pin would otherwise aim every later unsaid call of this connection
+      // at a surface that does not exist, so each of them fails the same way.
+      clearPinIfSurface(workspaceId, opened);
+      throw new SurfaceNotRegisteredError(opened);
+    }
+  }
   return opened;
+}
+
+/**
+ * A surface was opened for this caller and never became addressable.
+ *
+ * Its own class so the callers that swallow "could not open" can still tell
+ * this apart: sending the call unnamed after THIS failure would hand it to
+ * main's workspace-blind default, which is the defect the routing exists to
+ * prevent (#1328).
+ */
+export class SurfaceNotRegisteredError extends Error {
+  constructor(public readonly surfaceId: string) {
+    super(
+      `BROWSER_SURFACE_NOT_REGISTERED: a browser surface was opened for you (${surfaceId}) but ` +
+        'never became addressable — main lists no CDP target for it and this workspace\'s pane ' +
+        'list does not contain it. Nothing was navigated. Retry, or open one explicitly with ' +
+        'browser_open.',
+    );
+    this.name = 'SurfaceNotRegisteredError';
+  }
 }
 
 /** How long to wait for a freshly opened surface to become addressable. */
@@ -335,14 +375,35 @@ const SURFACE_READY_TIMEOUT_MS = 6_000;
 const SURFACE_READY_POLL_MS = 150;
 
 /**
+ * What the wait below could establish about a freshly opened surface.
+ *
+ * `unconfirmed` is not a failure and must never be treated as one: it is the
+ * slow guest, and the lane that cannot be asked.
+ */
+type SurfaceReadiness = 'registered' | 'unconfirmed' | 'absent';
+
+/**
  * Wait until main lists the surface among the caller's targets.
  *
  * That listing is exactly the condition every target-addressing handler
  * checks, so it is the honest readiness signal rather than a fixed sleep. A
- * timeout is not an error: the call proceeds and main answers for itself —
- * waiting longer would turn a slow guest into a hung tool.
+ * timeout on its own is still not an error — waiting longer would turn a slow
+ * guest into a hung tool — but a timeout used to end the wait silently, and a
+ * surface that was ANSWERED and never existed then took the whole call with
+ * it: the navigate was fired into the gap and the caller was told it worked
+ * (#1328). So the timeout asks the control plane, which knows a pane before
+ * its guest registers a CDP target, and only the two answers TOGETHER convict:
+ *
+ *   cdp.info lists it ──────────────────────────────► registered
+ *   cdp.info throws ───────────────────────────────► unconfirmed  (cannot ask)
+ *   6s, no listing ──┬── tabs list unreadable ─────► unconfirmed  (cannot ask)
+ *                    ├── tabs list HAS it ─────────► unconfirmed  (slow guest)
+ *                    └── tabs list lacks it ───────► absent       (never existed)
  */
-async function awaitSurfaceRegistered(workspaceId: string, surfaceId: string): Promise<void> {
+async function awaitSurfaceRegistered(
+  workspaceId: string,
+  surfaceId: string,
+): Promise<SurfaceReadiness> {
   const deadline = Date.now() + SURFACE_READY_TIMEOUT_MS;
   for (;;) {
     try {
@@ -351,14 +412,17 @@ async function awaitSurfaceRegistered(workspaceId: string, surfaceId: string): P
         openerKey: getOpenerKey(),
       })) as RoutableCdpInfo;
       if (Array.isArray(info?.targets) && info.targets.some((t) => t.surfaceId === surfaceId)) {
-        return;
+        return 'registered';
       }
     } catch {
-      return; // cannot ask — let the call itself report whatever happens
+      return 'unconfirmed'; // cannot ask — let the call itself report whatever happens
     }
-    if (Date.now() >= deadline) return;
+    if (Date.now() >= deadline) break;
     await new Promise((resolve) => setTimeout(resolve, SURFACE_READY_POLL_MS));
   }
+  const listing = await surfaceListing(workspaceId);
+  if (listing.status === 'unknown') return 'unconfirmed';
+  return listing.surfaceIds.includes(surfaceId) ? 'unconfirmed' : 'absent';
 }
 
 async function openSurface(workspaceId: string): Promise<string | null> {

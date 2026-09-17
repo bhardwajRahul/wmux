@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /*
  * The RPC lane's own surface.
@@ -65,6 +65,10 @@ function mainWith(
   // failure — so the lane has to wait for the registration rather than fire
   // into the gap.
   registerAfter = 0,
+  // What main answers `browser.navigate` with. Default is the plain `{ok:true}`
+  // every other method gets; a `{error}` here is the shape a handler RETURNS
+  // rather than throws, which the transport delivers as a success (#1328).
+  navigateReply?: unknown,
 ) {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   const pending = new Map<string, number>();
@@ -112,12 +116,38 @@ function mainWith(
         tab: { surfaceId: newSurfaceId, paneId: 'pane-new', url: '', title: '', selected: false, opener: 'mine' },
       });
     }
+    if (method === 'browser.navigate' && navigateReply !== undefined) {
+      return Promise.resolve(navigateReply);
+    }
     if (method === 'browser.lease.acquire') return Promise.resolve({ token: null });
     if (method === 'browser.lifecycle.get') return Promise.resolve({ entries: [] });
     if (method === 'browser.evaluate') return Promise.resolve({ value: 'https://b.test/' });
     return Promise.resolve({ ok: true });
   });
   return calls;
+}
+
+/**
+ * Drive a tool call that has to outlive the 6s registration wait.
+ *
+ * Fake timers, not a real sleep: the wait is deliberately long, and a test
+ * that paid for it in wall time would be the slowest in the suite for no extra
+ * confidence. Advance in slices until the call settles.
+ */
+async function settleWithTimers<T>(call: Promise<T>): Promise<T> {
+  // Captured, not re-thrown from a derived promise: a rejection parked until
+  // the loop ends is an unhandled rejection to node, and vitest fails on it.
+  let outcome: { ok: true; value: T } | { ok: false; error: unknown } | undefined;
+  void call.then(
+    (value) => { outcome = { ok: true, value }; },
+    (error) => { outcome = { ok: false, error }; },
+  );
+  for (let i = 0; i < 300 && !outcome; i++) {
+    await vi.advanceTimersByTimeAsync(100);
+  }
+  if (!outcome) throw new Error('the call never settled');
+  if (outcome.ok) return outcome.value;
+  throw outcome.error;
 }
 
 beforeEach(() => {
@@ -274,5 +304,172 @@ describe('a surface that is not addressable yet', () => {
     expect(text).toContain('2 browser surface(s) in this workspace belong to other agents');
     expect(text).toContain('browser_tabs list');
     expect(text).not.toContain('no browser surface is open in this workspace');
+  });
+});
+
+/*
+ * #1328 — a surface that was ANSWERED and never existed.
+ *
+ * Live dogfood, once in five runs: a connection with no surface of its own
+ * called browser_navigate with no surfaceId, was told `Navigated to <url>`,
+ * and nothing had loaded — no CDP registration, no pane, and the next
+ * browser_evaluate failed. Two holes made that answer possible: the open path
+ * treated its readiness timeout as non-fatal, and a main handler that RETURNS
+ * `{error}` (rather than throwing) arrives as a perfectly successful result.
+ */
+describe('a surface that never becomes addressable', () => {
+  /** Main that answers `browser.tabs new` with a surface it then never has. */
+  function mainWithPhantomSurface(ghost = 'surf-ghost') {
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    mockSendRpc.mockImplementation((method: string, params: Record<string, unknown> = {}) => {
+      calls.push({ method, params });
+      if (method === 'browser.cdp.info') {
+        return Promise.resolve({ targetsScoped: true, workspaceBackend: 'builtin', targets: [] });
+      }
+      // The pane tree does not have it either: nothing was ever created.
+      if (method === 'browser.tabs' && params.action === 'list') {
+        return Promise.resolve({ ok: true, action: 'list', tabs: [] });
+      }
+      if (method === 'browser.tabs' && params.action === 'new') {
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: ghost } });
+      }
+      if (method === 'browser.lease.acquire') return Promise.resolve({ token: null });
+      if (method === 'browser.lifecycle.get') return Promise.resolve({ entries: [] });
+      return Promise.resolve({ ok: true });
+    });
+    return calls;
+  }
+
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('refuses instead of reporting a navigation that never happened', async () => {
+    const calls = mainWithPhantomSurface();
+
+    const result = await settleWithTimers(
+      tools().get('browser_navigate')!({ url: 'https://a.test/' }),
+    );
+
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain('BROWSER_SURFACE_NOT_REGISTERED');
+    expect(text).toContain('surf-ghost');
+    expect(text).not.toContain('Navigated to');
+    // Not merely relabelled: the navigate was never fired into the gap.
+    expect(calls.filter((c) => c.method === 'browser.navigate')).toHaveLength(0);
+    // It did wait, and it did ask the control plane before convicting.
+    expect(calls.filter((c) => c.method === 'browser.cdp.info').length).toBeGreaterThan(1);
+    expect(
+      calls.some((c) => c.method === 'browser.tabs' && c.params.action === 'list'),
+    ).toBe(true);
+  });
+
+  it('gives the retry the same honest refusal, and a fresh open to fail on', async () => {
+    const calls = mainWithPhantomSurface();
+    const navigate = tools().get('browser_navigate')!;
+    const scope = createConnectionScope();
+
+    const first = await settleWithTimers(
+      runInConnectionScope(scope, () => navigate({ url: 'https://a.test/' })),
+    );
+    const second = await settleWithTimers(
+      runInConnectionScope(scope, () => navigate({ url: 'https://a.test/' })),
+    );
+
+    for (const result of [first, second]) {
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('BROWSER_SURFACE_NOT_REGISTERED');
+    }
+    // The dropped pin is what makes the retry a real attempt rather than a
+    // replay against a surface this connection is permanently aimed at.
+    expect(
+      calls.filter((c) => c.method === 'browser.tabs' && c.params.action === 'new'),
+    ).toHaveLength(2);
+  });
+
+  it('proceeds when the pane list HAS the surface — a slow guest is not a failure', async () => {
+    // The pane exists, its guest is simply late to register. This is the case
+    // the timeout was made non-fatal for, and it must stay that way: the
+    // absent verdict needs BOTH sources to agree.
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    mockSendRpc.mockImplementation((method: string, params: Record<string, unknown> = {}) => {
+      calls.push({ method, params });
+      if (method === 'browser.cdp.info') {
+        return Promise.resolve({ targetsScoped: true, workspaceBackend: 'builtin', targets: [] });
+      }
+      if (method === 'browser.tabs' && params.action === 'list') {
+        return Promise.resolve({ ok: true, action: 'list', tabs: [{ surfaceId: 'surf-slow' }] });
+      }
+      if (method === 'browser.tabs' && params.action === 'new') {
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-slow' } });
+      }
+      if (method === 'browser.lease.acquire') return Promise.resolve({ token: null });
+      if (method === 'browser.lifecycle.get') return Promise.resolve({ entries: [] });
+      if (method === 'browser.evaluate') return Promise.resolve({ value: 'https://a.test/' });
+      return Promise.resolve({ ok: true });
+    });
+
+    const result = await settleWithTimers(
+      tools().get('browser_navigate')!({ url: 'https://a.test/' }),
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(calls.find((c) => c.method === 'browser.navigate')?.params.surfaceId).toBe('surf-slow');
+  });
+
+  it('proceeds when the control plane cannot be asked at all', async () => {
+    // A lane that refuses `browser.tabs` (the commander lane does) must not
+    // make every freshly opened surface look like it never existed.
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    mockSendRpc.mockImplementation((method: string, params: Record<string, unknown> = {}) => {
+      calls.push({ method, params });
+      if (method === 'browser.cdp.info') {
+        return Promise.resolve({ targetsScoped: true, workspaceBackend: 'builtin', targets: [] });
+      }
+      if (method === 'browser.tabs' && params.action === 'new') {
+        return Promise.resolve({ ok: true, action: 'new', tab: { surfaceId: 'surf-opaque' } });
+      }
+      if (method === 'browser.tabs') return Promise.reject(new Error('method denied'));
+      if (method === 'browser.lease.acquire') return Promise.resolve({ token: null });
+      if (method === 'browser.lifecycle.get') return Promise.resolve({ entries: [] });
+      if (method === 'browser.evaluate') return Promise.resolve({ value: 'https://a.test/' });
+      return Promise.resolve({ ok: true });
+    });
+
+    const result = await settleWithTimers(
+      tools().get('browser_navigate')!({ url: 'https://a.test/' }),
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(calls.find((c) => c.method === 'browser.navigate')?.params.surfaceId).toBe('surf-opaque');
+  });
+});
+
+describe('a main answer that carries a failure instead of throwing one', () => {
+  it('reports the error rather than claiming the page loaded', async () => {
+    // The renderer bridge answers this for a surface whose webview is not
+    // mounted, and it comes back as a SUCCESSFUL rpc result. The reuse path in
+    // main already post-checks the same shape; the open path never did, so the
+    // agent was told it had navigated (#1328).
+    const calls = mainWith({}, 'surf-new', 0, {
+      error: 'browser: surface surf-new not found or not a browser',
+    });
+
+    const result = await tools().get('browser_navigate')!({ url: 'https://a.test/' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('surface surf-new not found');
+    expect(result.content[0].text).not.toContain('Navigated to');
+    expect(calls.some((c) => c.method === 'browser.navigate')).toBe(true);
+  });
+
+  it('leaves an ordinary success untouched', async () => {
+    const calls = mainWith({}, 'surf-new', 0, { ok: true, url: 'https://a.test/' });
+
+    const result = await tools().get('browser_navigate')!({ url: 'https://a.test/' });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('Navigated to');
+    expect(calls.some((c) => c.method === 'browser.navigate')).toBe(true);
   });
 });
