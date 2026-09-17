@@ -50,7 +50,8 @@ function collectTools(): Map<string, ToolHandler> {
 const tools = collectTools();
 const consoleTool = tools.get('browser_console');
 const network = tools.get('browser_network');
-if (!consoleTool || !network) throw new Error('inspection tools failed to register');
+const responseBody = tools.get('browser_response_body');
+if (!consoleTool || !network || !responseBody) throw new Error('inspection tools failed to register');
 
 // A Page stand-in the capture module can listen on.
 interface FakePage extends EventEmitter {
@@ -310,5 +311,169 @@ describe('browser_network — collection starts at page resolve (#1081)', () => 
 
     expect((await network({})).content[0].text).toContain('No network requests.');
     expect((await consoleTool({})).content[0].text).toContain('console survives');
+  });
+});
+
+// ── #1360 papercuts ─────────────────────────────────────────────────────────
+
+/** Emit the request/response pair the capture module listens for. */
+function exchange(
+  page: FakePage,
+  url: string,
+  method = 'GET',
+  status?: number,
+  body?: string,
+): void {
+  page.emit('request', { url: () => url, method: () => method });
+  if (status === undefined) return;
+  page.emit('response', {
+    url: () => url,
+    status: () => status,
+    headers: () => (body === undefined ? {} : { 'content-type': 'application/json' }),
+    text: () => Promise.resolve(body ?? ''),
+  });
+}
+
+describe('browser_console — the URL Chrome leaves off a 404 line (#1360)', () => {
+  it('appends the failing resource URL from the network buffer', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/missing', 'GET', 404);
+    page.emit(
+      'console',
+      consoleMessage('error', 'Failed to load resource: the server responded with a status of 404 ()'),
+    );
+
+    const text = (await consoleTool({ level: 'error' })).content[0].text;
+
+    expect(text).toContain('https://x.test/api/missing');
+  });
+
+  it('pairs two failures with their own URLs, matching on the stated status', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/a.js', 'GET', 500);
+    exchange(page, 'https://x.test/b.js', 'GET', 404);
+    page.emit('console', consoleMessage('error', 'Failed to load resource: the server responded with a status of 404 ()'));
+    page.emit('console', consoleMessage('error', 'Failed to load resource: the server responded with a status of 500 ()'));
+
+    const lines = (await consoleTool({ level: 'error' })).content[0].text.split('\n');
+
+    expect(lines[0]).toContain('https://x.test/b.js');
+    expect(lines[1]).toContain('https://x.test/a.js');
+  });
+
+  it('leaves an ordinary line alone and reads the network buffer only when needed', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/missing', 'GET', 404);
+    page.emit('console', consoleMessage('log', 'just chatter'));
+
+    const text = (await consoleTool({})).content[0].text;
+
+    expect(text).toBe('[log] just chatter');
+  });
+});
+
+describe('browser_network — filters and repeat collapsing (#1360)', () => {
+  it('filters by status class, method and an exclude glob', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/ok', 'GET', 200);
+    exchange(page, 'https://x.test/api/missing', 'GET', 404);
+    exchange(page, 'https://x.test/api/submit', 'POST', 404);
+    exchange(page, 'https://x.test/api/poll', 'GET', 404);
+
+    const byClass = (await network({ status: '4xx' })).content[0].text;
+    expect(byClass).not.toContain('api/ok');
+    expect(byClass).toContain('api/missing');
+
+    const byMethod = (await network({ method: 'post' })).content[0].text;
+    expect(byMethod).toContain('api/submit');
+    expect(byMethod).not.toContain('api/missing');
+
+    const excluded = (await network({ status: '404', exclude: '*poll*' })).content[0].text;
+    expect(excluded).toContain('api/missing');
+    expect(excluded).not.toContain('api/poll');
+  });
+
+  it('folds identical polling rows into one "xN" row keeping the newest id', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/poll', 'GET', 200);
+    exchange(page, 'https://x.test/api/poll', 'GET', 200);
+    exchange(page, 'https://x.test/api/poll', 'GET', 200);
+    exchange(page, 'https://x.test/api/other', 'GET', 200);
+
+    const rows = JSON.parse((await network({})).content[0].text) as Array<Record<string, unknown>>;
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0].repeated).toBe('x3');
+    // The id is the most recent occurrence — the one a follow-up
+    // browser_response_body wants.
+    expect(rows[0].id).toBe(3);
+    expect(rows[1].repeated).toBeUndefined();
+    expect(rows[1].id).toBe(4);
+  });
+
+  it('collapse:false keeps every row', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/poll', 'GET', 200);
+    exchange(page, 'https://x.test/api/poll', 'GET', 200);
+
+    const rows = JSON.parse((await network({ collapse: false })).content[0].text) as unknown[];
+
+    expect(rows).toHaveLength(2);
+  });
+});
+
+describe('browser_response_body — nth and request id (#1360)', () => {
+  /** Bodies are stored from an awaited promise; let the microtasks run. */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('returns the LAST match by default, not the first', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/rows', 'GET', 200, '{"filter":"before"}');
+    exchange(page, 'https://x.test/api/rows', 'GET', 200, '{"filter":"after"}');
+    await settle();
+
+    const text = (await responseBody({ urlPattern: '*api/rows*' })).content[0].text;
+
+    expect(text).toContain('after');
+  });
+
+  it('nth picks an earlier match, and 1 is the first', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/rows', 'GET', 200, '{"filter":"before"}');
+    exchange(page, 'https://x.test/api/rows', 'GET', 200, '{"filter":"after"}');
+    await settle();
+
+    expect((await responseBody({ urlPattern: '*api/rows*', nth: 1 })).content[0].text).toContain('before');
+    expect((await responseBody({ urlPattern: '*api/rows*', nth: -2 })).content[0].text).toContain('before');
+  });
+
+  it('accepts the id the network listing printed', async () => {
+    const page = makePage();
+    resolveChromePage(page);
+    exchange(page, 'https://x.test/api/rows', 'GET', 200, '{"n":1}');
+    exchange(page, 'https://x.test/api/rows', 'GET', 200, '{"n":2}');
+    await settle();
+
+    const rows = JSON.parse((await network({ collapse: false })).content[0].text) as Array<{ id: number }>;
+    const text = (await responseBody({ requestId: rows[0].id })).content[0].text;
+
+    expect(text).toContain('"n":1');
+  });
+
+  it('refuses a call that names neither a pattern nor an id', async () => {
+    resolveChromePage(makePage());
+
+    const result = await responseBody({});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('urlPattern');
   });
 });

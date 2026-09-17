@@ -21,6 +21,13 @@ import { evaluateWithGesture } from '../user-gesture';
 import { evaluateIsolated } from '../isolated-eval';
 import { detectDangerousPatterns } from '../security';
 import { redactPasswordParams } from '../redact';
+import {
+  attachFailedResourceUrls,
+  collapseRepeats,
+  filterNetwork,
+  resolveNthIndex,
+  type NetworkRow,
+} from '../inspectionFilters';
 import { sanitizeRef } from './interaction';
 import {
   allowScopedRpcFallback,
@@ -130,7 +137,23 @@ const BROWSER_NETWORK_SHAPE = {
   filter: z
     .string()
     .optional()
-    .describe('URL glob, e.g. "*api*".'),
+    .describe('URL glob to keep, e.g. "*api*".'),
+  exclude: z
+    .string()
+    .optional()
+    .describe('URL glob to drop, applied after filter — e.g. "*/poll*".'),
+  status: z
+    .string()
+    .optional()
+    .describe('Status filter: "404", or a class such as "4xx"/"5xx".'),
+  method: z
+    .string()
+    .optional()
+    .describe('HTTP method, case-insensitive.'),
+  collapse: z
+    .boolean()
+    .optional()
+    .describe('Fold identical url+method+status rows into one "xN" row (default true).'),
   clear: z
     .boolean()
     .optional()
@@ -142,7 +165,16 @@ const BROWSER_NETWORK_SHAPE = {
 const BROWSER_RESPONSE_BODY_SHAPE = {
   urlPattern: z
     .string()
-    .describe('URL glob, e.g. "*api/users*".'),
+    .optional()
+    .describe('URL glob, e.g. "*api/users*". Omit when passing requestId.'),
+  requestId: z
+    .number()
+    .optional()
+    .describe('The "id" browser_network printed for the request; takes priority over urlPattern.'),
+  nth: z
+    .number()
+    .optional()
+    .describe('Which match: 1 is the first, -1 the last (default).'),
   surfaceId: optionalSurfaceId,
   maxBytes: maxBytesParam,
 };
@@ -217,6 +249,64 @@ async function readCapture<T>(
   }
 }
 
+type NetworkSummary = { url: string; method: string; status?: number };
+
+/**
+ * The network buffer for a scope, from whichever lane serves it.
+ *
+ * Shared by browser_network and by browser_console (which needs it to put the
+ * URL back on a "Failed to load resource" line) and by browser_response_body
+ * (which resolves an `id`/`nth` against the same ordering the listing printed).
+ */
+async function readNetworkEntries(
+  scope: BrowserTargetScope,
+  clear?: boolean,
+): Promise<{ entries: NetworkSummary[]; window?: CaptureWindow }> {
+  return readCapture<{ entries: NetworkSummary[]; window?: CaptureWindow }>(
+    scope,
+    async () => {
+      // Main-process CDP capture, enabled when the guest attached.
+      const result = await sendScopedBrowserRpc<{
+        entries: NetworkSummary[];
+        since?: number;
+        missedBefore?: boolean;
+      }>('browser.network.get', scope, { ...(clear && { clear: true }) });
+      return {
+        entries: result.entries ?? [],
+        ...(typeof result.since === 'number' && {
+          window: { since: result.since, missedBefore: result.missedBefore === true },
+        }),
+      };
+    },
+    (page) => {
+      const state = ensurePageCapture(page);
+      const entries: NetworkSummary[] = state.network;
+      const window = state.networkWindow;
+      if (clear) clearNetworkCapture(state);
+      return { entries, window };
+    },
+  );
+}
+
+/**
+ * The one captured request a browser_response_body call names.
+ *
+ * `requestId` is the 1-based position the listing printed, so it addresses one
+ * exact request; otherwise `nth` counts over the glob's matches (-1, the
+ * default, being the most recent).
+ */
+function pickNetworkEntry(
+  entries: readonly NetworkSummary[],
+  args: { urlPattern?: string; requestId?: number; nth?: number },
+): NetworkSummary | null {
+  if (args.requestId !== undefined) return entries[args.requestId - 1] ?? null;
+  if (args.urlPattern === undefined) return null;
+  const pattern = args.urlPattern;
+  const matches = entries.filter((e) => matchesGlob(e.url, pattern));
+  const index = resolveNthIndex(matches.length, args.nth);
+  return index < 0 ? null : matches[index];
+}
+
 /**
  * State the collection window whenever it is known, so an empty buffer stops
  * reading like a clean page (#1081). Two different facts hide behind "nothing
@@ -272,7 +362,12 @@ function formatConsole(entries: ConsoleEntry[], window?: CaptureWindow): string 
 }
 
 /**
- * Filter by URL glob and render the {url, method, status} summary JSON.
+ * Filter and render the {id, url, method, status} summary JSON.
+ *
+ * `id` lets browser_response_body name one exact request instead of a glob that
+ * matched twelve. Identical rows are folded into one carrying `repeated: "xN"`
+ * unless `collapse:false` — a page polling one endpoint used to bury every
+ * other request in the listing (#1360).
  *
  * Request bodies are never captured, so the only credential that can reach this
  * listing is one a page put in the query string of a GET — which redaction
@@ -281,19 +376,36 @@ function formatConsole(entries: ConsoleEntry[], window?: CaptureWindow): string 
  */
 function formatNetwork(
   entries: Array<{ url: string; method: string; status?: number }>,
-  filter?: string,
+  options: {
+    filter?: string;
+    exclude?: string;
+    status?: string;
+    method?: string;
+    collapse?: boolean;
+  },
   window?: CaptureWindow,
 ): string {
-  const filtered = filter ? entries.filter((e) => matchesGlob(e.url, filter)) : entries;
-  const summary = filtered.map((e) => ({
+  // `id` is the 1-based position in the CAPTURE buffer, not in the filtered
+  // listing: browser_response_body resolves it against the same buffer, so a
+  // filter must not renumber the rows out from under a follow-up call.
+  const numbered = entries.map((e, i) => ({ ...e, id: i + 1 }));
+  const filtered = filterNetwork(numbered, options) as Array<
+    { url: string; method: string; status?: number; id: number }
+  >;
+  const rows: NetworkRow[] = filtered.map((e) => ({
+    id: e.id,
     url: redactPasswordParams(e.url),
     method: e.method,
     status: e.status ?? '(pending)',
   }));
-  if (summary.length === 0) {
+  const collapsed = options.collapse === false ? rows : collapseRepeats(rows);
+  if (collapsed.length === 0) {
     const detail = describeWindow(window, 'requests');
     return detail ? `No network requests. ${detail}` : 'No network requests collected.';
   }
+  const summary = collapsed.map(({ count, ...row }) =>
+    count === undefined ? row : { ...row, repeated: `x${count}` },
+  );
   return JSON.stringify(summary, null, 2) + windowFootnote(window, 'requests');
 }
 
@@ -802,7 +914,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_console',
-    'Read console messages. Collection starts when the page is opened/attached, not at this call; clear:true resets.',
+    'Read console messages. Collection starts when the page is opened/attached, not at this call; clear:true resets. A "Failed to load resource" line gets the failing URL appended from the network buffer, which Chrome leaves off the message itself.',
     BROWSER_CONSOLE_SHAPE,
     async ({ level, clear, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
@@ -835,7 +947,16 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
           },
         );
 
-        const text = formatConsole(filterConsole(entries, level), window);
+        const selected = filterConsole(entries, level);
+        // Only when a line actually needs a URL: the extra buffer read is free
+        // on the (overwhelmingly common) page that logged no failed resource.
+        const network = selected.some((e) => /failed to load resource/i.test(e.text))
+          ? await readNetworkEntries(scope).then((r) => r.entries).catch(() => [])
+          : [];
+        const text = formatConsole(
+          attachFailedResourceUrls(selected, network) as ConsoleEntry[],
+          window,
+        );
 
         return {
           content: [{ type: 'text' as const, text }],
@@ -855,40 +976,17 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_network',
-    'Read network requests. Collection starts when the page is opened/attached, not at this call; clear:true resets.',
+    'Read network requests. Collection starts when the page is opened/attached, not at this call; clear:true resets. Each row carries an "id" browser_response_body accepts; identical rows fold into one with "repeated":"xN".',
     BROWSER_NETWORK_SHAPE,
-    async ({ filter, clear, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ filter, exclude, status, method, collapse, clear, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
-        type NetworkSummary = { url: string; method: string; status?: number };
-        const { entries, window } = await readCapture<{
-          entries: NetworkSummary[];
-          window?: CaptureWindow;
-        }>(
-          scope,
-          async () => {
-            // Main-process CDP capture, enabled when the guest attached.
-            const result = await sendScopedBrowserRpc<{
-              entries: NetworkSummary[];
-              since?: number;
-              missedBefore?: boolean;
-            }>('browser.network.get', scope, { ...(clear && { clear: true }) });
-            return {
-              entries: result.entries ?? [],
-              ...(typeof result.since === 'number' && {
-                window: { since: result.since, missedBefore: result.missedBefore === true },
-              }),
-            };
-          },
-          (page) => {
-            const state = ensurePageCapture(page);
-            const entries: NetworkSummary[] = state.network;
-            const window = state.networkWindow;
-            if (clear) clearNetworkCapture(state);
-            return { entries, window };
-          },
-        );
+        const { entries, window } = await readNetworkEntries(scope, clear);
 
-        const text = formatNetwork(entries, filter, window);
+        const text = formatNetwork(
+          entries,
+          { filter, exclude, status, method, collapse },
+          window,
+        );
 
         return {
           content: [{ type: 'text' as const, text }],
@@ -908,29 +1006,55 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_response_body',
-    'Response body of a captured network request matching a URL glob.',
+    'Response body of a captured network request, by URL glob or by the "id" browser_network printed. With several matches, nth picks one — the last by default, which is the response after the filter change you just made.',
     BROWSER_RESPONSE_BODY_SHAPE,
-    async ({ urlPattern, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ urlPattern, requestId, nth, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
+        if (urlPattern === undefined && requestId === undefined) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Pass urlPattern (a URL glob) or requestId (the "id" a browser_network row printed).',
+              },
+            ],
+            isError: true,
+          };
+        }
+        const what =
+          requestId !== undefined ? `id ${requestId}` : `pattern "${urlPattern}"`;
         const body = await readCapture<string | null>(
           scope,
           async () => {
-            // Main matches and returns the body from its CDP capture buffer.
+            // Main's buffer cannot be indexed over RPC, so the id / nth is
+            // resolved against the listing first and asked for by exact URL.
+            // Same ordering the listing printed, because it is the same read.
+            let pattern = urlPattern;
+            if (requestId !== undefined || (nth !== undefined && nth !== -1)) {
+              const { entries } = await readNetworkEntries(scope);
+              const target = pickNetworkEntry(entries, { urlPattern, requestId, nth });
+              if (!target) return null;
+              pattern = target.url;
+            }
+            if (pattern === undefined) return null;
             const result = await sendScopedBrowserRpc<{ body: string | null }>('browser.responseBody.get', scope, {
-              urlPattern,
+              urlPattern: pattern,
             });
             return result.body ?? null;
           },
           (page) => {
             const state = ensurePageCapture(page);
-            // Find the last matching entry with a captured body
-            for (let i = state.network.length - 1; i >= 0; i--) {
-              const candidate = state.network[i].response?.body;
-              if (candidate !== undefined && matchesGlob(state.network[i].url, urlPattern)) {
-                return candidate;
-              }
+            if (requestId !== undefined) {
+              const entry = state.network[requestId - 1];
+              return entry?.response?.body ?? null;
             }
-            return null;
+            // Only entries whose body was actually retained can be answered
+            // with, so `nth` counts over those and not over every request.
+            const withBody = state.network.filter(
+              (e) => e.response?.body !== undefined && matchesGlob(e.url, urlPattern!),
+            );
+            const index = resolveNthIndex(withBody.length, nth);
+            return index < 0 ? null : withBody[index].response!.body!;
           },
         );
 
@@ -939,7 +1063,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             content: [
               {
                 type: 'text' as const,
-                text: `No response body found for pattern "${urlPattern}". Ensure the request has been made and the response was captured.`,
+                text: `No response body found for ${what}. Ensure the request has been made and the response was captured.`,
               },
             ],
           };

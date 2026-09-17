@@ -30,11 +30,11 @@ const BROWSER_WAIT_SHAPE = {
   selector: z
     .string()
     .optional()
-    .describe('CSS selector to appear.'),
+    .describe('CSS selector to appear. With text, it scopes the text search instead.'),
   text: z
     .string()
     .optional()
-    .describe('Text to appear in document.body.innerText.'),
+    .describe('Substring to appear in document.body.innerText, or in the innerText of selector when one is given.'),
   fn: z
     .string()
     .optional()
@@ -140,7 +140,7 @@ export function createWaitToolCatalog(deps: BrowserToolDeps) {
   const tool = defineWmuxTool({
     name: 'browser_wait',
     description:
-      'Wait for a condition. When several are given the priority is url > selector > text > fn > networkidle.',
+      'Wait for a condition. When several are given the priority is url > selector > text > fn > networkidle, EXCEPT that selector+text together wait for the text inside that element — the scope to use when the word you are waiting for also appears in a sidebar or nav. text alone is matched in document.body.innerText.',
     inputSchema: BROWSER_WAIT_SHAPE,
     profiles: ['full'],
     invoke: async ({ url, selector, text, fn, timeout, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
@@ -158,7 +158,10 @@ export function createWaitToolCatalog(deps: BrowserToolDeps) {
         if (fn && !url && !selector && !text) return;
         const args: Record<string, string | number> = { timeout: resolvedTimeout };
         if (url) args.urlGlob = url;
-        else if (selector) args.selector = selector;
+        else if (selector && text) {
+          args.selector = selector;
+          args.text = text;
+        } else if (selector) args.selector = selector;
         else if (text) args.text = text;
         // Never lets a recording problem fail the wait that just succeeded.
         try {
@@ -192,6 +195,17 @@ export function createWaitToolCatalog(deps: BrowserToolDeps) {
               return (await evaluate('document.readyState')) === 'complete';
             };
             label = `URL matched "${url}"`;
+          } else if (selector && text) {
+            // Scoped text (#1360): body.innerText matches the sidebar, the nav
+            // and every other region that happens to spell the same word, so a
+            // wait for "Done" returned before the panel under test said it.
+            // The element must exist AND contain the text — a missing element
+            // keeps polling rather than passing vacuously.
+            const expr =
+              `(() => { const el = document.querySelector(${JSON.stringify(selector)});` +
+              ` return !!el && (el.innerText || el.textContent || '').includes(${JSON.stringify(text)}); })()`;
+            predicate = async () => Boolean(await evaluate(expr));
+            label = `text "${text}" found in "${selector}"`;
           } else if (selector) {
             // waitForSelector defaults to state 'visible', so match attachment AND
             // visibility (non-empty box, not display:none/visibility:hidden) rather
@@ -269,6 +283,30 @@ export function createWaitToolCatalog(deps: BrowserToolDeps) {
           };
         }
 
+        if (selector && text) {
+          // Scoped text (#1360). waitForIsolated for the same reason the
+          // unscoped branch below uses it: the page must not be able to watch
+          // or answer the poll.
+          await waitForIsolated(
+            page,
+            ([s, t]: [string, string]) => {
+              const el = document.querySelector(s);
+              return !!el && ((el as HTMLElement).innerText || el.textContent || '').includes(t);
+            },
+            [selector, text] as [string, string],
+            resolvedTimeout,
+          );
+          record(page);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Wait completed: text "${text}" found in "${selector}"`,
+              },
+            ],
+          };
+        }
+
         if (selector) {
           await page.waitForSelector(selector, { timeout: resolvedTimeout });
           record(page);
@@ -326,13 +364,15 @@ export function createWaitToolCatalog(deps: BrowserToolDeps) {
         if (message.includes('Timeout') || message.includes('timeout')) {
           const condition = url
             ? `URL "${url}"`
-            : selector
-              ? `selector "${selector}"`
-              : text
-                ? `text "${text}"`
-                : fn
-                  ? 'custom predicate'
-                  : 'network idle';
+            : selector && text
+              ? `text "${text}" in "${selector}"`
+              : selector
+                ? `selector "${selector}"`
+                  : text
+                    ? `text "${text}"`
+                    : fn
+                      ? 'custom predicate'
+                      : 'network idle';
           return {
             content: [
               {
