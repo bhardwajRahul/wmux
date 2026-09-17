@@ -28,7 +28,27 @@ vi.mock('../PlaywrightEngine', () => ({
   },
 }));
 
-vi.mock('../snapshot', () => ({ resolveRef: resolveRefMock, listRefEntries: listRefEntriesMock, generateSnapshot: vi.fn(), generateScopedSnapshot: vi.fn(), markDomRefsActive: vi.fn() }));
+vi.mock('../snapshot', () => ({
+  resolveRef: resolveRefMock,
+  listRefEntries: listRefEntriesMock,
+  generateSnapshot: vi.fn(),
+  generateScopedSnapshot: vi.fn(),
+  markDomRefsActive: vi.fn(),
+  noteFrameRefsForScope: vi.fn(),
+  browserScopeKey: (scope: { workspaceId?: string; surfaceId?: string }) =>
+    `${scope.workspaceId ?? ''}:${scope.surfaceId ?? 'last'}`,
+}));
+
+/** A PNG header of the given size — browser_screenshot reads the real bytes. */
+function pngBytes(width: number, height: number): Buffer {
+  const bytes = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes, 0);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write('IHDR', 12, 'latin1');
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  return bytes;
+}
 
 import { registerInteractionTools } from '../tools/interaction';
 import { registerInspectionTools } from '../tools/inspection';
@@ -123,7 +143,8 @@ function makePage(
       }),
       screenshot: vi.fn(async () => {
         order.push('screenshot');
-        return Buffer.from('png');
+        // 1024 CSS px wide at ratio 2: the note must state one scale of 2.
+        return pngBytes(2048, 1536);
       }),
     },
   };
@@ -261,7 +282,7 @@ describe('browser_click coordinates', () => {
 });
 
 describe('browser_screenshot coordinate basis', () => {
-  it('states the devicePixelRatio divisor for a viewport capture', async () => {
+  it('states one scale, measured on the returned image, for a viewport capture (#1358)', async () => {
     const { page } = makePage();
     getPage.mockResolvedValue(page);
 
@@ -269,11 +290,13 @@ describe('browser_screenshot coordinate basis', () => {
     const note = result.content.find((c) => c.type === 'text')?.text ?? '';
 
     expect(result.content[0].type).toBe('image');
-    expect(note).toContain('devicePixelRatio 2');
-    expect(note).toContain('image pixels / 2');
+    expect(note).toContain('browser_click x = image_x / 2, y = image_y / 2');
+    expect(note).toContain('"imageWidth":2048');
+    expect(note).toContain('"viewportWidth":1024');
+    expect(note).not.toContain('devicePixelRatio');
   });
 
-  it('[fix] reads the devicePixelRatio before taking the shot', async () => {
+  it('[fix] reads the viewport before taking the shot', async () => {
     const watched = makePage();
     getPage.mockResolvedValue(watched.page);
 
@@ -621,7 +644,7 @@ describe('browser_screenshot refs', () => {
     const result = await screenshot({ refs: true });
     const note = result.content.find((c) => c.type === 'text')?.text ?? '';
 
-    expect(note).toContain('devicePixelRatio 2');
+    expect(note).toContain('image_x / 2');
     expect(note).toContain('Refs in this capture (viewport CSS px: x,y,w,h):\nref=12 button "Log in" 40,20,80,30');
     expect(note).not.toContain('ref=13');
     expect(note).toContain('1 outside the capture');

@@ -35,8 +35,22 @@ import {
   type CaptureWindow,
   type ConsoleEntry,
 } from '../pageCapture';
-import { clampScreenshotCeilingBytes, MAX_SCREENSHOT_MAXBYTES } from '../../resultCap';
-import { formatRefBoxTable, refBoxCandidates } from '../screenshotRefs';
+import { clampScreenshotCeilingBytes } from '../../resultCap';
+import {
+  formatRefBoxTable,
+  recallShrinkRung,
+  refBoxCandidates,
+  rememberScreenshotScale,
+  rememberShrinkRung,
+} from '../screenshotRefs';
+import {
+  coordinateBasis,
+  fitScreenshot,
+  screenshotGeometry,
+  type FittedImage,
+  type ShrinkRung,
+  type Viewport,
+} from '../screenshotScale';
 
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
@@ -463,124 +477,24 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // browser_screenshot
   // -----------------------------------------------------------------------
 
-  /**
-   * The coordinate basis of a screenshot, stated in the result.
-   *
-   * browser_click x/y are VIEWPORT CSS pixels, while a PNG is in device pixels
-   * — off by the devicePixelRatio on every retina display — and a fullPage or
-   * element shot is not in viewport space at all. Without this line an agent
-   * reading pixels off the image clicks the wrong place and cannot tell why.
-   * Adding a text part changes the result shape (image-only before), which is
-   * called out in the changelog.
-   */
-  const coordinateBasis = (
-    kind: 'viewport' | 'fullPage' | 'element' | 'unsupported',
-    dpr: number | null,
-  ): string => {
-    if (kind === 'fullPage') {
-      return 'Coordinates in this image are DOCUMENT coordinates — NOT usable for browser_click x/y (which are viewport CSS px). Take a viewport screenshot (omit fullPage) if you need to click by coordinate.';
-    }
-    if (kind === 'element') {
-      return 'Coordinates in this image are ELEMENT-relative — NOT usable for browser_click x/y (which are viewport CSS px).';
-    }
-    if (kind === 'unsupported') {
-      return 'This backend does not support coordinate clicks (browser_click resolves elements by ref here), so no coordinate can be read off this image.';
-    }
-    return dpr === null
-      ? 'This is a viewport capture. browser_click x/y are viewport CSS px; this image may be scaled by the display\'s devicePixelRatio, which could not be read here — divide image pixels by it before clicking.'
-      : `This is a viewport capture at devicePixelRatio ${dpr}. browser_click x/y are viewport CSS px = image pixels / ${dpr}.`;
-  };
-
-  /** Read the ratio at capture time, so the note describes THIS image. */
-  const readDpr = async (page: Page | null): Promise<number | null> => {
+  /** Read the live viewport in CSS px, so the factor describes THIS image. */
+  const readViewport = async (page: Page | null): Promise<Viewport | null> => {
     if (!page) return null;
-    // devicePixelRatio is a property of the frame, not of the main world's
-    // globals, so the isolated world reads the same number.
-    const value = await evaluateIsolated(page, 'window.devicePixelRatio').catch(() => null);
-    return typeof value === 'number' && value > 0 ? value : null;
+    // innerWidth/innerHeight are frame properties, not main-world globals, so
+    // the isolated world reads the same numbers. viewportSize() is null on
+    // every connectOverCDP page, hence the page read rather than the API.
+    const size = await evaluateIsolated(page, '[window.innerWidth, window.innerHeight]').catch(
+      () => null,
+    );
+    if (!Array.isArray(size) || typeof size[0] !== 'number' || typeof size[1] !== 'number') {
+      return null;
+    }
+    return size[0] > 0 && size[1] > 0 ? { width: size[0], height: size[1] } : null;
   };
 
-  /**
-   * One rung of the downscale ladder: a re-encode the lane can actually
-   * perform. `scale` is relative to the ORIGINAL capture, so the note the
-   * caller reads ("scaled to 0.5") is the number they divide image pixels by
-   * on top of the coordinate basis already stated.
-   */
-  interface ShrinkRung {
-    readonly scale: number;
-    readonly quality: number;
-  }
-
-  /**
-   * Owner decision: browser_screenshot NEVER refuses. Over the base64 ceiling
-   * the image is re-encoded smaller — JPEG first, then progressively scaled —
-   * and the result SAYS what was applied, so a caller reading coordinates off
-   * the pixels can compensate exactly. A refusal used to protect the
-   * coordinate contract by removing the capability; stating the factor
-   * protects it while keeping the capability.
-   */
-  const SHRINK_LADDER: readonly ShrinkRung[] = Object.freeze([
-    { scale: 1, quality: 80 },
-    { scale: 0.75, quality: 80 },
-    { scale: 0.5, quality: 75 },
-    { scale: 0.35, quality: 70 },
-    { scale: 0.25, quality: 60 },
-  ]);
-
-  /** What a shrink produced, plus the sentence describing it. */
-  interface FittedImage {
-    readonly data: string;
-    readonly mimeType: string;
-    /** Empty when the original PNG was already within the ceiling. */
-    readonly note: string;
-  }
-
-  /**
-   * Walk the ladder until a rung fits under `ceiling`. A rung that a lane
-   * cannot perform returns null and ends the walk; the smallest payload seen
-   * is returned either way, because handing back a too-large image with an
-   * honest note still beats refusing (and the text cap never touches image
-   * content, so the caller's own ceiling is the only bound that applies).
-   */
-  const fitScreenshot = async (
-    original: string,
-    ceiling: number,
-    shrink: (rung: ShrinkRung) => Promise<string | null>,
-  ): Promise<FittedImage> => {
-    if (original.length <= ceiling) {
-      return { data: original, mimeType: 'image/png', note: '' };
-    }
-    let best = { data: original, mimeType: 'image/png', scale: 1, quality: 0 };
-    for (const rung of SHRINK_LADDER) {
-      const data = await shrink(rung).catch(() => null);
-      if (data === null) break;
-      if (data.length < best.data.length) {
-        best = { data, mimeType: 'image/jpeg', scale: rung.scale, quality: rung.quality };
-      }
-      if (data.length <= ceiling) break;
-    }
-    if (best.mimeType === 'image/png') {
-      // No lane knob produced anything smaller. Say so rather than pretending.
-      return {
-        data: best.data,
-        mimeType: 'image/png',
-        note:
-          `This image is ${(best.data.length / (1024 * 1024)).toFixed(1)} MiB of base64, over the ` +
-          `${(ceiling / (1024 * 1024)).toFixed(1)} MiB ceiling, and this capture path offers no ` +
-          'downscale. Narrow the capture (omit fullPage, or scope to an element with ref).',
-      };
-    }
-    const fits = best.data.length <= ceiling ? '' : ' It is still over the ceiling — narrow the capture.';
-    return {
-      data: best.data,
-      mimeType: best.mimeType,
-      note:
-        `Downscaled to fit the ${(ceiling / (1024 * 1024)).toFixed(1)} MiB ceiling: JPEG q${best.quality}` +
-        `${best.scale === 1 ? ' at full size' : `, scaled to ${best.scale}`}. Divide image pixels by ` +
-        `${best.scale} before applying the coordinate basis above.${fits}` +
-        ` Pass maxBytes (up to ${MAX_SCREENSHOT_MAXBYTES / (1024 * 1024)} MiB) for the original.`,
-    };
-  };
+  /** Ladder memo key: the rung is only reused for the same surface shape. */
+  const viewportKey = (viewport: Viewport | null): string =>
+    viewport ? `${viewport.width}x${viewport.height}` : 'unknown';
 
   /** Playwright lanes can simply re-capture at the rung's format and scale. */
   const shrinkViaPlaywright = (
@@ -601,7 +515,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
 
   server.tool(
     'browser_screenshot',
-    'Screenshot the page or one element as a base64-encoded PNG. Requires browser_open first, even if a browser panel is already visible.',
+    'Screenshot the page or one element as a base64-encoded PNG. Requires browser_open first, even if a browser panel is already visible. A viewport capture states ONE scale (image px per viewport CSS px, device pixel ratio and any downscale already folded in) plus a screenshotScale JSON line: click with browser_click imageX/imageY, or divide by that scale yourself. fullPage and element captures are not in click coordinates at all.',
     BROWSER_SCREENSHOT_SHAPE,
     async ({ fullPage, ref, surfaceId, maxBytes, refs }) => withAutomationLease(deps, surfaceId, async (scope) => {
       const ceiling = clampScreenshotCeilingBytes(maxBytes);
@@ -646,13 +560,18 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
         if (!ref && (await engine.resolveWorkspaceBackend(scope.workspaceId)) === 'chrome') {
           const page = await engine.getPageForScope(scope);
           if (page) {
-            // Read the ratio immediately before the capture: a display change
+            // Read the viewport immediately before the capture: a resize
             // between the two would otherwise mislabel the image.
-            const dpr = fullPage ? null : await readDpr(page);
+            const viewport = fullPage ? null : await readViewport(page);
             const buf = await page.screenshot({ ...(fullPage && { fullPage: true }), type: 'png' });
+            const scopeKey = browserScopeKey(scope);
+            const memoKey = `${scopeKey}|${fullPage ? 'full' : 'viewport'}`;
             const fitted = await fitScreenshot(
               buf.toString('base64'),
-              ceiling,
+              {
+                maxBytes: ceiling,
+                rememberedScale: recallShrinkRung(memoKey, viewportKey(viewport), ceiling),
+              },
               shrinkViaPlaywright((rung) =>
                 page.screenshot({
                   ...(fullPage && { fullPage: true }),
@@ -664,7 +583,12 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
                 }),
               ),
             );
-            const basis = coordinateBasis(fullPage ? 'fullPage' : 'viewport', dpr);
+            rememberShrinkRung(memoKey, viewportKey(viewport), ceiling, fitted.scale);
+            // Measured on the bytes that are actually returned, so the one
+            // factor already contains the device ratio and the rung above.
+            const geometry = fullPage ? null : screenshotGeometry(fitted.data, viewport);
+            if (geometry) rememberScreenshotScale(scopeKey, geometry);
+            const basis = coordinateBasis(fullPage ? 'fullPage' : 'viewport', geometry);
             return imageResult(fitted, refs ? `${basis}\n\n${await refsTable(page)}` : basis);
           }
         }
@@ -679,7 +603,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             const buffer = (await el.screenshot()) as Buffer;
             const fitted = await fitScreenshot(
               buffer.toString('base64'),
-              ceiling,
+              { maxBytes: ceiling },
               shrinkViaPlaywright((rung) =>
                 el.screenshot({ type: 'jpeg', quality: rung.quality }) as Promise<Buffer>,
               ),
@@ -701,14 +625,25 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
         // only place this lane's pixels exist. A daemon that predates the
         // parameters answers with the same PNG, which fitScreenshot reads as
         // "no knob" and reports honestly instead of refusing.
-        const fitted = await fitScreenshot(result.data, ceiling, async (rung) => {
-          const shrunk = await sendScopedBrowserRpc<{ data: string; mimeType?: string }>(
-            'browser.screenshot',
-            scope,
-            { ...(fullPage && { fullPage }), format: 'jpeg', quality: rung.quality, scale: rung.scale },
-          );
-          return shrunk.mimeType === 'image/jpeg' ? shrunk.data : null;
-        });
+        const rpcMemoKey = `${browserScopeKey(scope)}|rpc|${fullPage ? 'full' : 'viewport'}`;
+        const fitted = await fitScreenshot(
+          result.data,
+          {
+            maxBytes: ceiling,
+            // This lane cannot read a viewport, so the rung is remembered under
+            // a fixed key: it still stops drifting between calls.
+            rememberedScale: recallShrinkRung(rpcMemoKey, 'unknown', ceiling),
+          },
+          async (rung) => {
+            const shrunk = await sendScopedBrowserRpc<{ data: string; mimeType?: string }>(
+              'browser.screenshot',
+              scope,
+              { ...(fullPage && { fullPage }), format: 'jpeg', quality: rung.quality, scale: rung.scale },
+            );
+            return shrunk.mimeType === 'image/jpeg' ? shrunk.data : null;
+          },
+        );
+        rememberShrinkRung(rpcMemoKey, 'unknown', ceiling, fitted.scale);
         // The RPC lane cannot click by coordinate at all, so telling the
         // caller how to convert pixels here would contradict itself.
         const basis = coordinateBasis(fullPage ? 'fullPage' : 'unsupported', null);

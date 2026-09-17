@@ -16,6 +16,7 @@ import type { Page } from 'playwright-core';
 import { listRefEntries, resolveRef } from './snapshot';
 import { listSmartElementsOnPage, resolveSmartRefLocator } from './dom-intelligence';
 import type { Box } from './pointer-path';
+import type { ScreenshotGeometry } from './screenshotScale';
 
 /** Total wall time for measuring every box. */
 export const REF_BOX_BUDGET_MS = 1500;
@@ -38,6 +39,64 @@ export interface RefBoxCandidate {
    * stop waiting after `timeoutMs` and release anything it acquired.
    */
   measure: (timeoutMs: number) => Promise<Box | null>;
+}
+
+// ---------------------------------------------------------------------------
+// What the last screenshot of a surface was scaled by.
+//
+// browser_click { imageX, imageY } divides by it, so an agent reading pixels
+// off the picture does not have to do the arithmetic (#1358). It lives here,
+// beside the other per-surface screenshot facts, and only a VIEWPORT capture
+// writes it — a fullPage or element shot is not in click space at all.
+// ---------------------------------------------------------------------------
+
+const lastScreenshotScale = new Map<string, ScreenshotGeometry>();
+
+export function rememberScreenshotScale(scopeKey: string, geometry: ScreenshotGeometry): void {
+  lastScreenshotScale.set(scopeKey, geometry);
+}
+
+export function getScreenshotScale(scopeKey: string): ScreenshotGeometry | undefined {
+  return lastScreenshotScale.get(scopeKey);
+}
+
+/**
+ * The downscale rung a surface settled on, keyed by the viewport it was chosen
+ * for and the ceiling it was chosen under. Reused until one of those changes,
+ * so the factor in the note does not drift from call to call while the page
+ * grows and shrinks.
+ */
+interface RungMemo {
+  readonly viewport: string;
+  readonly ceiling: number;
+  readonly scale: number;
+}
+
+const shrinkRungs = new Map<string, RungMemo>();
+
+export function rememberShrinkRung(
+  scopeKey: string,
+  viewport: string,
+  ceiling: number,
+  scale: number,
+): void {
+  shrinkRungs.set(scopeKey, { viewport, ceiling, scale });
+}
+
+export function recallShrinkRung(
+  scopeKey: string,
+  viewport: string,
+  ceiling: number,
+): number | null {
+  const memo = shrinkRungs.get(scopeKey);
+  if (!memo || memo.viewport !== viewport || memo.ceiling !== ceiling) return null;
+  return memo.scale;
+}
+
+/** Test seam: drop every remembered screenshot fact. */
+export function clearScreenshotScaleState(): void {
+  lastScreenshotScale.clear();
+  shrinkRungs.clear();
 }
 
 export const NO_SNAPSHOT_REFS_LINE =
