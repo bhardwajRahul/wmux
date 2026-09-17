@@ -137,9 +137,16 @@ async function sendOverrides(session: CDPSession, state: EmulationState): Promis
   });
   // Sent on both branches: a preset that turns touch OFF (a desktop preset
   // after a phone one) has to say so, and "enabled: false" is how.
+  //
+  // `maxTouchPoints` is omitted when disabling, not sent as 0: CDP validates
+  // the field whether or not touch is being enabled, and Chrome rejects the
+  // whole command with "Touch points must be between 1 and 16". Measured on
+  // Chrome 141 — the 0 shape threw, and the `.catch` on the reset path below
+  // swallowed it, which is how a page kept `maxTouchPoints: 10` through a
+  // reset that reported success (#1357).
   await loose(session).send('Emulation.setTouchEmulationEnabled', {
     enabled: m.hasTouch,
-    maxTouchPoints: m.hasTouch ? TOUCH_POINTS : 0,
+    ...(m.hasTouch && { maxTouchPoints: TOUCH_POINTS }),
   });
 }
 
@@ -271,8 +278,10 @@ export async function clearUserAgentEmulation(context: BrowserContext): Promise<
       // same contradiction the preset path exists to remove, only pointing
       // the other way.
       await loose(session).send('Emulation.clearDeviceMetricsOverride').catch(() => {});
+      // No maxTouchPoints — see the note in applyMetrics: 0 is refused by CDP
+      // and the catch below would hide it, leaving the touchscreen installed.
       await loose(session)
-        .send('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 })
+        .send('Emulation.setTouchEmulationEnabled', { enabled: false })
         .catch(() => {});
       // Clearing the override drops the viewport emulation Playwright thinks
       // it still has, so its cached size — the one screenshots clip to and

@@ -111,7 +111,9 @@ describe('browser.emulate device reset (packaged CDP lane)', () => {
 
     expect(commands()).toContain('Emulation.clearDeviceMetricsOverride');
     const touch = sent.find((s) => s.method === 'Emulation.setTouchEmulationEnabled');
-    expect(touch?.params).toMatchObject({ enabled: false, maxTouchPoints: 0 });
+    // maxTouchPoints must be absent, not 0: CDP refuses 0 and the catch below
+    // would turn that refusal into a silent no-op (#1357).
+    expect(touch?.params).toEqual({ enabled: false });
     const restore = sent.find((s) => s.method === 'Emulation.setDeviceMetricsOverride');
     expect(restore?.params).toMatchObject({ width: 1280, height: 720, mobile: false });
     expect(mockWebContents.reload).toHaveBeenCalledTimes(1);
