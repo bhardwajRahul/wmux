@@ -36,6 +36,7 @@ import { foldRemoteKeyboardState, INITIAL_REMOTE_KEYBOARD_STATE, type RemoteKeyb
 import { attachImeAnchor } from '../terminal/imeAnchor';
 import { attachImeResidueGuard } from '../terminal/imeResidueGuard';
 import { attachImeStormGuard } from '../terminal/imeStormGuard';
+import { attachCompositionCommitGate } from '../terminal/compositionCommitGate';
 import { webglContextPool } from '../terminal/webglContextPool';
 import { teardownWebglAddon } from '../terminal/webglTeardown';
 import { createGlyphRepaintScheduler, type GlyphRepaintScheduler } from '../terminal/glyphRepaint';
@@ -1333,6 +1334,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       },
     });
 
+    // #1361: keep a byte we write ourselves behind an IME commit that is still
+    // in flight. Chromium ends the composition before delivering a key it does
+    // not consume, and xterm's CompositionHelper then sends the composed text
+    // from a `setTimeout(…, 0)` — so a synchronous write from the custom key
+    // handler overtakes it and the newline lands in front of the last Korean
+    // syllable. See terminal/compositionCommitGate.ts.
+    const compositionCommitGate = attachCompositionCommitGate(terminal);
+
     // #874/#942: keep the IME candidate window on the cursor. xterm anchors
     // its hidden helper textarea at the ybase-relative cursor row while the
     // renderer paints the cursor at the ydisp-relative one, so a scrolled-up
@@ -1788,8 +1797,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
       if (newlineByte !== null) {
         e.preventDefault();
-        window.electronAPI.pty.write(ptyId, newlineByte);
-        noteUserKeystroke(newlineByte);
+        // #1361: ordered behind an IME commit that xterm has queued but not
+        // yet sent. With no IME in play this runs synchronously, exactly as
+        // before.
+        compositionCommitGate.runAfterCommit(() => {
+          window.electronAPI.pty.write(ptyId, newlineByte);
+          noteUserKeystroke(newlineByte);
+        });
         return false;
       }
 
@@ -2747,6 +2761,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       unregisterAtlasGuard();
       imeResidueGuard?.dispose();
       imeStormGuard.dispose();
+      compositionCommitGate.dispose();
       imeAnchor.dispose();
       deadInputWatchdog.dispose();
       autoCopy.dispose();
