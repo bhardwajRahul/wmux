@@ -143,6 +143,35 @@ describe('daemon.promoteSession — guards', () => {
     expect(region.slice(createAt, saveAt)).not.toMatch(/if \(isWslShell\(session\.cmd\)\)/);
   });
 
+  // #1305 — the pending-recovery TTL only works because of WHERE the restamp
+  // lives. A client asking for the pane renews it; the boot background retry
+  // must not, or every boot would renew every entry and nothing could ever age
+  // out. Neither half is reachable from a unit test (both live inside a running
+  // daemon), and getting it wrong silently restores the unbounded growth, so
+  // pin the split structurally.
+  it('a client retry renews the pending entry but the boot background retry does not', () => {
+    const rpcAt = source.indexOf("pipeServer.onRpc('daemon.promoteSession'");
+    expect(rpcAt, 'daemon.promoteSession not registered').toBeGreaterThanOrEqual(0);
+    const rpcRegion = source.slice(rpcAt, rpcAt + 600);
+    expect(rpcRegion).toMatch(/touchPendingRecovery\(id\)/);
+    // Before the attempt: a promote that fails on a path with no save must
+    // still have recorded that the user asked for this pane.
+    expect(rpcRegion.indexOf('touchPendingRecovery(id)'))
+      .toBeLessThan(rpcRegion.indexOf('promoteOnce(id)'));
+
+    // The attach path is the other client-initiated entry point.
+    const attachAt = source.indexOf("pipeServer.onRpc('daemon.attachSession'");
+    expect(source.slice(attachAt, attachAt + 600)).toMatch(/touchPendingRecovery\(p\.id\)/);
+
+    // The boot background retry (setImmediate, after the RPC registration)
+    // must stay untouched.
+    const bootAt = source.indexOf('WSL background recovery');
+    expect(bootAt, 'boot background recovery not found').toBeGreaterThan(rpcAt);
+    const bootRegion = source.slice(source.lastIndexOf('setImmediate(', bootAt), bootAt);
+    expect(bootRegion).toMatch(/promoteOnce\(session\.id\)/);
+    expect(bootRegion).not.toMatch(/touchPendingRecovery/);
+  });
+
   it('daemon.listSessions appends suspended entries ONLY when asked', () => {
     const start = source.indexOf("pipeServer.onRpc('daemon.listSessions'");
     const region = source.slice(start, source.indexOf("pipeServer.onRpc('daemon.promoteSession'"));

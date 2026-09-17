@@ -25,10 +25,21 @@ user is detected on the next attempt.
 
 If recovery fails, the pane shows the error and **Retry connection**. The original
 pane ID, conversation binding and buffer remain saved across further restarts,
-without expiring while recovery is pending. Fix the distro/directory and retry;
-closing the pane explicitly discards the pending recovery. A missing exec-session
-directory also keeps the pane pending instead of running `--resume` in another
-project.
+outliving the ordinary 7-day suspended-session retention. Fix the distro/directory
+and retry; closing the pane explicitly discards the pending recovery. A missing
+exec-session directory also keeps the pane pending instead of running `--resume`
+in another project.
+
+A pending pane is retained for 30 days, not forever. The 30 days start when the
+pane becomes pending, and opening the pane again restarts them: opening the
+workspace mounts the pane, which retries the connection, and each retry renews
+the retention. So a pane you keep opening is kept. A pane whose surface or
+workspace was removed without an explicit close is never opened again, so it is
+discarded 30 days later, along with the per-boot background retry it was
+costing. The retention is never shorter than `session.suspendedTtlHours`, and a
+pane restored from an older wmux starts its 30 days at the first launch after
+the upgrade. A pane reachable only through wmux web or a remote host has no
+renewal path today, so it keeps the flat 30 days.
 
 ## Claude resume
 

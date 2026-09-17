@@ -2002,10 +2002,36 @@ function registerRpcHandlers(
     },
   };
 
+  // #1305: a CLIENT asking for a pending-recovery pane (the Retry button, an
+  // attach/reconnect) is live user interest, so restart the entry's retention
+  // clock (recoveryPendingSince, what StateWriter's pending-recovery TTL reads)
+  // and persist it, because the restamp only matters across a daemon restart.
+  // saveImmediate (not debounced) because the promote this precedes can fail on
+  // a path that never saves, and a lost restamp is what the TTL would then act
+  // on. No-op for anything that is not pending, and throttled in the manager so
+  // a held Retry button cannot turn into one whole-file write per click.
+  //
+  // Deliberately NOT called from the boot background retry below, and NOT from
+  // daemon.listSessions: the first would renew every entry on every boot and
+  // the second would renew every entry at once, either of which restores the
+  // immortality this TTL exists to end.
+  const touchPendingRecovery = (id: string): void => {
+    if (!sessionManager.touchPendingRecovery(id)) return;
+    const next = buildState(sessionManager);
+    // buildState is live sessions + pendingRecovery only, but a recovery-cap-
+    // skipped suspended record exists ONLY in sessions.json. Save the disk
+    // remainder alongside it or this write erases those panes — the same merge
+    // the reboot-survival save in recoverSessions does.
+    const liveIds = new Set(next.sessions.map((s) => s.id));
+    next.sessions.push(...stateWriter.load().sessions.filter((s) => !liveIds.has(s.id)));
+    stateWriter.saveImmediate(next);
+  };
+
   // daemon.attachSession
   pipeServer.onRpc('daemon.attachSession', async (params) => {
     const p = params as unknown as DaemonSessionIdParams;
     if (sessionManager.getPendingRecovery(p.id)) {
+      touchPendingRecovery(p.id);
       const result = await promoteOnce(p.id);
       if (!result.ok) throw new Error(result.error?.message || 'WSL recovery failed; retry after checking the target');
     }
@@ -2485,7 +2511,13 @@ function registerRpcHandlers(
     promotionInFlight.set(id, operation);
     return operation;
   };
-  pipeServer.onRpc('daemon.promoteSession', (params) => promoteOnce(String(params?.id ?? '')));
+  pipeServer.onRpc('daemon.promoteSession', (params) => {
+    const id = String(params?.id ?? '');
+    // Before the attempt, so an attempt that fails on a path with no save
+    // still records that the user is actively retrying this pane (#1305).
+    touchPendingRecovery(id);
+    return promoteOnce(id);
+  });
   // Defer cold WSL starts until RPC registration/event wiring can finish.
   // Independent panes recover concurrently; foreground attach shares the same
   // in-flight promotion. Exec units also resume when no GUI is attached.

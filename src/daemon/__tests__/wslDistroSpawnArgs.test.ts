@@ -40,6 +40,7 @@ vi.mock('../../shared/wslIntegration', async () => {
 });
 import { DaemonSessionManager } from '../DaemonSessionManager';
 import { StateWriter } from '../StateWriter';
+import type { DaemonSession } from '../types';
 
 describe('createSession — WSL distro selection and recovery target', () => {
   let manager: DaemonSessionManager;
@@ -141,6 +142,122 @@ describe('createSession — WSL distro selection and recovery target', () => {
       clock.mockRestore();
       writer.dispose();
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // #1305 — the boot loop in daemon/index.ts seeds pendingRecovery from
+  // stateWriter.load() and then schedules a background promote for every
+  // pending entry:
+  //
+  //   sessions.json --load()--> [survivors] --keepPendingRecovery()--> manager
+  //                                                                      |
+  //             listSessions().filter(getPendingRecovery) --> promoteOnce(id)
+  //
+  // So pruning at load() is what stops the retry from ever being scheduled.
+  // Before the fix both entries below survived load() and both got a boot
+  // retry, forever.
+  it('stops scheduling a boot retry once the pending entry ages out', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-pending-boot-retry-'));
+    const writer = new StateWriter(tmpDir);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    try {
+      const meta = await manager.createSessionAsync({ id: 'seed', cmd: 'wsl.exe', cwd: '~' });
+      manager.destroySession(meta.id);
+      writer.saveImmediate({ version: 1, sessions: [
+        { ...meta, id: 'abandoned', state: 'suspended', recoveryError: 'WSL distro unavailable',
+          recoveryPendingSince: new Date(now - 31 * DAY_MS).toISOString() },
+        { ...meta, id: 'still-wanted', state: 'suspended', recoveryError: 'WSL distro unavailable',
+          recoveryPendingSince: new Date(now - 1 * DAY_MS).toISOString() },
+      ] });
+
+      // Replay the boot seeding step verbatim (daemon/index.ts recoverSessions).
+      for (const session of writer.load().sessions) {
+        manager.keepPendingRecovery(session, session.recoveryError);
+      }
+      // Replay the boot retry selection verbatim (daemon/index.ts setImmediate).
+      const scheduled = manager.listSessions()
+        .filter((s) => manager.getPendingRecovery(s.id))
+        .map((s) => s.id);
+      expect(scheduled).toEqual(['still-wanted']);
+    } finally {
+      clock.mockRestore();
+      writer.dispose();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // #1305 — the escape hatch: a pane the user is actively retrying must not
+  // vanish. The client-initiated RPCs call touchPendingRecovery before
+  // promoting; nothing else may restart the clock.
+  it('renews a pending entry the user retries, and the renewal survives a restart', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-pending-touch-'));
+    const writer = new StateWriter(tmpDir);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    try {
+      const meta = await manager.createSessionAsync({ id: 'seed', cmd: 'wsl.exe', cwd: '~' });
+      manager.destroySession(meta.id);
+      manager.keepPendingRecovery({ ...meta, id: 'retried', env: {},
+        recoveryPendingSince: new Date(now - 29 * DAY_MS).toISOString() }, 'WSL distro unavailable');
+      manager.keepPendingRecovery({ ...meta, id: 'unattempted', env: {} }, undefined);
+
+      expect(manager.touchPendingRecovery('retried')).toBe(true);
+      // Nothing to persist for an id that is not pending, or for a placeholder
+      // that has no failure and is governed by the plain suspended TTL — the
+      // daemon helper skips its saveImmediate on both.
+      expect(manager.touchPendingRecovery('never-existed')).toBe(false);
+      expect(manager.touchPendingRecovery('unattempted')).toBe(false);
+      // Throttled: a held-down Retry button must not force one synchronous
+      // whole-file write per click.
+      expect(manager.touchPendingRecovery('retried')).toBe(false);
+
+      writer.saveImmediate({ version: 1, sessions: manager.listSessions() });
+      // Two more days pass: 31 days since the pane went pending, but only
+      // 2 days since the user asked for it.
+      clock.mockReturnValue(now + 2 * DAY_MS);
+      expect(writer.load().sessions.map((s) => s.id)).toEqual(['retried', 'unattempted']);
+    } finally {
+      clock.mockRestore();
+      writer.dispose();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // #1305 — the linchpin, pinned behaviourally rather than by source text: if
+  // ANY path that records a pending entry also restarted its clock, every boot
+  // and every failed background retry would renew it and sessions.json would
+  // grow forever again. keepPendingRecovery is that path, for both the per-boot
+  // re-seed and promoteSession's failure branch.
+  it('re-recording a pending entry never restarts its retention clock', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const meta = await manager.createSessionAsync({ id: 'seed', cmd: 'wsl.exe', cwd: '~' });
+      manager.destroySession(meta.id);
+      manager.keepPendingRecovery({ ...meta, id: 'pending', env: {} }, 'WSL distro unavailable');
+      const readPending = (): DaemonSession => {
+        const session = manager.getPendingRecovery('pending');
+        expect(session, 'pending entry disappeared').toBeDefined();
+        return session as DaemonSession;
+      };
+      const stamped = readPending().recoveryPendingSince;
+      expect(stamped).toBe(new Date(now).toISOString());
+
+      // A later boot re-seeds it, and a later retry fails and re-records it.
+      clock.mockReturnValue(now + 10 * 24 * 60 * 60 * 1000);
+      for (const error of ['WSL distro unavailable', 'WSL could not open the directory']) {
+        manager.keepPendingRecovery(readPending(), error);
+      }
+      expect(readPending().recoveryPendingSince).toBe(stamped);
+
+      // Clearing the failure drops the clock so a later failure starts fresh.
+      manager.keepPendingRecovery(readPending(), undefined);
+      expect(readPending()).not.toHaveProperty('recoveryPendingSince');
+    } finally {
+      clock.mockRestore();
     }
   });
 

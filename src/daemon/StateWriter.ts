@@ -115,6 +115,35 @@ const SUSPENDED_TTL_HOURS_DEFAULT = 7 * 24;
 // (config.session.detachedTtlHours) overrides this at the daemon.
 const DETACHED_TTL_HOURS_DEFAULT = 8;
 
+// #1305: retention bound for a SUSPENDED entry that carries `recoveryError` —
+// a WSL pane whose recovery failed and which is waiting for an explicit user
+// Retry or close (#1263). Those entries are exempt from suspendedTtlHours,
+// because aging one out discards the only saved conversation binding and
+// buffer-dump reference the pane has. Exempt used to mean immortal: if the
+// pane's surface or workspace disappeared without an explicit close, nothing
+// ever promotes or closes the entry, so sessions.json grew forever and every
+// boot spent a cold WSL probe retrying a pane nobody can see.
+//
+// The clock is `recoveryPendingSince`, stamped when the entry first becomes
+// pending, and NOT `lastActivity`. lastActivity is the shell's last output,
+// which can already be months old the moment a pane goes pending — exec and
+// supervised units are deliberately allowed to sit silent (see the detached
+// clause below) — so clocking retention off it would discard such a unit's
+// conversation binding and scrollback on the boot after its first failure,
+// with none of the retention this constant promises. Recovery also deletes the
+// `.buf` of anything no longer in state.sessions (cleanOrphanedBuffers), so
+// that loss is immediate and total.
+//
+// keepPendingRecovery stamps the clock once and never restarts it, so neither
+// the per-boot re-seed nor a failed background retry renews an entry. A client
+// that asks for the pane (Retry, attach/reconnect) DOES restart it — see
+// touchPendingRecovery in daemon/index.ts — so a pane the user still opens
+// never ages out here.
+//
+// 30 days: long enough to survive a broken distro, a holiday and a machine
+// swap, short enough that an abandoned pane does not outlive its own project.
+const PENDING_RECOVERY_TTL_HOURS = 30 * 24;
+
 // #646: how far past its own deadTtlHours a tombstone may be kept alive while
 // its pid still answers, so recovery's reconciliation pass can still find and
 // reap the orphaned shell. 7x turns the default 24 h tombstone into a week,
@@ -356,6 +385,9 @@ export class StateWriter {
     //   - suspended: this.suspendedTtlHours (configurable, default 7d —
     //     v2.8.1 hotfix; see top of this file for the accumulation incident
     //     this prevents).
+    //   - suspended + recoveryError (a WSL pane awaiting Retry): the much
+    //     longer PENDING_RECOVERY_TTL_HOURS, never shorter than the plain
+    //     suspended TTL (#1305).
     //   - detached: this.detachedTtlHours (configurable, default 8h — #557).
     //
     // attached is the only live state with no TTL: a client is connected, so
@@ -367,6 +399,11 @@ export class StateWriter {
     // Graceful shutdown still demotes every live session to suspended, so on a
     // clean exit these become suspended-tombstones governed by the 7 d TTL.
     const now = Date.now();
+    // #1305: never shorter than the plain suspended TTL. Raising
+    // session.suspendedTtlHours past 30 d must not make a pane that is waiting
+    // for the user's Retry die BEFORE an ordinary suspended tombstone.
+    const pendingRecoveryTtlMs =
+      Math.max(PENDING_RECOVERY_TTL_HOURS, this.suspendedTtlHours) * 60 * 60 * 1000;
     let restamped = false;
     state.sessions = state.sessions.filter((s) => {
       // Heal any lastActivity that is not a valid, parseable ISO timestamp.
@@ -409,8 +446,22 @@ export class StateWriter {
         return typeof s.pid === 'number' && isPidAlive(s.pid);
       }
       // A failed WSL recovery is awaiting an explicit user retry/close. Aging
-      // it out would discard the only saved conversation and buffer reference.
-      if (s.state === 'suspended' && s.recoveryError) return true;
+      // it out at the ordinary suspended TTL would discard the only saved
+      // conversation and buffer reference, so it gets its own, much longer
+      // bound on its own clock instead of the exemption it used to have — see
+      // PENDING_RECOVERY_TTL_HOURS for why "exempt" could not stay "immortal"
+      // and why the clock is recoveryPendingSince rather than lastActivity.
+      if (s.state === 'suspended' && s.recoveryError) {
+        const pendingSince = Date.parse(s.recoveryPendingSince ?? '');
+        // No clock yet: a record written before this field existed, or one
+        // whose value is corrupt. Keep it — recoverSessions re-seeds every WSL
+        // session through keepPendingRecovery on this same boot, which stamps
+        // the clock, so it ages out from here rather than from a timestamp
+        // that was never about being pending. Fail-open, like the lastActivity
+        // heal above: a missing clock must never cost a user their pane.
+        if (Number.isNaN(pendingSince)) return true;
+        return now - pendingSince < pendingRecoveryTtlMs;
+      }
       if (s.state === 'suspended') {
         return sinceMs < this.suspendedTtlHours * 60 * 60 * 1000;
       }
