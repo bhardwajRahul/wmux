@@ -6,6 +6,7 @@ import { PlaywrightEngine } from '../PlaywrightEngine';
 import { withAutomationLease } from '../automationLease';
 import { matchSensitiveDomain } from '../security';
 import { evalFunctionOrRpc } from '../page-eval';
+import { evaluateIsolated } from '../isolated-eval';
 import { isChromiumUserAgent } from '../../../shared/uaMetadata';
 import { describeToolError } from '../toolError';
 import {
@@ -19,6 +20,52 @@ import {
   type BrowserTargetScope,
   type BrowserToolDeps,
 } from '../browserScope';
+
+/**
+ * The viewport a page had before a device preset replaced it (#1357).
+ *
+ * `device: null` used to clear the UA and tell the caller to run
+ * browser_resize, so the page stayed at the phone's width: its media queries
+ * and touch checks kept matching the preset, and a manual resize afterwards
+ * landed the layout between breakpoints. Remembering the size here is what
+ * lets the reset put it back in the same call. Keyed weakly, so a closed page
+ * takes its entry with it.
+ */
+const prePresetViewport = new WeakMap<Page, { width: number; height: number }>();
+
+/** Used only when a reset finds neither a remembered nor a current viewport. */
+const DEFAULT_RESET_VIEWPORT = { width: 1280, height: 720 };
+
+/**
+ * What the page itself reports, read after an emulate call so the caller sees
+ * the real state rather than the summary of what was asked for.
+ */
+const DEVICE_PROBE_EXPRESSION =
+  '({ w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio,'
+  + ' touch: navigator.maxTouchPoints })';
+
+interface DeviceProbe {
+  w: number;
+  h: number;
+  dpr: number;
+  touch: number;
+}
+
+/** Format a probe reading, or undefined when the page could not be asked. */
+export function formatDeviceProbe(probe: DeviceProbe | null | undefined): string | undefined {
+  if (!probe || typeof probe.w !== 'number' || typeof probe.h !== 'number') return undefined;
+  return `probe=${probe.w}x${probe.h} dpr=${probe.dpr} maxTouchPoints=${probe.touch}`;
+}
+
+async function deviceProbeLine(page: Page): Promise<string | undefined> {
+  try {
+    const probe = await evaluateIsolated<DeviceProbe>(page, DEVICE_PROBE_EXPRESSION);
+    return formatDeviceProbe(probe);
+  } catch {
+    // A probe that cannot be read must not fail the emulation it describes.
+    return undefined;
+  }
+}
 
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
@@ -497,6 +544,14 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
           // device preset
           if (device !== undefined) {
             if (deviceDescriptor) {
+              // Remember what the preset is about to replace, so `device: null`
+              // can put it back instead of leaving the page on a phone width
+              // (#1357). Only the first preset in a chain records: two presets
+              // in a row must still reset to the pre-emulation desktop size.
+              if (!prePresetViewport.has(page)) {
+                const before = page.viewportSize();
+                if (before) prePresetViewport.set(page, { ...before });
+              }
               await page.setViewportSize(deviceDescriptor.viewport);
               // Apply user agent via extra headers
               await context.setExtraHTTPHeaders({
@@ -573,8 +628,39 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
                 await context.setExtraHTTPHeaders({ ...(headers ?? {}) });
                 applied.push('userAgent=reset');
               }
-              applied.push('device=reset (use browser_resize to set viewport)');
+              // clearUserAgentEmulation above drops the device metrics and the
+              // touch points on the sessions the preset was applied through,
+              // but the viewport is Playwright's own and survives it. Put the
+              // pre-preset size back here rather than telling the caller to run
+              // browser_resize: a page left at the phone width keeps matching
+              // the preset's media queries (#1357).
+              const remembered = prePresetViewport.get(page);
+              prePresetViewport.delete(page);
+              const current = page.viewportSize();
+              const target = remembered ?? current ?? DEFAULT_RESET_VIEWPORT;
+              const how = remembered
+                ? 'restored'
+                : current
+                  ? 'kept (no pre-preset viewport recorded)'
+                  : 'default (no pre-preset viewport recorded)';
+              await page.setViewportSize(target);
+              // The page's media queries and `ontouchstart` checks already ran
+              // under the preset, so their results cannot be trusted without a
+              // fresh evaluation.
+              let reloaded = true;
+              await page.reload().catch(() => {
+                reloaded = false;
+              });
+              applied.push(
+                `device=reset (viewport ${target.width}x${target.height} ${how}, ${
+                  reloaded ? 'reloaded' : 'reload failed'
+                })`,
+              );
             }
+            // Say what the page actually reports now, on apply and on reset
+            // alike, so the caller does not have to trust the summary.
+            const probe = await deviceProbeLine(page);
+            if (probe) applied.push(probe);
           }
         } else {
           // Packaged RPC fallback (#111). The main-process handler applies each

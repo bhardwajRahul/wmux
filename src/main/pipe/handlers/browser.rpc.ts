@@ -52,6 +52,21 @@ const activePreset = new WeakMap<
     screenHeight?: number;
   }
 >();
+
+/**
+ * The viewport a WebContents had before a device preset replaced it (#1357).
+ *
+ * `device: null` cleared the metrics override but said nothing about the size,
+ * so a caller who had gone to a phone preset was left to guess the desktop
+ * dimensions back. Remembering them here is what lets the reset restore the
+ * viewport in the same call.
+ */
+const prePresetViewport = new WeakMap<WebContents, { width: number; height: number }>();
+
+/** What the page reports about its own viewport, pixel ratio and touch points. */
+const DEVICE_PROBE_EXPRESSION =
+  '({ w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio,'
+  + ' touch: navigator.maxTouchPoints })';
 import { refererFor } from '../../../shared/referer';
 import { buildUserAgentOverride } from '../../../shared/uaMetadata';
 import { WebviewCdpManager } from '../../browser-session/WebviewCdpManager';
@@ -2993,6 +3008,25 @@ export function registerBrowserRpc(
     const send = (method: string, p?: Record<string, unknown>): Promise<unknown> =>
       wc.debugger.sendCommand(method, p);
     const applied: string[] = [];
+    // Read the page's own numbers rather than reporting back what was asked
+    // for. Best-effort: a page that cannot be evaluated must not fail the
+    // emulation this describes.
+    const probe = async (): Promise<
+      { w: number; h: number; dpr: number; touch: number } | undefined
+    > => {
+      try {
+        const res = (await send('Runtime.evaluate', {
+          expression: DEVICE_PROBE_EXPRESSION,
+          returnByValue: true,
+        })) as { result?: { value?: { w?: number; h?: number; dpr?: number; touch?: number } } };
+        const v = res?.result?.value;
+        return typeof v?.w === 'number' && typeof v.h === 'number'
+          ? { w: v.w, h: v.h, dpr: v.dpr ?? 0, touch: v.touch ?? 0 }
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    };
 
     if (typeof params['offline'] === 'boolean') {
       await send('Network.enable');
@@ -3077,6 +3111,13 @@ export function registerBrowserRpc(
         width: number; height: number; deviceScaleFactor?: number; mobile?: boolean;
         hasTouch?: boolean; screenWidth?: number; screenHeight?: number;
       };
+      // Remember what the preset is about to replace so `deviceReset` can put
+      // it back (#1357). Only the first preset in a chain records: two presets
+      // in a row must still reset to the pre-emulation desktop size.
+      if (!prePresetViewport.has(wc)) {
+        const before = await probe();
+        if (before) prePresetViewport.set(wc, { width: before.w, height: before.h });
+      }
       await send('Emulation.setDeviceMetricsOverride', {
         width: dm.width, height: dm.height,
         deviceScaleFactor: dm.deviceScaleFactor ?? 0, mobile: dm.mobile ?? false,
@@ -3127,6 +3168,8 @@ export function registerBrowserRpc(
       const label = typeof params['deviceLabel'] === 'string' ? params['deviceLabel'] : `${dm.width}x${dm.height}`;
       applied.push(`device=${label}`);
       if (touchUnavailable) applied.push('touch=unavailable on this transport');
+      const after = await probe();
+      if (after) applied.push(`probe=${after.w}x${after.h} dpr=${after.dpr} maxTouchPoints=${after.touch}`);
     } else if (params['deviceReset'] === true) {
       // Actually undo the preset over CDP: drop the device metrics override and
       // restore the real user agent. Without this, a packaged caller who switches
@@ -3134,11 +3177,19 @@ export function registerBrowserRpc(
       // subsequent page. CDP has no "clear UA override" command, so re-apply the
       // WebContents' own UA to shed the mobile one set by the preset above.
       activePreset.delete(wc);
+      const remembered = prePresetViewport.get(wc);
+      prePresetViewport.delete(wc);
       await send('Emulation.clearDeviceMetricsOverride');
       // The touch points the preset installed outlive clearDeviceMetricsOverride,
       // so a reset that skipped this left a desktop UA reporting a touchscreen.
+      let touchDisabled = true;
       await send('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 })
-        .catch(() => { /* transport without touch emulation; metrics still cleared */ });
+        .catch(() => {
+          // Swallowing this was how a reset could report success while
+          // navigator.maxTouchPoints stayed at the preset's value (#1357).
+          // The metrics are still cleared; say what did not happen.
+          touchDisabled = false;
+        });
       try {
         const ua = typeof wc.getUserAgent === 'function' ? wc.getUserAgent() : undefined;
         // Restore the metadata alongside the string: re-applying the real UA
@@ -3153,7 +3204,33 @@ export function registerBrowserRpc(
       } catch {
         /* getUserAgent / UA override unavailable on this transport; metrics still cleared */
       }
-      applied.push('device=reset (use browser_resize to set viewport)');
+      // Restore the viewport the preset replaced. Clearing the override alone
+      // left the caller to guess the desktop size back, and a page still at the
+      // phone width keeps matching the preset's media queries (#1357).
+      let viewportNote: string;
+      if (remembered) {
+        await send('Emulation.setDeviceMetricsOverride', {
+          width: remembered.width,
+          height: remembered.height,
+          deviceScaleFactor: 0,
+          mobile: false,
+        });
+        viewportNote = `viewport ${remembered.width}x${remembered.height} restored`;
+      } else {
+        viewportNote = 'viewport from surface bounds (no pre-preset viewport recorded)';
+      }
+      // The page's media queries and `ontouchstart` checks already ran under the
+      // preset, so their results cannot be trusted without a fresh evaluation.
+      let reloaded = true;
+      try {
+        wc.reload();
+      } catch {
+        reloaded = false;
+      }
+      applied.push(`device=reset (${viewportNote}, ${reloaded ? 'reloaded' : 'reload failed'})`);
+      if (!touchDisabled) applied.push('touch=could not be disabled');
+      const after = await probe();
+      if (after) applied.push(`probe=${after.w}x${after.h} dpr=${after.dpr} maxTouchPoints=${after.touch}`);
     }
 
     return { applied };
