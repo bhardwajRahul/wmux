@@ -1,5 +1,13 @@
 import type { Page, Frame, Locator, ElementHandle } from 'playwright-core';
-import { buildDomSnapshotExpression } from './dom-intelligence';
+import { buildDomSnapshotExpression, readDomSnapshotPayload } from './dom-intelligence';
+import {
+  describeRetiredRef,
+  nextRefFor,
+  priorRefDescriptors,
+  recordRefGeneration,
+  recoveredRefNote,
+  uniqueDescriptorMatch,
+} from './refDescriptors';
 import {
   REDACTED_PASSWORD,
   getPasswordFieldBackendIds,
@@ -776,9 +784,46 @@ const pageRefMaps = new WeakMap<Page, RefEntry[]>();
  */
 const pageRefScopes = new WeakMap<Page, string>();
 
+/**
+ * Stable per-Page number, so a descriptor history can name the page it belongs
+ * to. Two tabs showing the same URL are different ref spaces, so the URL alone
+ * cannot key the history.
+ */
+const snapshotPageIds = new WeakMap<Page, number>();
+let nextSnapshotPageId = 1;
+
+function snapshotPageId(page: Page): number {
+  const existing = snapshotPageIds.get(page);
+  if (existing !== undefined) return existing;
+  const id = nextSnapshotPageId++;
+  snapshotPageIds.set(page, id);
+  return id;
+}
+
+/**
+ * Descriptor-history key for one page's ref space (#1355).
+ *
+ * The document is part of the key: a ref from the page before a navigation must
+ * not be recoverable against the page after it. The selector scope is too — a
+ * scoped snapshot numbers refs inside one subtree, so its descriptors describe
+ * a different listing from the unscoped one's.
+ */
+function axDescriptorKey(page: Page, scopeSelector: string | undefined): string {
+  return `ax:p${snapshotPageId(page)}:${pageDocumentKey(page) ?? ''}:${scopeSelector ?? ''}`;
+}
+
+/** The same, for the DOM interactive listing this page falls through to. */
+function domDescriptorKey(page: Page): string {
+  return `ax-dom:p${snapshotPageId(page)}:${pageDocumentKey(page) ?? ''}`;
+}
+
 function setPageRefs(page: Page, refs: RefEntry[], scopeSelector?: string): void {
   finalizeRefs(refs);
   pageRefMaps.set(page, refs);
+  // What this generation's numbers meant, so a ref the next snapshot no longer
+  // lists can still be resolved through its descriptor (#1355). An empty map is
+  // the DOM-fallthrough case, which keeps its own history keyed separately.
+  if (refs.length > 0) recordRefGeneration(axDescriptorKey(page, scopeSelector), 0, refs);
   const generation = pageRefIdentity.get(page)?.generation ?? 0;
   const stamps = new Map<string, SnapshotStamp>();
   stamps.set(MAIN_FRAME.key, { generation, url: pageDocumentKey(page) });
@@ -2207,12 +2252,20 @@ export async function generateSnapshot(
       // The listing carries the page URL and every link href verbatim, so it
       // gets the same URL redaction the network listing does (inspection.ts
       // applies it to its own two DOM-listing branches).
-      let domSnapshot = redactPasswordParams(
-        (await evaluateIsolated<string>(
-          page,
-          buildDomSnapshotExpression(undefined, { filter: options?.filter }),
-        )),
-      );
+      // Stable numbering on this lane too (#1355): an element still on the page
+      // keeps the number the last listing gave it, so a ref the agent is
+      // holding survives a re-snapshot that added elements above it.
+      const domKey = domDescriptorKey(page);
+      const payload = readDomSnapshotPayload(await evaluateIsolated<unknown>(
+        page,
+        buildDomSnapshotExpression(undefined, {
+          ...(options?.filter && { filter: options.filter }),
+          stable: { prior: priorRefDescriptors(domKey, 0), nextRef: nextRefFor(domKey, 0) },
+          withEntries: true,
+        }),
+      ));
+      if (payload.entries.length > 0) recordRefGeneration(domKey, 0, payload.entries);
+      let domSnapshot = redactPasswordParams(payload.text);
       // aria has no DOM-listing equivalent — say so instead of silently
       // returning the ai-style listing (same honesty rule as the selector
       // path in inspection.ts). 'ai' needs no note: the listing IS ai-style.
@@ -2519,6 +2572,13 @@ export interface ResolveRefOptions {
    * of it, so a detached node cannot hold a CDP wait open after the call.
    */
   timeout?: number;
+  /**
+   * Sink for anything the caller should pass on to the agent — today only the
+   * "this ref came from an earlier snapshot" note (#1355). A sink rather than a
+   * return value because the resolver's contract is an ElementHandle, and every
+   * caller that does not care keeps its one-line call.
+   */
+  notes?: string[];
 }
 
 /**
@@ -2542,7 +2602,13 @@ export async function resolveRef(
   options?: ResolveRefOptions,
 ): Promise<ElementHandle | null> {
   // Primary: the a11y refMap from the last generateSnapshot() on this page.
-  const primary = await resolveRefViaAxMap(page, ref, options?.strictCount === true, options?.timeout);
+  const primary = await resolveRefViaAxMap(
+    page,
+    ref,
+    options?.strictCount === true,
+    options?.timeout,
+    options?.notes,
+  );
   if (primary) return primary;
 
   // Fallback: DOM snapshots (the RPC fallback + the root-only fallthrough) tag
@@ -2665,6 +2731,7 @@ async function resolveRefViaAxMap(
   ref: string,
   strictCount = false,
   timeout?: number,
+  notes?: string[],
 ): Promise<ElementHandle | null> {
   const wanted = refNumber(ref);
   if (wanted === null) return null;
@@ -2683,7 +2750,25 @@ async function resolveRefViaAxMap(
     );
   }
 
-  const target = refs.find((entry) => entry.ref === wanted);
+  // The scope the latest snapshot numbered inside, which is also what its
+  // descriptors were recorded against.
+  const scopeSelector = pageRefScopes.get(page);
+
+  let target = refs.find((entry) => entry.ref === wanted);
+  let recovered = '';
+  if (!target) {
+    // A ref the latest snapshot does not carry is not automatically a dead one
+    // (#1355). Look the number up in this page's descriptor history: if the
+    // current refMap holds exactly one element the stored role+name can name,
+    // it is the same element under a listing that was re-cut around it. Zero or
+    // several stay stale — a guess between look-alikes is worse than refusing.
+    const descriptor = describeRetiredRef(axDescriptorKey(page, scopeSelector), wanted);
+    const match = descriptor ? uniqueDescriptorMatch(descriptor, refs) : null;
+    if (match) {
+      target = match;
+      recovered = recoveredRefNote(wanted);
+    }
+  }
   if (!target) {
     const identity = pageRefIdentity.get(page);
     // The number was handed out on this document but the latest snapshot does
@@ -2698,11 +2783,11 @@ async function resolveRefViaAxMap(
     return null;
   }
 
-  // Use Playwright's getByRole to locate the element. A scoped snapshot numbered
-  // its refs inside one element, so search inside that same element — otherwise
-  // the nth-match count below is taken over the whole page and can land on an
-  // identical role+name that the caller deliberately scoped out.
-  const scopeSelector = pageRefScopes.get(page);
+  // Playwright's getByRole locates the element. A scoped snapshot numbered its
+  // refs inside one element, so the search runs inside that same element
+  // (`scopeSelector`, read above) — otherwise the nth-match count below is
+  // taken over the whole page and can land on an identical role+name that the
+  // caller deliberately scoped out.
 
   // A selector scope and a frame route are two different answers to "where do
   // I count from", and there is no sound way to combine them: the selector was
@@ -2769,7 +2854,11 @@ async function resolveRefViaAxMap(
 
   try {
     const nth = Math.min(target.sameNameIndex, count - 1);
-    return await locator.nth(nth).elementHandle(timeout === undefined ? undefined : { timeout });
+    const handle = await locator
+      .nth(nth)
+      .elementHandle(timeout === undefined ? undefined : { timeout });
+    if (handle && recovered) notes?.push(recovered);
+    return handle;
   } catch {
     return null;
   }
