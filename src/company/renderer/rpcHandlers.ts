@@ -12,6 +12,19 @@ import { getWorkspaceLeafPanes } from '../../shared/paneUtils';
 
 type Store = ReturnType<typeof useStore.getState>;
 
+/**
+ * #1337 — the gap between the bracketed paste and the Enter that submits it
+ * depends on the receiving agent: a paste-burst TUI (Codex) swallows an Enter
+ * written too soon after the paste and leaves the message sitting in its
+ * composer, unsubmitted. The agent is read from the per-ptyId surfaceAgent map
+ * at write time, so it always describes the pane the bytes go to.
+ */
+function submitToMemberPty(ptyId: string, text: string): void {
+  submitBracketedPasteToPty(ptyId, text, {
+    agent: useStore.getState().surfaceAgent[ptyId]?.name,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -71,7 +84,7 @@ function deliverToCeo(store: Store, from: string, message: string): void {
     const surface = leaf.surfaces.find((s) => s.surfaceType !== 'browser' && s.ptyId);
     if (surface) {
       const formatted = formatMessage(from, 'CEO', message);
-      submitBracketedPasteToPty(surface.ptyId, formatted);
+      submitToMemberPty(surface.ptyId, formatted);
       break;
     }
   }
@@ -177,7 +190,7 @@ export async function handleCompanyRpc(
     for (const member of c.departments.flatMap((d) => d.members)) {
       if (!member.ptyId) continue;
       if (member.status === 'idle') {
-        submitBracketedPasteToPty(member.ptyId, formatBroadcast(from, message));
+        submitToMemberPty(member.ptyId, formatBroadcast(from, message));
         sentImmediate++;
       } else {
         store.enqueueMessage(member.id, member.ptyId, member.name, message, from, true);
@@ -204,7 +217,7 @@ export async function handleCompanyRpc(
     for (const member of dept.members) {
       if (!member.ptyId) continue;
       if (member.status === 'idle') {
-        submitBracketedPasteToPty(member.ptyId, formatMessage(from, member.name, message));
+        submitToMemberPty(member.ptyId, formatMessage(from, member.name, message));
         sentImmediate++;
       } else {
         store.enqueueMessage(member.id, member.ptyId, member.name, message, from, false);
@@ -231,7 +244,7 @@ export async function handleCompanyRpc(
     const member = dept.members.find((m) => m.id === memberId);
     if (!member?.ptyId) return { error: `member not found or no PTY` };
     if (member.status === 'idle') {
-      submitBracketedPasteToPty(member.ptyId, formatMessage(from, member.name, message));
+      submitToMemberPty(member.ptyId, formatMessage(from, member.name, message));
       return { ok: true, sentImmediate: 1, queued: 0 };
     } else {
       store.enqueueMessage(member.id, member.ptyId, member.name, message, from, false);
@@ -258,7 +271,7 @@ export async function handleCompanyRpc(
       for (const member of c.departments.flatMap((d) => d.members)) {
         if (!member.ptyId) continue;
         if (member.status === 'idle') {
-          submitBracketedPasteToPty(member.ptyId, formatBroadcast(from, message));
+          submitToMemberPty(member.ptyId, formatBroadcast(from, message));
         } else {
           store.enqueueMessage(member.id, member.ptyId, member.name, message, from, true);
         }
@@ -276,7 +289,7 @@ export async function handleCompanyRpc(
     for (const member of targets) {
       if (!member.ptyId) continue;
       if (member.status === 'idle') {
-        submitBracketedPasteToPty(member.ptyId, formatMessage(from, member.name, message));
+        submitToMemberPty(member.ptyId, formatMessage(from, member.name, message));
       } else {
         store.enqueueMessage(member.id, member.ptyId, member.name, message, from, false);
       }
@@ -326,7 +339,7 @@ export async function handleCompanyRpc(
       store.addToInbox(member.id, { from, to: member.name, message, priority });
       if (!member.ptyId) continue;
       if (member.status === 'idle') {
-        submitBracketedPasteToPty(member.ptyId, formatMessage(from, member.name, message, priority as MessagePriority));
+        submitToMemberPty(member.ptyId, formatMessage(from, member.name, message, priority as MessagePriority));
         delivered++;
       } else {
         store.enqueueMessage(member.id, member.ptyId, member.name, message, from, false);
@@ -355,7 +368,7 @@ export async function handleCompanyRpc(
       store.addToInbox(member.id, { from, to: 'All', message, priority });
       if (!member.ptyId) continue;
       if (member.status === 'idle') {
-        submitBracketedPasteToPty(member.ptyId, formatBroadcast(from, message, priority as MessagePriority));
+        submitToMemberPty(member.ptyId, formatBroadcast(from, message, priority as MessagePriority));
       } else {
         store.enqueueMessage(member.id, member.ptyId, member.name, message, from, true);
       }

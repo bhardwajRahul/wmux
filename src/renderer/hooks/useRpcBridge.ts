@@ -32,7 +32,7 @@ import {
 } from '../utils/searchEngine';
 import { submitBracketedPasteToPty } from '../utils/ptyMessageDelivery';
 import { publishA2aTask } from '../events/publisher';
-import { resolvePaneAddress, activePaneTerminalPty, decideSameWsSend, decideReplyDelivery, REPLY_SUPPRESS_HINTS, countRoundTrips, maxSideMessages, REPLY_ROUND_CAP, isTerminalPtyInLeaves, resolveSelfPaneIdentity, resolveSenderPaneAddress, resolvePaneRole, findLeafPanes, type PaneAddress } from './a2aAddressing';
+import { resolvePaneAddress, activePaneTerminalPty, decideSameWsSend, decideReplyDelivery, REPLY_SUPPRESS_HINTS, submitReceiptFields, countRoundTrips, maxSideMessages, REPLY_ROUND_CAP, isTerminalPtyInLeaves, resolveSelfPaneIdentity, resolveSenderPaneAddress, resolvePaneRole, findLeafPanes, type PaneAddress } from './a2aAddressing';
 import { resolveWorkspaceTarget } from './workspaceTargeting';
 import { destroyRemoteSessions, destroySurfaceRemoteSession, destroyWorkspaceRemoteSessions } from '../utils/remoteSessionTeardown';
 import { remoteAgentKey } from '../../shared/remoteHosts';
@@ -236,8 +236,20 @@ function findOwnedSurface(
 // individual keystrokes.
 // ---------------------------------------------------------------------------
 
+// #1337 — the gap before Enter, and whether that Enter may be reported as a
+// real submit, both depend on WHICH AGENT owns the pty being written to. Read
+// it from the per-ptyId surfaceAgent map at write time rather than taking it
+// from the caller: the caller's liveness metadata can fall back to
+// workspace-level `metadata.agentName`, which in a multi-agent workspace names
+// a different pane than the one `activePaneTerminalPty` resolved. A receipt
+// about the wrong pane is the same false receipt this is fixing.
+function ptyAgent(ptyId: string): { name?: string; status?: string } {
+  const a = useStore.getState().surfaceAgent[ptyId];
+  return a ? { name: a.name, status: a.status } : {};
+}
+
 function submitToPty(ptyId: string, text: string): void {
-  submitBracketedPasteToPty(ptyId, text);
+  submitBracketedPasteToPty(ptyId, text, { agent: ptyAgent(ptyId).name });
 }
 
 // ---------------------------------------------------------------------------
@@ -417,17 +429,20 @@ export function useRpcBridge(): void {
 // active terminal. Extracted to avoid duplication across send/reply/update.
 // ---------------------------------------------------------------------------
 
-// Returns whether a pty was actually written to. A workspace whose active pane
+// Returns the ptyId actually written to, or null. A workspace whose active pane
 // has no terminal (browser surface, empty) resolves no pty and this is a no-op
 // — callers that report a `delivery` outcome MUST use the return value instead
 // of assuming success (review 2-MODEL finding: the unconditional
 // `notified:true` was the same false receipt this PR set out to remove).
+//
+// #1337: the ptyId, not a bare boolean, because the receipt has to describe the
+// pane that received the bytes — see `ptyAgent`.
 function deliverPtyNotification(
   targetWs: { rootPane: Pane; activePaneId: string; name: string; stashedPanes?: Workspace['stashedPanes'] },
   senderName: string,
   message: string,
   explicitPtyId?: string,
-): boolean {
+): string | null {
   // getWorkspaceLeafPanes puts VISIBLE leaves first, so the "first leaf with a
   // live terminal" fallback still prefers something on screen (#977); a stashed
   // pane only catches the message when nothing visible can take it, which beats
@@ -435,9 +450,9 @@ function deliverPtyNotification(
   const ptyId = explicitPtyId ?? activePaneTerminalPty(getWorkspaceLeafPanes(targetWs), targetWs.activePaneId);
   if (ptyId) {
     submitToPty(ptyId, formatA2aMessage(senderName, targetWs.name, message));
-    return true;
+    return ptyId;
   }
-  return false;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,12 +464,12 @@ function deliverPtyNotification(
 // it cannot corrupt a multi-line readline state.
 // ---------------------------------------------------------------------------
 
-// Returns whether a pty was actually written to — see deliverPtyNotification.
+// Returns the ptyId actually written to, or null — see deliverPtyNotification.
 function deliverPtyNudge(
   targetWs: { rootPane: Pane; activePaneId: string; stashedPanes?: Workspace['stashedPanes'] },
   nudge: string,
   explicitPtyId?: string,
-): boolean {
+): string | null {
   // getWorkspaceLeafPanes puts VISIBLE leaves first, so the "first leaf with a
   // live terminal" fallback still prefers something on screen (#977); a stashed
   // pane only catches the message when nothing visible can take it, which beats
@@ -462,9 +477,9 @@ function deliverPtyNudge(
   const ptyId = explicitPtyId ?? activePaneTerminalPty(getWorkspaceLeafPanes(targetWs), targetWs.activePaneId);
   if (ptyId) {
     submitToPty(ptyId, nudge);
-    return true;
+    return ptyId;
   }
-  return false;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2367,22 +2382,20 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
             // resolve a pty at write time and are a no-op when none exists (e.g.
             // the cross-ws active pane is a browser surface). Assuming success
             // here would recreate the exact false receipt this change removes.
-            let wrote: boolean;
+            let wrotePty: string | null;
             let mode: 'nudge' | 'notification' = 'nudge';
+            const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, targetWs.metadata);
             if (decision.sameWs) {
               // Same-ws sibling: pointer-only nudge (no full-body injection).
-              wrote = deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName), explicitPty);
+              wrotePty = deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName), explicitPty);
+            } else if (!silentExplicit && isLiveTuiAgent(liveMeta)) {
+              wrotePty = deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName), explicitPty);
             } else {
-              const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, targetWs.metadata);
-              if (!silentExplicit && isLiveTuiAgent(liveMeta)) {
-                wrote = deliverPtyNudge(targetWs, buildA2aNudge(taskId, senderName), explicitPty);
-              } else {
-                wrote = deliverPtyNotification(targetWs, senderName, message, explicitPty);
-                mode = 'notification';
-              }
+              wrotePty = deliverPtyNotification(targetWs, senderName, message, explicitPty);
+              mode = 'notification';
             }
-            delivery = wrote
-              ? { stored: true, notified: true, mode }
+            delivery = wrotePty
+              ? { stored: true, notified: true, mode, ...submitReceiptFields(ptyAgent(wrotePty)) }
               : {
                   stored: true,
                   notified: false,
@@ -2544,16 +2557,16 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
       // Liveness for the nudge-vs-paste choice must reflect the ADDRESSED pane's
       // agent (a workspace can host >1 agent), not ws-level metadata.
       const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, target.metadata);
-      let wrote: boolean;
+      let wrotePty: string | null;
       let mode: 'nudge' | 'notification' = 'nudge';
       if (!silentExplicit && isLiveTuiAgent(liveMeta)) {
-        wrote = deliverPtyNudge(target, buildA2aNudge(newTaskId, fromName), explicitPty);
+        wrotePty = deliverPtyNudge(target, buildA2aNudge(newTaskId, fromName), explicitPty);
       } else {
-        wrote = deliverPtyNotification(target, fromName, message, explicitPty);
+        wrotePty = deliverPtyNotification(target, fromName, message, explicitPty);
         mode = 'notification';
       }
-      delivery = wrote
-        ? { stored: true, notified: true, mode }
+      delivery = wrotePty
+        ? { stored: true, notified: true, mode, ...submitReceiptFields(ptyAgent(wrotePty)) }
         : {
             stored: true,
             notified: false,
@@ -2757,15 +2770,11 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
         // caller's own pane (mirror of the reply branch + decideSameWsSend).
         const sameWsUnverified = sameWsTask && !callerPtyIdUpdate;
         if (!pinnedAddressLost && !sameWsNoAnchor && !selfLoop && !sameWsUnverified) {
-          if (sameWsTask) {
+          const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, targetWs.metadata);
+          if (sameWsTask || isLiveTuiAgent(liveMeta)) {
             deliverPtyNudge(targetWs, buildA2aNudge(taskId, callerName), explicitPty);
           } else {
-            const liveMeta = deliveryLiveMeta(store.surfaceAgent, explicitPty, targetWs.metadata);
-            if (isLiveTuiAgent(liveMeta)) {
-              deliverPtyNudge(targetWs, buildA2aNudge(taskId, callerName), explicitPty);
-            } else {
-              deliverPtyNotification(targetWs, callerName, message, explicitPty);
-            }
+            deliverPtyNotification(targetWs, callerName, message, explicitPty);
           }
         }
       }

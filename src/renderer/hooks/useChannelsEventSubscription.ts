@@ -338,7 +338,14 @@ export function useChannelsEventSubscription(): void {
             // pastes immediately and the TUI queues it (message-latency epic).
             st.surfaceAgent[ptyId]?.slug,
           ),
-        deliverNudge: (ptyId, text) => submitBracketedPasteToPty(ptyId, text),
+        // #1337 — the gap before Enter depends on the receiving agent: a
+        // paste-burst TUI (Codex) swallows an Enter written too soon after the
+        // paste and strands the mention in its composer. Same slug the busy
+        // gate above already reads, so this pane is named or it is nobody.
+        deliverNudge: (ptyId, text) =>
+          submitBracketedPasteToPty(ptyId, text, {
+            agent: useStore.getState().surfaceAgent[ptyId]?.slug,
+          }),
         markDelivered: st.markChannelMentionDelivered,
         // 2f: rate cap unchanged; the first capped observation per window also
         // raises a one-shot user-visible toast (the cap itself only console-
