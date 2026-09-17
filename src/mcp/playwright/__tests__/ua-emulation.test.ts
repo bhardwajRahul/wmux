@@ -154,9 +154,11 @@ describe('applyUserAgentEmulation with a device preset', () => {
       mobile: false,
       hasTouch: false,
     });
+    // No maxTouchPoints at all. CDP validates the field whether or not touch
+    // is being enabled and refuses 0, so the 0 shape made every touch-off
+    // throw — and the reset path's catch hid it (#1357).
     expect(paramsOf(h.sent, 'Emulation.setTouchEmulationEnabled')).toEqual({
       enabled: false,
-      maxTouchPoints: 0,
     });
   });
 
@@ -198,9 +200,9 @@ describe('clearUserAgentEmulation', () => {
     await clearUserAgentEmulation(h.context);
 
     expect(methods(h.sent)).toContain('Emulation.clearDeviceMetricsOverride');
+    // Disabling carries no maxTouchPoints: CDP refuses 0 (#1357).
     expect(paramsOf(h.sent, 'Emulation.setTouchEmulationEnabled')).toEqual({
       enabled: false,
-      maxTouchPoints: 0,
     });
     // The real UA comes back with the real platform, not the preset's.
     const restored = h.sent.filter((s) => s.method === 'Emulation.setUserAgentOverride').pop()!;

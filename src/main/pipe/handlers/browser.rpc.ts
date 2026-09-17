@@ -3129,8 +3129,11 @@ export function registerBrowserRpc(
         // navigator.maxTouchPoints stayed 0 under a phone preset, contradicting
         // the UA the same call had just installed. Sent on both branches so a
         // desktop preset after a phone one actually turns touch back off.
+        // maxTouchPoints is omitted when disabling: CDP validates it either
+        // way and refuses 0 ("Touch points must be between 1 and 16"), so the
+        // 0 shape turned every touch-off into a caught error (#1357).
         await send('Emulation.setTouchEmulationEnabled', {
-          enabled: dm.hasTouch, maxTouchPoints: dm.hasTouch ? 5 : 0,
+          enabled: dm.hasTouch, ...(dm.hasTouch && { maxTouchPoints: 5 }),
         }).catch(() => {
           // Same guard the reset path has: a transport without touch
           // emulation must not take the whole preset down with it — the UA,
@@ -3183,7 +3186,9 @@ export function registerBrowserRpc(
       // The touch points the preset installed outlive clearDeviceMetricsOverride,
       // so a reset that skipped this left a desktop UA reporting a touchscreen.
       let touchDisabled = true;
-      await send('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 })
+      // No maxTouchPoints — CDP refuses 0 even when disabling, and the catch
+      // below turned that refusal into a silent no-op (#1357).
+      await send('Emulation.setTouchEmulationEnabled', { enabled: false })
         .catch(() => {
           // Swallowing this was how a reset could report success while
           // navigator.maxTouchPoints stayed at the preset's value (#1357).
