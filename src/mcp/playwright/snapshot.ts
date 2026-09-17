@@ -1283,7 +1283,21 @@ function stripNonInteractive(
   // crosses grafted out-of-process frames, whose ids collide with the main
   // frame's (editableRootsFor).
   const frame = frameOf(node, inheritedFrame);
-  if (isInteractive(node, editableRootsFor(frame, editableRoots))) return node;
+  if (isInteractive(node, editableRootsFor(frame, editableRoots))) {
+    // Kept — but its SUBTREE is filtered too (#1360). Returning the node whole
+    // was what still put `StaticText "Log in"` and `image` lines in a listing
+    // the caller had asked to be interactive-only: a link wrapping an icon and
+    // a label carries both, and the link's own `name` already says what they
+    // say. Nested controls (a listbox's options, a toolbar's buttons) are
+    // interactive themselves and survive this walk unchanged.
+    if (!node.children) return node;
+    const kept = node.children
+      .map((child) => stripNonInteractive(child, editableRoots, frame))
+      .filter((c): c is AXNode => c !== null);
+    return kept.length === node.children.length
+      ? node
+      : { ...node, ...(kept.length > 0 ? { children: kept } : { children: undefined }) };
+  }
   // An iframe ALWAYS survives the interactive filter. It is not interactive, so
   // it would otherwise vanish — and its disappearance is exactly the wrong
   // signal in both directions. For a frame that was never read, the controls

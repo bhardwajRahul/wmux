@@ -222,6 +222,18 @@ const NEARLY_EMPTY_TEXT_CHARS = 200;
 const SKELETON_MIN_ELEMENTS = 20;
 /** chars-per-element below which the DOM is mostly empty boxes. */
 const SKELETON_TEXT_PER_ELEMENT = 5;
+/**
+ * ...and an absolute ceiling on the text, for the same reason the nearly-empty
+ * verdict has one (#1360).
+ *
+ * A DENSITY below the ratio is not enough on its own: a large, fully rendered
+ * application screen has thousands of elements, so the ratio's budget grows
+ * with it and a page showing several screens' worth of readable text still
+ * came in under it while one long-poll was open. A page that has rendered this
+ * much text is not a skeleton whatever its element count, and the warning
+ * fired on finished pages all through the 2026-09-17 dogfood.
+ */
+const SKELETON_MAX_TEXT_CHARS = 2000;
 
 /**
  * The readiness note, or '' when the page looks normal.
@@ -269,6 +281,7 @@ export function describePageReadiness(
   if (
     pendingRequests > 0 &&
     facts.totalElements > SKELETON_MIN_ELEMENTS &&
+    facts.textChars < SKELETON_MAX_TEXT_CHARS &&
     facts.textChars < facts.totalElements * SKELETON_TEXT_PER_ELEMENT
   ) {
     return `skeleton screen likely — ${pendingRequests} request(s) in flight and little text rendered`;
