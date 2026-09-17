@@ -93,6 +93,14 @@ export interface ConnectionScope {
    */
   frameRefs?: unknown;
   /**
+   * Per-surface ref descriptors (role + name + nth-of-kind) for the last few
+   * snapshot generations, per connection for the same reason as snapshotCache:
+   * they decide which number an element keeps and which old ref may be
+   * recovered, so one agent's snapshot must never renumber another's. Typed as
+   * unknown to avoid an import cycle; refDescriptors owns the cast.
+   */
+  refDescriptors?: unknown;
+  /**
    * Random id identifying this connection as the OPENER of a browser surface.
    * Sent with every open so main can record who asked for a surface, and the
    * default target of a call that names none stays on this connection's own

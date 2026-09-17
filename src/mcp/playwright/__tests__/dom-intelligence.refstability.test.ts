@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { clearRefDescriptors } from '../refDescriptors';
 import {
   clearElementCache,
   getLocatorByRef,
@@ -590,9 +591,84 @@ describe('replay axis for a smart ref', () => {
   });
 });
 
+// #1355 — a ref number the latest snapshot does not carry is not automatically
+// a dead one. The listing can have been re-cut around an element that never
+// moved (a framework swapped the node, a dropdown opened above it), and
+// refusing every such ref made an agent re-snapshot before every interaction.
+describe('a ref from an earlier snapshot is recovered through its descriptor', () => {
+  it('resolves it, and says the ref came from an earlier snapshot', async () => {
+    clearElementCache();
+    clearRefDescriptors();
+    const page = makePage(
+      tree([
+        { backendId: 300, role: 'button', name: 'Open menu' },
+        { backendId: 301, role: 'link', name: 'Reports' },
+      ]),
+    );
+    await getSmartSnapshot(page);
+
+    // The framework re-rendered the link: same role, same accessible name, a
+    // brand new DOM node — so identity numbering cannot recognise it and the
+    // old ref 2 is absent from the new listing.
+    (page as unknown as FakePage).nodes = tree([
+      { backendId: 300, role: 'button', name: 'Open menu' },
+      { backendId: 302, role: 'link', name: 'Reports' },
+    ]);
+    const after = await getSmartSnapshot(page);
+    expect(refOf(after.elements, 'Reports')).not.toBe(2);
+
+    const notes: string[] = [];
+    expect(await resolveSmartRefLocator(page, 2, { notes })).toBe('link|Reports#0');
+    expect(notes).toEqual([
+      'note=smartRef 2 was from an earlier snapshot; resolved to the same element',
+    ]);
+  });
+
+  it('still reports stale when the element is genuinely gone', async () => {
+    clearElementCache();
+    clearRefDescriptors();
+    const page = makePage(
+      tree([
+        { backendId: 310, role: 'button', name: 'Delete draft' },
+        { backendId: 311, role: 'button', name: 'Keep' },
+      ]),
+    );
+    await getSmartSnapshot(page);
+
+    (page as unknown as FakePage).nodes = tree([
+      { backendId: 311, role: 'button', name: 'Keep' },
+    ]);
+    await getSmartSnapshot(page);
+
+    await expect(resolveSmartRefLocator(page, 1)).rejects.toThrow(/no longer in the page snapshot/);
+  });
+
+  it('still reports stale when two candidates match the descriptor', async () => {
+    clearElementCache();
+    clearRefDescriptors();
+    const page = makePage(tree([{ backendId: 320, role: 'button', name: 'Row' }]));
+    await getSmartSnapshot(page);
+
+    // The single row became two identical ones, both on new nodes. Picking
+    // either would be a coin flip, so the ref stays stale.
+    (page as unknown as FakePage).nodes = tree([
+      { backendId: 321, role: 'button', name: 'Row' },
+      { backendId: 322, role: 'button', name: 'Row' },
+    ]);
+    await getSmartSnapshot(page);
+
+    const notes: string[] = [];
+    await expect(resolveSmartRefLocator(page, 1, { notes })).rejects.toThrow(
+      /no longer in the page snapshot/,
+    );
+    expect(notes).toEqual([]);
+  });
+});
+
 describe('RPC lane keeps positional refs', () => {
   it('resolves a smart ref through the data attribute it tagged', async () => {
     clearElementCache();
+    clearRefDescriptors();
     // Identity cannot be held here: browser_snapshot's RPC fallback strips
     // data-wmux-ref document-wide and renumbers from 0 on each of its scans.
     const evaluate = async () => ({

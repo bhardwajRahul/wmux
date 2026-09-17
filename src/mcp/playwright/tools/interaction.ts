@@ -735,11 +735,18 @@ function requireSingleMatch(selector: string, count: number): void {
 }
 
 /** Resolve an address on the Playwright lane. Throws with the reason it failed. */
-async function resolveTypeTarget(page: Page, addr: RefAddress): Promise<TypeTarget> {
+async function resolveTypeTarget(
+  page: Page,
+  addr: RefAddress,
+  notes?: string[],
+): Promise<TypeTarget> {
   if (addr.smartRef !== undefined) {
     // Throws StaleSmartRefError rather than typing into a substitute — the same
-    // guarantee browser_click({smartRef}) gives.
-    return (await resolveSmartRefLocator(page, addr.smartRef)) as unknown as TypeTarget;
+    // guarantee browser_click({smartRef}) gives. A ref from an earlier snapshot
+    // that still names exactly one element is recovered, with a note (#1355).
+    return (await resolveSmartRefLocator(page, addr.smartRef, {
+      ...(notes && { notes }),
+    })) as unknown as TypeTarget;
   }
   if (addr.selector !== undefined) {
     requireCssSelector(addr.selector);
@@ -1270,7 +1277,10 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
               // DOM node identity now, so the cache is no longer a dense 1..n
               // range. Throws StaleSmartRefError rather than clicking a
               // substitute when the ref no longer names one live element.
-              const locator = await resolveSmartRefLocator(page, smartRef);
+              // A ref from an earlier snapshot that still names exactly one
+              // element resolves through its descriptor and says so (#1355).
+              const refNotes: string[] = [];
+              const locator = await resolveSmartRefLocator(page, smartRef, { notes: refNotes });
               const dispatch = await withModifiers(page, modifierKeys, () =>
                 clickWithApproach(page as unknown as ApproachPage, locator, !!double, tap),
               );
@@ -1291,7 +1301,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
                 });
               }
               return {
-                content: [{ type: 'text' as const, text: `Clicked${double ? ' (double)' : ''} element smartRef=${smartRef}${modifiersNote(modifierKeys)}${dispatchNote(!!tapper, double, dispatch)}${await popupNote()}` }],
+                content: [{ type: 'text' as const, text: `Clicked${double ? ' (double)' : ''} element smartRef=${smartRef}${modifiersNote(modifierKeys)}${dispatchNote(!!tapper, double, dispatch)}${refNotes.map((n) => `\n${n}`).join('')}${await popupNote()}` }],
               };
             }
 
@@ -1361,9 +1371,10 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
         // navigate the page out from under a later lookup.
         let isPassword: boolean;
         let segments: string[];
+        const refNotes: string[] = [];
 
         if (page) {
-          const el = await resolveTypeTarget(page, addr);
+          const el = await resolveTypeTarget(page, addr, refNotes);
           isPassword = await isPasswordElement(el);
           segments = await typeIntoTarget(page, el, text, { humanlike, newlineKey });
           if (submit) await page.keyboard.press('Enter');
@@ -1413,7 +1424,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
           content: [
             {
               type: 'text' as const,
-              text: `Typed "${echoed}" into element ${describeAddress(addr)}${lineNote}${submit ? ' and submitted' : ''}`,
+              text: `Typed "${echoed}" into element ${describeAddress(addr)}${lineNote}${submit ? ' and submitted' : ''}${refNotes.map((n) => `\n${n}`).join('')}`,
             },
           ],
         };

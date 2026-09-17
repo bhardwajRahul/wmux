@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
-import { buildDomSnapshotExpression } from '../dom-intelligence';
+import { buildDomSnapshotExpression, type DomSnapshotPayload } from '../dom-intelligence';
+import {
+  clearRefDescriptors,
+  nextRefFor,
+  priorRefDescriptors,
+  recordRefGeneration,
+  type RefDescriptor,
+} from '../refDescriptors';
 
 // Selector-scoped DOM snapshot (Phase 1): the expression runs against jsdom
 // (document/location are globals there), the same way the markdown-extractor
@@ -77,5 +84,48 @@ describe('buildDomSnapshotExpression filter:"interactive" (#1066)', () => {
     document.body.innerHTML = '<h1>Title</h1><button>Go</button>';
     const out = run(buildDomSnapshotExpression());
     expect(out).toContain('H1: Title');
+  });
+});
+
+// #1355 — the lane that actually renumbered. With plain positional numbering a
+// dropdown opening above a link moved it from ref 2 to ref 14, and the ref the
+// agent was holding then resolved to a menu item or was refused as stale.
+describe('buildDomSnapshotExpression stable numbering (#1355)', () => {
+  const NAV = '<a href="/home">Home</a><a href="/reports">Reports</a>';
+  const MENU = Array.from({ length: 12 }, (_, i) => `<button>Item ${i}</button>`).join('');
+
+  function listing(stable?: { prior: RefDescriptor[]; nextRef: number }): DomSnapshotPayload {
+    return run(
+      buildDomSnapshotExpression(undefined, { ...(stable && { stable }), withEntries: true }),
+    ) as unknown as DomSnapshotPayload;
+  }
+
+  it('gives an element the same number after a dropdown opens above it', () => {
+    clearRefDescriptors();
+    document.body.innerHTML = NAV;
+    const first = listing();
+    expect(first.entries.map((e) => e.ref)).toEqual([0, 1]);
+    recordRefGeneration('surface', 0, first.entries);
+
+    document.body.innerHTML = MENU + NAV;
+    const second = listing({
+      prior: priorRefDescriptors('surface', 0),
+      nextRef: nextRefFor('surface', 0),
+    });
+
+    const reports = second.entries.find((e) => e.name === 'Reports');
+    expect(reports?.ref).toBe(1);
+    expect(second.entries.find((e) => e.name === 'Home')?.ref).toBe(0);
+    // The attribute the agent clicks through carries the same number.
+    expect(document.querySelector('a[href="/reports"]')?.getAttribute('data-wmux-ref')).toBe('1');
+    // New elements take numbers after the previous maximum; nothing is reused.
+    expect(second.entries.find((e) => e.name === 'Item 0')?.ref).toBe(2);
+    expect(new Set(second.entries.map((e) => e.ref)).size).toBe(second.entries.length);
+  });
+
+  it('numbers from zero, exactly as before, when no history is supplied', () => {
+    clearRefDescriptors();
+    document.body.innerHTML = MENU + NAV;
+    expect(listing().entries.map((e) => e.ref)).toEqual([...Array(14).keys()]);
   });
 });

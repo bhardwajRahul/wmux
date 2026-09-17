@@ -70,7 +70,10 @@ describe('getSmartSnapshotViaEval', () => {
     await getSmartSnapshotViaEval(evaluate);
     const script = evaluate.mock.calls[0][0] as string;
     expect(script).toContain('data-wmux-ref');
-    expect(script).toContain('i + 1'); // 1-based, matches getSmartSnapshot / getLocatorByRef
+    // The numbering now comes from the shared stable-ref assignment, seeded
+    // 1-based to match getSmartSnapshot / getLocatorByRef (#1355).
+    expect(script).toContain('assignStableRefs');
+    expect(script).toContain('assigned.refs[i]');
     expect(script).toContain('button'); // INTERACTIVE_SELECTOR embedded
     expect(script).toContain('slice(0, 100)');
   });

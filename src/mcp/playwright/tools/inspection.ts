@@ -12,7 +12,8 @@ import {
   noteFrameRefsForScope,
   resolveRef,
 } from '../snapshot';
-import { buildDomSnapshotExpression } from '../dom-intelligence';
+import { buildDomSnapshotExpression, readDomSnapshotPayload } from '../dom-intelligence';
+import { nextRefFor, priorRefDescriptors, recordRefGeneration } from '../refDescriptors';
 import { pageEvaluator, rpcEvaluator } from '../page-eval';
 import { formatSnapshotResult } from '../snapshotDiff';
 import { getSnapshotBaseline, setSnapshotBaseline, snapshotSurfaceKey } from '../snapshotCache';
@@ -37,6 +38,17 @@ import {
 } from '../pageCapture';
 import { clampScreenshotCeilingBytes, MAX_SCREENSHOT_MAXBYTES } from '../../resultCap';
 import { formatRefBoxTable, refBoxCandidates } from '../screenshotRefs';
+
+/**
+ * Descriptor-history key for the DOM interactive listing (#1355).
+ *
+ * Per surface, because that is what a listing describes, and per selector,
+ * because a scoped listing numbers refs inside one subtree — its descriptors
+ * describe a different listing from the unscoped one's.
+ */
+function domListingKey(scope: BrowserTargetScope, selector: string | undefined): string {
+  return `dom:${browserScopeKey(scope)}:${selector ?? ''}`;
+}
 
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
@@ -358,11 +370,21 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             // mark any live Page's a11y refMap stale so resolveRef cannot use it.
             scopeRoute = '|dom';
             const evaluate = page ? pageEvaluator(page) : rpcEvaluator(scope);
+            // Stable numbering (#1355): an element still in the subtree keeps
+            // the number the previous listing gave it, so opening a dropdown no
+            // longer renumbers every ref the agent is holding.
+            const domKey = domListingKey(scope, selector);
+            const payload = readDomSnapshotPayload(await evaluate(
+              buildDomSnapshotExpression(selector, {
+                ...(filter && { filter }),
+                stable: { prior: priorRefDescriptors(domKey, 0), nextRef: nextRefFor(domKey, 0) },
+                withEntries: true,
+              }),
+            ));
             // The DOM listing carries the page URL and every link href verbatim,
             // so it gets the same URL redaction the network listing does.
-            text = redactPasswordParams(
-              String(await evaluate(buildDomSnapshotExpression(selector, { filter }))),
-            );
+            text = redactPasswordParams(String(payload.text));
+            if (payload.entries.length > 0) recordRefGeneration(domKey, 0, payload.entries);
             if (text.startsWith('No element matches selector:')) {
               // A miss is an error, not a snapshot — and must never become the
               // diff baseline for the next call (review consensus).
@@ -394,11 +416,18 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
           // Same expression the page-mode root-only fallthrough runs (snapshot.ts),
           // via the shared buildDomSnapshotExpression() helper — filter honored,
           // aria noted, same as there (#1066).
-          const result = await sendScopedBrowserRpc<{ value: string }>('browser.evaluate', scope, {
-            expression: buildDomSnapshotExpression(undefined, { filter }),
+          const domKey = domListingKey(scope, undefined);
+          const result = await sendScopedBrowserRpc<{ value: unknown }>('browser.evaluate', scope, {
+            expression: buildDomSnapshotExpression(undefined, {
+              ...(filter && { filter }),
+              stable: { prior: priorRefDescriptors(domKey, 0), nextRef: nextRefFor(domKey, 0) },
+              withEntries: true,
+            }),
           });
+          const payload = readDomSnapshotPayload(result.value);
           // Same URL redaction as the scoped DOM listing above.
-          text = redactPasswordParams(result.value);
+          text = redactPasswordParams(payload.text);
+          if (payload.entries.length > 0) recordRefGeneration(domKey, 0, payload.entries);
           if (format === 'aria') {
             text = `(note: aria format unavailable — no live page, returning the DOM interactive listing)\n${text}`;
           }

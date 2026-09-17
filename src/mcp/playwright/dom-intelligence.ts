@@ -8,6 +8,16 @@ import {
 } from './redact';
 import { ancestorContext } from '../../shared/browserReplay/actionTrace';
 import { getDomFacts } from './ownAttributes';
+import {
+  describeRetiredRef,
+  nextRefFor,
+  priorRefDescriptors,
+  recordRefGeneration,
+  recoveredRefNote,
+  STABLE_REF_ASSIGNMENT_JS,
+  uniqueDescriptorMatch,
+  type RefDescriptor,
+} from './refDescriptors';
 
 // ---------------------------------------------------------------------------
 // Shared interactive-element selector
@@ -46,9 +56,21 @@ export const INTERACTIVE_SELECTOR =
  * retain a stale ref that collides with the fresh numbering.
  *
  * Stale-tag hygiene: prior `data-wmux-ref` attributes are removed before
- * re-numbering from 0. Without this, a shrunk interactive set between two
- * snapshots would leave two elements sharing one ref, and resolveRef's
- * `.first()` data-attr fallback (snapshot.ts) could pick the wrong one.
+ * re-numbering. Without this, a shrunk interactive set between two snapshots
+ * would leave two elements sharing one ref, and resolveRef's `.first()`
+ * data-attr fallback (snapshot.ts) could pick the wrong one.
+ *
+ * `stable` (optional) makes the numbering survive a re-listing: an element
+ * whose descriptor matches one of the last few generations keeps its number and
+ * only genuinely new elements take numbers after the previous maximum (#1355).
+ * Without it the walk numbers from 0 exactly as it always did — opening a
+ * dropdown then moved a link from ref 2 to ref 14 and invalidated the ref the
+ * agent was holding. The assignment rule is shipped into the page as source
+ * text from refDescriptors so the page and the caller cannot disagree about it.
+ *
+ * `withEntries` returns `{ text, entries }` instead of the bare listing, so the
+ * caller can record what this generation's numbers meant. Callers that do not
+ * ask keep the string return they always had.
  *
  * `filter: 'interactive'` drops the heading (h1–h3) listing so the output is
  * the ref listing alone — the DOM-path equivalent of stripNonInteractive on
@@ -56,19 +78,73 @@ export const INTERACTIVE_SELECTOR =
  * The `Page:`/`URL:` header always stays: the auto-diff URL guard in
  * inspection.ts parses the `URL: …` line out of this text.
  */
+export interface DomSnapshotEntry {
+  ref: number;
+  role: string;
+  name: string;
+}
+
+export interface DomSnapshotPayload {
+  text: string;
+  entries: DomSnapshotEntry[];
+}
+
+export interface DomSnapshotExpressionOptions {
+  filter?: 'interactive';
+  /** Previous generations' descriptors + the first unspent number (#1355). */
+  stable?: { prior: readonly RefDescriptor[]; nextRef: number };
+  /** Return `{ text, entries }` rather than the listing text alone. */
+  withEntries?: boolean;
+}
+
+/**
+ * Read back what `buildDomSnapshotExpression({ withEntries: true })` returned.
+ *
+ * Tolerant of a bare string, because not every transport preserves an object:
+ * the RPC bridge and some test doubles hand the listing back as text. Losing
+ * the entries only costs the NEXT listing its stable numbering, which is what
+ * the lane did before — a snapshot that reads as empty would be a regression.
+ */
+export function readDomSnapshotPayload(raw: unknown): DomSnapshotPayload {
+  if (typeof raw === 'string') return { text: raw, entries: [] };
+  const payload = raw as Partial<DomSnapshotPayload> | null | undefined;
+  return {
+    text: typeof payload?.text === 'string' ? payload.text : String(raw ?? ''),
+    entries: Array.isArray(payload?.entries) ? payload.entries : [],
+  };
+}
+
 export function buildDomSnapshotExpression(
   rootSelector?: string,
-  opts?: { filter?: 'interactive' },
+  opts?: DomSnapshotExpressionOptions,
 ): string {
+  const miss = `'No element matches selector: ' + rootSel`;
   return `(() => {
     const sel = ${JSON.stringify(INTERACTIVE_SELECTOR)};
     const rootSel = ${JSON.stringify(rootSelector ?? null)};
     const interactiveOnly = ${JSON.stringify(opts?.filter === 'interactive')};
+    const withEntries = ${JSON.stringify(opts?.withEntries === true)};
+    const assignStableRefs = (${STABLE_REF_ASSIGNMENT_JS});
+    const prior = ${JSON.stringify(opts?.stable?.prior ?? [])};
+    const seedNext = ${JSON.stringify(opts?.stable?.nextRef ?? 0)};
     const root = rootSel ? document.querySelector(rootSel) : document;
-    if (!root) return 'No element matches selector: ' + rootSel;
+    if (!root) return withEntries ? { text: ${miss}, entries: [] } : ${miss};
     document.querySelectorAll('[data-wmux-ref]').forEach(el => el.removeAttribute('data-wmux-ref'));
     const interactives = [...root.querySelectorAll(sel)].slice(0, 100);
-    interactives.forEach((el, i) => el.setAttribute('data-wmux-ref', String(i)));
+    // The descriptor this lane identifies an element by. Only ever compared
+    // against descriptors this same lane recorded, so the tag-name role and the
+    // label-or-text name need agree with nothing else.
+    const described = interactives.map(el => ({
+      role: el.getAttribute('role') || el.tagName.toLowerCase(),
+      name: (el.getAttribute('aria-label')
+        || (el.textContent || '').trim()
+        || el.getAttribute('placeholder')
+        || el.getAttribute('name')
+        || '').substring(0, 120),
+    }));
+    const assigned = assignStableRefs(prior, seedNext, described);
+    const refs = assigned.refs;
+    interactives.forEach((el, i) => el.setAttribute('data-wmux-ref', String(refs[i])));
     const title = document.title;
     const url = location.href;
     const lines = ['Page: ' + title, 'URL: ' + url, ''];
@@ -86,7 +162,7 @@ export function buildDomSnapshotExpression(
       const type = el.getAttribute('type') || '';
       const placeholder = el.getAttribute('placeholder') || '';
       const href = el.getAttribute('href') || '';
-      let desc = '  [ref=' + i + '] ' + tag;
+      let desc = '  [ref=' + refs[i] + '] ' + tag;
       if (type) desc += '[type=' + type + ']';
       if (role) desc += '[role=' + role + ']';
       if (name) desc += ' name="' + name + '"';
@@ -96,7 +172,12 @@ export function buildDomSnapshotExpression(
       if (href) desc += ' -> ' + href.substring(0, 60);
       lines.push(desc);
     });
-    return lines.join('\\n');
+    const text = lines.join('\\n');
+    if (!withEntries) return text;
+    return {
+      text,
+      entries: described.map((d, i) => ({ ref: refs[i], role: d.role, name: d.name })),
+    };
   })()`;
 }
 
@@ -384,6 +465,23 @@ function pageId(page: Page): number {
 export function smartPageToken(page: Page): string {
   const identity = pageSmartRefIdentity.get(page);
   return `p${pageId(page)}e${identity?.documentEpoch ?? 0}`;
+}
+
+/**
+ * Descriptor-history key for the CDP smart lane.
+ *
+ * `smartPageToken` carries the page AND its document epoch, so a reload or a
+ * navigation starts a fresh history rather than letting a ref from the old
+ * document be recovered against the new one — which is the same boundary
+ * resolveSmartRefLocator refuses outright.
+ */
+function smartDescriptorKey(page: Page, surfaceId: string | undefined): string {
+  return `smart:${surfaceId ?? ''}:${smartPageToken(page)}`;
+}
+
+/** Descriptor-history key for the page-less RPC smart lane. */
+function rpcSmartDescriptorKey(surfaceId: string | undefined): string {
+  return `rpc-smart:${surfaceId ?? ''}`;
 }
 
 /**
@@ -792,6 +890,11 @@ export async function getSmartSnapshot(
     generation: identity?.generation ?? 0,
     documentEpoch: identity?.documentEpoch ?? 0,
   });
+  // What these numbers MEAN, so a ref from a generation or two ago can still be
+  // resolved through its descriptor when this snapshot no longer lists it
+  // (#1355). Numbering itself is keyed on backendDOMNodeId on this lane and is
+  // not touched by the history.
+  recordRefGeneration(smartDescriptorKey(page, options?.surfaceId), 1, elements);
 
   return { url, title, elements, content };
 }
@@ -805,14 +908,15 @@ export async function getSmartSnapshot(
  * channel. Lower role fidelity than the AX tree (tag/role heuristic) — the
  * accepted packaged-mode degradation; the dev path keeps full fidelity.
  *
- * Refs on this lane stay POSITIONAL (1-based walk order), unlike the CDP lane
- * above. Identity cannot be held here: the only place to keep it is the
- * `data-wmux-ref` attribute, and browser_snapshot's RPC fallback strips every
- * one of those document-wide and renumbers from 0 on each of its own scans
- * (buildDomSnapshotExpression, above). An interleaved browser_snapshot would
- * therefore either wipe the identity or, worse, leave 0-based numbers behind
- * for this scan to adopt as its own. browser_smart_snapshot skips diffing on
- * this lane for exactly that reason (tools/extraction.ts).
+ * Refs on this lane are no longer positional walk order: they come from the
+ * per-surface descriptor history (#1355), so an element still on the page keeps
+ * the number it had and only a new one takes a number after the previous
+ * maximum. The identity lives in this process, not in the page — the
+ * `data-wmux-ref` attribute is only the stamp that makes a number locatable,
+ * and browser_snapshot's RPC fallback still strips every one of those
+ * document-wide on each of its own scans (buildDomSnapshotExpression, above).
+ * An interleaved browser_snapshot therefore still wipes the STAMPS, which is
+ * why browser_smart_snapshot skips diffing on this lane (tools/extraction.ts).
  *
  * Each interactive element is tagged `data-wmux-ref="<ref>"` with the
  * SAME 1-based number, so:
@@ -830,6 +934,14 @@ export async function getSmartSnapshotViaEval(
     0,
     Math.floor(options?.maxContentLength ?? DEFAULT_MAX_CONTENT_LENGTH),
   );
+
+  // Numbering survives a re-snapshot on this lane too (#1355): an element whose
+  // descriptor matches one of the last generations keeps its number, and only a
+  // genuinely new element takes one after the previous maximum. Positional
+  // numbering was what moved a link from ref 2 to ref 14 when a dropdown opened.
+  const descriptorKey = rpcSmartDescriptorKey(options?.surfaceId);
+  const prior = priorRefDescriptors(descriptorKey, 1);
+  const seedNext = nextRefFor(descriptorKey, 1);
 
   // Note: the selector + .slice(0, 100) cap + data-wmux-ref tagging mirror
   // browser_snapshot's RPC fallback (inspection.ts) via INTERACTIVE_SELECTOR.
@@ -857,15 +969,20 @@ export async function getSmartSnapshotViaEval(
       if (el.getAttribute('contenteditable') === 'true') return 'textbox';
       return 'generic';
     };
+    const nameFor = (el) => (el.getAttribute('aria-label')
+      || (el.textContent || '').trim()
+      || el.getAttribute('placeholder')
+      || el.getAttribute('name')
+      || '').substring(0, 120);
+    const assignStableRefs = (${STABLE_REF_ASSIGNMENT_JS});
+    const described = els.map((el) => ({ role: roleFor(el), name: nameFor(el) }));
+    // 1-based — matches getSmartSnapshot / getLocatorByRef.
+    const assigned = assignStableRefs(${JSON.stringify(prior)}, ${JSON.stringify(seedNext)}, described);
     const elements = els.map((el, i) => {
-      const ref = i + 1; // 1-based — matches getSmartSnapshot / getLocatorByRef
+      const ref = assigned.refs[i];
       el.setAttribute('data-wmux-ref', String(ref));
-      const name = (el.getAttribute('aria-label')
-        || (el.textContent || '').trim()
-        || el.getAttribute('placeholder')
-        || el.getAttribute('name')
-        || '').substring(0, 120);
-      const out = { ref, role: roleFor(el), name };
+      const name = described[i].name;
+      const out = { ref, role: described[i].role, name };
       // el.value is the plaintext for EVERY input type, password included —
       // this path has no a11y tree doing the masking for it (redact.ts).
       const val = el.value;
@@ -918,6 +1035,7 @@ export async function getSmartSnapshotViaEval(
     generation: 0,
     documentEpoch: 0,
   });
+  recordRefGeneration(descriptorKey, 1, elements);
 
   return {
     url: raw?.url ?? '',
@@ -997,6 +1115,16 @@ export class StaleSmartRefError extends Error {
 
 const RESNAPSHOT = 'Run browser_smart_snapshot to get current refs.';
 
+export interface ResolveSmartRefOptions {
+  /**
+   * Sink for anything the caller should pass on to the agent — today only the
+   * "this ref came from an earlier snapshot" note (#1355). A sink rather than a
+   * return value because the resolver's contract is a Locator, and every
+   * existing caller that does not care keeps its one-line call.
+   */
+  notes?: string[];
+}
+
 /**
  * Resolve a smart ref to a live Playwright locator.
  *
@@ -1013,9 +1141,14 @@ const RESNAPSHOT = 'Run browser_smart_snapshot to get current refs.';
  * resolved to whatever now sat at that index and reported a successful click
  * (review 2) — the older positional locator at least failed to parse.
  */
-export async function resolveSmartRefLocator(page: Page, ref: number): Promise<Locator> {
+export async function resolveSmartRefLocator(
+  page: Page,
+  ref: number,
+  options?: ResolveSmartRefOptions,
+): Promise<Locator> {
   const record = getSnapshotRecord();
-  const element = record.elements.find((e) => e.ref === ref);
+  let element = record.elements.find((e) => e.ref === ref);
+  let recovered = '';
 
   // Wrong page, whatever the ref says. Checked before anything else: on the
   // CDP lane the refs belong to ONE page, and every check below would
@@ -1048,6 +1181,25 @@ export async function resolveSmartRefLocator(page: Page, ref: number): Promise<L
   }
 
   if (!element) {
+    // A ref the latest snapshot does not carry is not automatically a dead one
+    // (#1355): the listing can have been re-cut around an element that never
+    // moved. Look the number up in the descriptor history and see whether the
+    // current listing holds exactly one element it can name. Exactly one is
+    // acted on, with a note saying so; zero or several keep the stale error
+    // below, because a guess between two look-alikes is worse than a refusal.
+    const descriptorKey =
+      record.page === null
+        ? rpcSmartDescriptorKey(record.surfaceId)
+        : smartDescriptorKey(page, record.surfaceId);
+    const descriptor = describeRetiredRef(descriptorKey, ref);
+    const match = descriptor ? uniqueDescriptorMatch(descriptor, record.elements) : null;
+    if (match) {
+      element = match;
+      recovered = recoveredRefNote(ref, 'smartRef');
+    }
+  }
+
+  if (!element) {
     // The number was handed out on this document but the latest snapshot does
     // not list it: the element it named is gone. The number is never reissued,
     // so retrying cannot help — only re-snapshotting can.
@@ -1060,7 +1212,10 @@ export async function resolveSmartRefLocator(page: Page, ref: number): Promise<L
     throw new StaleSmartRefError(`Element with smartRef=${ref} not found. ${RESNAPSHOT}`);
   }
 
-  if (element.locator.startsWith('[data-wmux-ref=')) return page.locator(element.locator);
+  if (element.locator.startsWith('[data-wmux-ref=')) {
+    if (recovered) options?.notes?.push(recovered);
+    return page.locator(element.locator);
+  }
 
   const role = element.role as Parameters<Page['getByRole']>[0];
   // `exact: true` (review 1): getByRole's name filter is substring- and
@@ -1105,6 +1260,7 @@ export async function resolveSmartRefLocator(page: Page, ref: number): Promise<L
     );
   }
 
+  if (recovered) options?.notes?.push(recovered);
   return locator.nth(Math.min(index, count - 1));
 }
 
