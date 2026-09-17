@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { PlaywrightEngine } from '../PlaywrightEngine';
 import { withAutomationLease } from '../automationLease';
 import { getSmartSnapshot, getSmartSnapshotViaEval, smartPageToken } from '../dom-intelligence';
-import { extractMarkdown, extractStructuredData } from '../markdown-extractor';
+import { extractMarkdown, extractStructuredDataWithNotes } from '../markdown-extractor';
 import { resolveEvaluator, rpcEvaluator } from '../page-eval';
 import { formatSnapshotResult } from '../snapshotDiff';
 import { getSnapshotBaseline, setSnapshotBaseline, snapshotSurfaceKey } from '../snapshotCache';
@@ -228,13 +228,19 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
         // RPC fallback when not (packaged builds, issue #105).
         const page = await engine.getPageForScope(scope).catch(allowScopedRpcFallback);
 
-        const records = await extractStructuredData(page, scope, goal, fields);
+        const { records, notes } = await extractStructuredDataWithNotes(page, scope, goal, fields);
+
+        // Caveats ride along after the JSON, the same way browser_snapshot
+        // appends its truncation note (issue #1353): a positional column guess
+        // or a one-field-only mapping is still a result, but the agent has to
+        // know it is a guess.
+        const note = notes.length > 0 ? `\n\n(${notes.join('; ')})` : '';
 
         return {
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify(records, null, 2),
+              text: JSON.stringify(records, null, 2) + note,
             },
           ],
         };

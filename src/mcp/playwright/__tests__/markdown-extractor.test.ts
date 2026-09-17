@@ -104,7 +104,8 @@ describe('extractStructuredData', () => {
 
   it('returns table data (strategy 1) from the native page path', async () => {
     const rows = [{ name: 'a', price: '1' }];
-    const page = { evaluate: vi.fn().mockResolvedValueOnce(rows) };
+    // The table strategy resolves { records, note } (issue #1353).
+    const page = { evaluate: vi.fn().mockResolvedValueOnce({ records: rows, note: null }) };
     const out = await extractStructuredData(page as never, { workspaceId: 'ws-test' }, 'goal', {
       name: 'string',
       price: 'number',
@@ -118,9 +119,9 @@ describe('extractStructuredData', () => {
     const page = {
       evaluate: vi
         .fn()
-        .mockResolvedValueOnce([]) // tables
+        .mockResolvedValueOnce({ records: [], note: null }) // tables
         .mockResolvedValueOnce([]) // lists
-        .mockResolvedValueOnce(repeated), // repeated
+        .mockResolvedValueOnce({ records: repeated, note: null }), // repeated
     };
     const out = await extractStructuredData(page as never, { workspaceId: 'ws-test' }, 'goal', { title: 'string' });
     expect(out).toEqual(repeated);
@@ -128,7 +129,7 @@ describe('extractStructuredData', () => {
   });
 
   it('uses the RPC fallback when no page is available', async () => {
-    mockSendRpc.mockResolvedValueOnce({ value: [{ name: 'rpc' }] });
+    mockSendRpc.mockResolvedValueOnce({ value: { records: [{ name: 'rpc' }], note: null } });
     const out = await extractStructuredData(
       null,
       { workspaceId: 'ws-test', surfaceId: 'surf' },
