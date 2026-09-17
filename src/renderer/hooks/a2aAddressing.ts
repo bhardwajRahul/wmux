@@ -6,6 +6,7 @@
 import type { PaneLeaf } from '../../shared/types';
 import { getLeafPanes } from '../../shared/paneUtils';
 import { isBrainPtyId } from '../../shared/constants';
+import { submitProfileForAgent, type SubmitAssurance } from '../../shared/ptyMessageDelivery';
 
 export type PaneAddress = { ptyId: string; paneId: string; surfaceId: string };
 
@@ -387,3 +388,56 @@ export function maxSideMessages(history: ReadonlyArray<{ kind: string; role?: st
  *  costs nothing to honor: continue by having the human open a fresh task
  *  that references this one. */
 export const REPLY_ROUND_CAP = 5;
+
+// ---------------------------------------------------------------------------
+// Delivery receipt honesty (#1337)
+// ---------------------------------------------------------------------------
+//
+// `notified: true` has only ever meant "a pane with a live pty was resolved and
+// written to". It has never meant "the receiving agent started a turn": the
+// paste write's result is discarded, the Enter that submits it goes out on a
+// timer AFTER the RPC has already answered, and no signal comes back from the
+// composer either way.
+//
+// For a Claude Code pane that gap is small enough to ignore: a CR into its
+// composer submits. For a Codex CLI pane it is the whole bug in #1337 — the
+// nudge landed in the composer, the agent never woke, and the sender got the
+// same receipt a woken agent produces, so it waited on a turn that was never
+// going to start.
+//
+// So the receipt now carries what wmux actually proved. `notified` keeps its
+// meaning (a push signal WAS written — no existing consumer breaks) and
+// `submit` says whether the Enter can be claimed as a real submit.
+//
+//   submit: 'assured'      a Claude Code pane that is not sitting on a dialog.
+//   submit: 'unverified'   everyone else: Codex, any other agent, a pane whose
+//                          agent could not be named, and a Claude pane at
+//                          `awaiting_input` (there the CR answers the dialog
+//                          rather than starting a turn). The bytes went out;
+//                          what the composer did with them is not observable.
+
+/** Guidance shipped alongside `submit: 'unverified'`. Names the concrete next
+ *  action, like every other `delivery.hint` on this path. */
+export const UNVERIFIED_SUBMIT_HINT =
+  'The nudge was written into the target pane, but wmux cannot confirm that agent submitted ' +
+  'it (only an idle Claude Code pane reports turn start). Do not block on a turn starting: the ' +
+  'task is stored, the receiver can poll a2a_task_query, and a human may need to press Enter in ' +
+  'that pane.';
+
+/**
+ * The `submit` / `hint` half of a successful `delivery` record, for a write
+ * that actually reached a pty. Takes the agent of THAT pty (see `ptyAgent` in
+ * useRpcBridge) rather than the caller's liveness metadata, which can name a
+ * workspace-level agent that does not own the pane the bytes went to.
+ *
+ * Split out of useRpcBridge so it is unit testable and so both send branches
+ * cannot drift apart.
+ */
+export function submitReceiptFields(
+  pane: { name?: string; status?: string },
+): { submit: SubmitAssurance; hint?: string } {
+  const { assurance } = submitProfileForAgent(pane.name, pane.status);
+  return assurance === 'assured'
+    ? { submit: assurance }
+    : { submit: assurance, hint: UNVERIFIED_SUBMIT_HINT };
+}
