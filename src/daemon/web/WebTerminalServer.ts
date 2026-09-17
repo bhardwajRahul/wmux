@@ -1825,10 +1825,10 @@ export class WebTerminalServer {
     if (p.startsWith('/api/sessions/')) {
       const rest = p.slice('/api/sessions/'.length);
       if (req.method === 'GET' && rest.endsWith('/diff')) {
-        return this.handleSessionDiff(res, rest.slice(0, -'/diff'.length));
+        return this.handleSessionDiff(res, rest.slice(0, -'/diff'.length), principal);
       }
       if (req.method === 'GET' && rest.endsWith('/commands')) {
-        return this.handleSessionCommands(res, rest.slice(0, -'/commands'.length));
+        return this.handleSessionCommands(res, rest.slice(0, -'/commands'.length), principal);
       }
       if (req.method === 'GET' && rest.endsWith('/turns/block')) {
         return this.handleSessionTurnBlock(req, res, rest.slice(0, -'/turns/block'.length));
@@ -1837,7 +1837,7 @@ export class WebTerminalServer {
         return this.handleSessionTurns(req, res, rest.slice(0, -'/turns'.length), principal);
       }
       if (req.method === 'POST' && rest.endsWith('/resize')) {
-        return this.handleSessionResize(req, res, rest.slice(0, -'/resize'.length));
+        return this.handleSessionResize(req, res, rest.slice(0, -'/resize'.length), principal);
       }
       if (req.method === 'DELETE') {
         return this.handleSessionDelete(res, rest, principal);
@@ -2238,10 +2238,10 @@ export class WebTerminalServer {
    * `not-a-git-repo` is a 409, not a 500: a pane running in `~` is completely
    * normal and the phone should say "no repository here", not "something broke".
    */
-  private async handleSessionDiff(res: http.ServerResponse, rawId: string): Promise<void> {
+  private async handleSessionDiff(res: http.ServerResponse, rawId: string, principal: WebPrincipal): Promise<void> {
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    const managed = this.deps.sessionManager.getSession(id);
+    const managed = this.attachableSession(principal, id);
     if (!managed) return this.json(res, 404, { error: 'session not found' });
 
     // Absent only for a session record written before spawnCwd existed. Every
@@ -2319,10 +2319,10 @@ export class WebTerminalServer {
    * an empty list rather than a refusal — "this pane has no commands" is a
    * usable answer for a composer, "409" is not.
    */
-  private handleSessionCommands(res: http.ServerResponse, rawId: string): void {
+  private handleSessionCommands(res: http.ServerResponse, rawId: string, principal: WebPrincipal): void {
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    const managed = this.deps.sessionManager.getSession(id);
+    const managed = this.attachableSession(principal, id);
     if (!managed) return this.json(res, 404, { error: 'session not found' });
 
     const cwd = managed.meta.spawnCwd;
@@ -2500,6 +2500,29 @@ export class WebTerminalServer {
   }
 
   /**
+   * The pane THIS caller may attach to (stream bytes from, type into), or null.
+   *
+   * #1388 — the byte routes resolved their pane with a bare `getSession`, so
+   * a paired device that learned a brain id could open `/api/stream?session=`
+   * on it and read the orchestrator's raw terminal, while `/api/sessions` and
+   * the transcript routes had long refused the same id. The exclusion could
+   * not simply be added to `handleStream`: the operator token legitimately
+   * streams every pane, brain included (the desktop's own remote mirror rides
+   * this route). So the gate follows the credential class — a device gets
+   * `readableSession`'s answer, the operator keeps `getSession`'s. Every
+   * per-pane route a device can reach (stream, input, resize, delete, diff,
+   * commands) resolves through here, so the 404 is the same on all of them.
+   */
+  private attachableSession(
+    principal: WebPrincipal,
+    sessionId: string,
+  ): ReturnType<DaemonSessionManager['getSession']> {
+    return principal.kind === 'operator'
+      ? this.deps.sessionManager.getSession(sessionId)
+      : this.readableSession(sessionId);
+  }
+
+  /**
    * `GET /api/sessions/:id/turns/block?srcOffset=&n=&eventId=` — the body behind
    * a code-block or tool-body chip, the phone's half of what the desktop does
    * over `daemon.transcript.codeBlock`.
@@ -2593,10 +2616,11 @@ export class WebTerminalServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
     rawId: string,
+    principal: WebPrincipal,
   ): void {
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    const managed = this.deps.sessionManager.getSession(id);
+    const managed = this.attachableSession(principal, id);
     if (!managed) return this.json(res, 404, { error: 'session not found' });
 
     this.readJsonBody(req, res, (body) => {
@@ -2616,7 +2640,7 @@ export class WebTerminalServer {
       // Re-read rather than trusting the lookup above: the body arrives over
       // however many TCP segments it takes, and a pane can die or be attached
       // by the desk in between.
-      const current = this.deps.sessionManager.getSession(id);
+      const current = this.attachableSession(principal, id);
       if (!current) return this.json(res, 404, { error: 'session not found' });
       if (current.meta.state === 'attached' && current.viewerVisible) {
         return this.json(res, 409, {
@@ -2860,7 +2884,7 @@ export class WebTerminalServer {
 
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    if (!this.deps.sessionManager.getSession(id)) {
+    if (!this.attachableSession(principal, id)) {
       return this.json(res, 404, { error: 'session not found' });
     }
     lifecycle
@@ -2905,7 +2929,7 @@ export class WebTerminalServer {
     principal: WebPrincipal,
   ): void {
     const sessionId = url.searchParams.get('session') ?? '';
-    const managed = this.deps.sessionManager.getSession(sessionId);
+    const managed = this.attachableSession(principal, sessionId);
     if (!managed) {
       return this.json(res, 404, { error: 'session not found' });
     }
@@ -3067,7 +3091,9 @@ export class WebTerminalServer {
       return this.refuseInput(res, principal, 'typing runs commands on this machine');
     }
     const sessionId = url.searchParams.get('session') ?? '';
-    const managed = this.deps.sessionManager.getSession(sessionId);
+    // Same class gate as the stream (#1388): a device must not be able to
+    // type into the orchestrator's pane either.
+    const managed = this.attachableSession(principal, sessionId);
     if (!managed) {
       return this.json(res, 404, { error: 'session not found' });
     }
