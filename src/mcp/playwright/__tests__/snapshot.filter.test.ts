@@ -52,4 +52,42 @@ describe('generateSnapshot filter:"interactive"', () => {
     expect(out).toContain('paragraph');
     expect(out).toContain('button');
   });
+
+  // #1360 (the CDP lane's half of #1066): a kept node used to be returned with
+  // its WHOLE subtree, so the text and image lines under a link survived a
+  // filter that exists to remove exactly those.
+  const WRAPPED: CdpNode[] = [
+    { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, name: { type: 'name', value: 'Page' }, childIds: ['2'] },
+    { nodeId: '2', role: { type: 'role', value: 'link' }, name: { type: 'name', value: 'Log in' }, childIds: ['3', '4', '5'] },
+    { nodeId: '3', role: { type: 'role', value: 'image' }, name: { type: 'name', value: 'lock icon' }, childIds: [] },
+    { nodeId: '4', role: { type: 'role', value: 'StaticText' }, name: { type: 'name', value: 'Log in' }, childIds: [] },
+    { nodeId: '5', role: { type: 'role', value: 'button' }, name: { type: 'name', value: 'Nested' }, childIds: [] },
+  ];
+
+  it('strips the text and image lines under a kept interactive node', async () => {
+    const out = await generateSnapshot(makePage(WRAPPED) as never, {
+      format: 'ai',
+      filter: 'interactive',
+    });
+
+    expect(out).toContain('link');
+    expect(out).not.toContain('image');
+    expect(out).not.toContain('StaticText');
+  });
+
+  it('keeps an interactive node nested inside another one', async () => {
+    const out = await generateSnapshot(makePage(WRAPPED) as never, {
+      format: 'ai',
+      filter: 'interactive',
+    });
+
+    expect(out).toContain('"Nested"');
+  });
+
+  it('without the filter the wrapped text and image lines are still there', async () => {
+    const out = await generateSnapshot(makePage(WRAPPED) as never, { format: 'ai' });
+
+    expect(out).toContain('image');
+    expect(out).toContain('StaticText');
+  });
 });

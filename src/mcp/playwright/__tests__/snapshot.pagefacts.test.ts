@@ -71,6 +71,23 @@ describe('pageFacts: readiness verdicts', () => {
   it('says nothing about an ordinary page', () => {
     expect(describePageReadiness(facts(), 5)).toBe('');
   });
+
+  it('[fix #1360] stays quiet about a big screen that HAS rendered its text', () => {
+    // The ratio's budget grows with the element count, so a large application
+    // screen showing several screens' worth of readable text still came in
+    // under 5 chars/element while one long-poll was open — and was called a
+    // skeleton. An absolute text ceiling is what separates the two.
+    expect(
+      describePageReadiness(facts({ totalElements: 4000, textChars: 9000 }), 2),
+    ).toBe('');
+  });
+
+  it('[fix #1360] still calls a genuinely empty-boxed page a skeleton', () => {
+    // Same element count, a hundredth of the text: this one really is boxes.
+    expect(
+      describePageReadiness(facts({ totalElements: 4000, textChars: 90 }), 2),
+    ).toContain('skeleton screen likely');
+  });
 });
 
 describe('pageFacts: scrollable reporting rules', () => {

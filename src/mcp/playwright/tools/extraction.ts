@@ -89,7 +89,7 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_smart_snapshot',
-    'Indexed interactive elements plus clean page text. Pass a returned ref to browser_click as smartRef. A repeat call returns a diff; pass full:true for the whole listing.',
+    'Indexed interactive elements plus clean page text. Pass a returned ref to browser_click as smartRef. On the chrome backend a repeat call returns a diff (full:true forces the whole listing); the packaged RPC lane numbers refs by position, so it returns the full listing every time and says so.',
     BROWSER_SMART_SNAPSHOT_SHAPE,
     async ({ maxContentLength, full, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
@@ -162,10 +162,17 @@ export function registerExtractionTools(server: McpServer, deps: BrowserToolDeps
         // The content summary is cut at maxContentLength, so a diff — "(no
         // changes)" most of all — speaks only for what fits (review 10).
         const truncated = snapshot.content.endsWith('... (truncated)');
-        const note =
+        let note =
           rendered.usedDiff && truncated
             ? `\n(page text is capped at ${capLength} characters; anything past the cut is not compared)`
             : '';
+        // #1360: "a repeat call returns a diff" is true only where refs are
+        // keyed on DOM identity. On this lane they are positional, so the tool
+        // silently returned the full tree every time and looked broken. Say
+        // which it is instead of leaving the caller to infer it.
+        if (!page && !full) {
+          note += '\n(no diff on this backend: refs here are numbered by walk position, so a single insertion renumbers the listing and a diff would be noise. The chrome backend diffs.)';
+        }
 
         return {
           content: [{ type: 'text' as const, text: rendered.text + note }],

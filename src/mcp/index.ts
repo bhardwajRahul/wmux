@@ -97,7 +97,10 @@ const maxBytesParam = z
 // `<TOOLNAME>_SHAPE` naming mirrors the tool name 1:1. Tools whose param object
 // is empty (`{}`) are left inline: an empty object holds no zod schema to share.
 const BROWSER_OPEN_SHAPE = {
-  url: z.string().optional().describe('Defaults to google.com.'),
+  // #1360: this said "defaults to google.com", which the chrome backend never
+  // did — it opens about:blank. Only the builtin panel has a start page, and
+  // only when it has to create a pane.
+  url: z.string().optional().describe('Omit for a blank page (the builtin panel shows its start page).'),
 };
 
 const BROWSER_CLOSE_SHAPE = {
