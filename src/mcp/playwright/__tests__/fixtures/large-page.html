@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Large page fixture</title>
+  </head>
+  <body>
+    <h1>Large page fixture</h1>
+    <!--
+      ~5000 accessibility nodes: 500 rows x (row container + label + value +
+      button + link). One row in the middle carries the needle word, so a `q`
+      that asks for it has exactly one answer on a page whose tree is large
+      enough for the fetch/serialise cost to be measurable (#1356).
+    -->
+    <main id="rows"></main>
+    <script>
+      const rows = document.getElementById('rows');
+      const html = [];
+      for (let i = 0; i < 500; i++) {
+        const needle = i === 250 ? ' data-needle="1" id="needle-row"' : '';
+        const word = i === 250 ? 'Unobtainium' : 'Widget';
+        html.push(
+          '<section' + needle + ' role="group" aria-label="Row ' + i + '">' +
+            '<span>' + word + ' ' + i + '</span>' +
+            '<span>value ' + i + '</span>' +
+            '<button type="button">Open ' + word + ' ' + i + '</button>' +
+            '<a href="#r' + i + '">Details ' + i + '</a>' +
+          '</section>',
+        );
+      }
+      rows.innerHTML = html.join('');
+    </script>
+  </body>
+</html>
