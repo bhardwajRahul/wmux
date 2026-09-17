@@ -3712,6 +3712,16 @@ export class WebTerminalServer {
     if (this.deps.sessionManager.getSession(sessionId)) {
       this.recordLiveness(sessionId, body.state, body.at);
     }
+    // #1315 — past this line the id arms a per-pane coalescing timer and ends
+    // up on a wire, so it has to name a pane a phone may be told about. It used
+    // to be inert on its own: an invented id could hold no watcher, so delivery
+    // found nobody. With the pane stream as a second sink that is no longer
+    // true, and `this.clients` is not keyed by pane — one open stream for pane A
+    // would otherwise let an id off the untrusted hook pipe reach
+    // `pendingLiveness`/`livenessTimers`, the same growth `recordLiveness` above
+    // is gated against. Same gate as the transcript routes, so the orchestrator
+    // brain's pane is refused here too.
+    if (!this.readableSession(sessionId)) return;
     // Both sinks, not just the fleet one (#1315): a phone on the terminal face
     // holds a pane stream and no `/api/events` connection at all, and bailing on
     // `eventClients` alone left it with nothing to render.
@@ -3830,19 +3840,20 @@ export class WebTerminalServer {
    * than the stream already carries.
    *
    * `tool` is withheld, exactly as `livenessSummary` withholds it from
-   * `/api/sessions`: the tool name is agent-authored text off the hook pipe, and
-   * widening the STATE is the point here while widening what the pane is typing
-   * is not. The body is rebuilt field by field rather than deleted from, so a
-   * future field on `AgentLivenessBody` is opt-in rather than leaked by default.
+   * `/api/sessions`: it is per-call content the pane itself chose, arriving over
+   * a hook pipe that is not a trusted producer, and widening the STATE is the
+   * point here while widening what the pane is typing is not. `agent` stays
+   * because it is the pane's identity, which `/api/sessions` already serves in
+   * its own `agent` field — this is not a second, narrower trust claim about the
+   * pipe, only about which of its fields this wire needs. The body is rebuilt
+   * field by field rather than deleted from, so a future field on
+   * `AgentLivenessBody` is opt-in rather than leaked by default.
+   *
+   * Which pane a frame may name is settled in `emitAgentLiveness`, which refuses
+   * an unknown id and the brain pane before a timer is ever armed.
    */
   private deliverPaneLiveness(body: AgentLivenessBody): void {
     if (this.clients.size === 0) return;
-    // Same gate the transcript routes take, for both of its reasons. `sessionId`
-    // arrives from the hook pipe, which is not a trusted producer — an invented
-    // id must not become a frame — and the orchestrator brain's pane is not a
-    // worker pane a phone may learn anything about. `handleStream` itself still
-    // resolves panes with a bare `getSession`; this does not widen that.
-    if (!this.readableSession(body.sessionId)) return;
     const wire = JSON.stringify({
       sessionId: body.sessionId,
       state: body.state,
@@ -4524,12 +4535,25 @@ function workspaceLabelOf(env: Record<string, string> | undefined): { workspace?
  * `DaemonSession.cwd`). Both separators are split on because a Windows daemon
  * can hold a pane whose shell reports a POSIX path (WSL, git-bash), and a
  * trailing separator must not yield an empty leaf.
+ *
+ * Three inputs have no leaf and get the field withheld rather than a label a
+ * human cannot read:
+ *
+ *   - A ROOT. `/` has always had none; `C:\` — which is exactly what OSC 7
+ *     `/C:/` parses to on the daemon's primary platform — must behave the same,
+ *     or a pane sitting at a drive root renders a chip reading "C:".
+ *   - WHITESPACE. A segment of spaces is an invisible chip. `cwd` is whatever
+ *     the pane's own process claimed, so degenerate values are a thing that
+ *     happens rather than a hypothetical.
+ *   - Nothing at all (absent, empty).
  */
 function cwdLeafOf(cwd: string | undefined): { cwdLeaf?: string } {
   if (typeof cwd !== 'string') return {};
-  const segments = cwd.split(/[\\/]/).filter((segment) => segment.length > 0);
-  const leaf = segments[segments.length - 1];
-  return leaf ? { cwdLeaf: leaf } : {};
+  const segments = cwd.split(/[\\/]/).filter((segment) => segment.trim().length > 0);
+  const leaf = segments[segments.length - 1]?.trim() ?? '';
+  // A bare drive letter is the Windows spelling of `/` — a root, not a folder.
+  if (!leaf || /^[A-Za-z]:$/.test(leaf)) return {};
+  return { cwdLeaf: leaf };
 }
 
 /**

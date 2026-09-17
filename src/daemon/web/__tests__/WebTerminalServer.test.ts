@@ -629,14 +629,13 @@ describe('WebTerminalServer', () => {
     expect(sessions[1].cwdLeaf).toBe('y');
   });
 
-  it('★ #1319 the cwd leaf survives both separators, a trailing one, and a bare root', async () => {
+  it('★ #1319 the cwd leaf survives both separators and a trailing one', async () => {
     // A Windows daemon can hold a pane whose shell reports a POSIX path (WSL,
-    // git-bash), so neither separator can be the only one split on. A trailing
-    // separator must not yield an empty leaf, and a root has no leaf at all —
-    // in which case the key is absent rather than an empty string.
+    // git-bash), so neither separator can be the only one split on, and a
+    // trailing separator must not swallow the leaf.
     live[0].cwd = 'C:\\Users\\dev\\wmux\\';
     live[1].cwd = '/home/dev/projects/relay';
-    live[2].cwd = '/';
+    live[2].cwd = '\\\\build-01\\share\\out';
     const info = await startRO();
     const { sessions } = (await (
       await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
@@ -644,6 +643,26 @@ describe('WebTerminalServer', () => {
 
     expect(sessions[0].cwdLeaf).toBe('wmux');
     expect(sessions[1].cwdLeaf).toBe('relay');
+    expect(sessions[2].cwdLeaf).toBe('out');
+  });
+
+  it('★ #1319 a cwd with no readable leaf carries no key — including a DRIVE root', async () => {
+    // `cwd` is whatever the pane's own process last claimed over OSC 7, so the
+    // degenerate values are real. The key is withheld rather than filled with
+    // something a human cannot read: absent is a label the client can fall back
+    // from, "C:" and " " are labels it would print.
+    live[0].cwd = '/';
+    // What OSC 7 `/C:/` parses to on the daemon's primary platform. Before the
+    // drive-letter check this rendered a pane chip reading "C:".
+    live[1].cwd = 'C:\\';
+    live[2].cwd = '   ';
+    const info = await startRO();
+    const { sessions } = (await (
+      await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+    ).json()) as { sessions: Array<Record<string, unknown>> };
+
+    expect('cwdLeaf' in sessions[0]).toBe(false);
+    expect('cwdLeaf' in sessions[1]).toBe(false);
     expect('cwdLeaf' in sessions[2]).toBe(false);
   });
 
@@ -4374,6 +4393,24 @@ describe('WebTerminalServer', () => {
       return { state, done };
     };
     const settleMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    /**
+     * Wait until a pumped buffer contains `want`, or fail at the deadline.
+     *
+     * A positive assertion must never be a fixed sleep: a loopback chunk that
+     * lands at 260 ms on a loaded runner would be a hard failure rather than a
+     * slower pass. Polling the buffer the pump already fills costs nothing and
+     * leaves no orphaned `read()` behind. (A NEGATIVE assertion is still a
+     * bounded sleep — proving absence has no event to wait for.)
+     */
+    const waitForWire = async (
+      state: { wire: string },
+      want: string,
+      budgetMs = 3_000,
+    ): Promise<void> => {
+      const deadline = Date.now() + budgetMs;
+      while (!state.wire.includes(want) && Date.now() < deadline) await settleMs(20);
+      expect(state.wire).toContain(want);
+    };
 
     it('★ #1315 the pane stream carries liveness with no /turns read and no --allow-transcript', async () => {
       const info = await startRO();
@@ -4390,10 +4427,41 @@ describe('WebTerminalServer', () => {
         server.emitAgentLiveness({
           sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 2,
         });
-        await settleMs(250);
-        expect(state.wire).toContain('event: agent.liveness');
+        await waitForWire(state, 'event: agent.liveness');
         expect(state.wire).toContain('"state":"awaiting_input"');
         expect(state.wire).toContain('"sessionId":"s1"');
+      } finally {
+        ac.abort();
+        await done;
+      }
+    });
+
+    it('★ #1315 a coalesced working state reaches the pane stream too', async () => {
+      // Every other case here emits a SETTLED state, which skips the coalescing
+      // window entirely. `busy`/`tool` take the other path — the one that arms a
+      // timer and delivers from its callback — so without this the whole
+      // setTimeout branch onto the pane stream is untested.
+      const info = await startRO();
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      try {
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'busy', agent: 'Claude Code', at: 1,
+        });
+        // Last-write-wins inside the window: the frame that lands is the newest
+        // state, not the one that opened it.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'tool', tool: 'Bash', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(state, 'event: agent.liveness');
+        expect(state.wire).toContain('"state":"tool"');
+        expect(state.wire).not.toContain('"state":"busy"');
+        expect(state.wire).not.toContain('Bash');
       } finally {
         ac.abort();
         await done;
@@ -4425,8 +4493,7 @@ describe('WebTerminalServer', () => {
         server.emitAgentLiveness({
           sessionId: 's2', state: 'awaiting_permission', tool: 'Bash', agent: 'Claude Code', at: 2,
         });
-        await settleMs(250);
-        expect(state.wire).toContain('event: agent.liveness');
+        await waitForWire(state, 'event: agent.liveness');
         expect(state.wire).toContain('"state":"awaiting_permission"');
         expect(state.wire).not.toContain('Bash');
         expect(state.wire).not.toContain('"tool"');
@@ -4450,24 +4517,22 @@ describe('WebTerminalServer', () => {
       server.emitAgentLiveness({
         sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 1,
       });
-      await settleMs(250);
-      expect(state.wire).toContain('event: agent.liveness');
+      await waitForWire(state, 'event: agent.liveness');
+      expect(server.status().clients).toBe(1);
 
       ac.abort();
       await done;
-      await settleMs(250);
+      const deadline = Date.now() + 3_000;
+      while (server.status().clients !== 0 && Date.now() < deadline) await settleMs(20);
 
-      // The subscription IS the connection, so nothing survives it —
-      // `disconnectDevice` counting zero is the server's own view of that.
+      // The subscription IS the connection, so nothing survives it — the
+      // server's own client count going back to zero is that claim, and it
+      // cannot pass for the wrong reason the way a revoke count could.
       // `transcriptWatchers`, the fleet channel's registry, is deliberately
       // never undone; this path has nothing to undo.
+      expect(server.status().clients).toBe(0);
+      // Revoking the device finds nothing left to cut either.
       expect(server.disconnectDevice(phone.deviceId)).toBe(0);
-      // And an emit after the close is a no-op, not a write to a dead socket.
-      expect(() =>
-        server.emitAgentLiveness({
-          sessionId: 's1', state: 'idle', agent: 'Claude Code', at: 2,
-        }),
-      ).not.toThrow();
     });
 
     it('★ #1315 pane-stream liveness refuses the brain pane and an invented session id', async () => {
@@ -4513,8 +4578,7 @@ describe('WebTerminalServer', () => {
         server.emitAgentLiveness({
           sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 2,
         });
-        await settleMs(250);
-        expect(panePump.state.wire).toContain('event: agent.liveness');
+        await waitForWire(panePump.state, 'event: agent.liveness');
 
         ac.abort();
         await Promise.all([brainPump.done, panePump.done]);
@@ -4546,8 +4610,7 @@ describe('WebTerminalServer', () => {
         server.emitAgentLiveness({
           sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 1,
         });
-        await settleMs(250);
-        expect(panePump.state.wire).toContain('event: agent.liveness');
+        await waitForWire(panePump.state, 'event: agent.liveness');
         expect(fleetPump.state.wire).not.toContain('agent.liveness');
       } finally {
         ac.abort();

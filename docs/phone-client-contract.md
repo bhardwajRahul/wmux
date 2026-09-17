@@ -190,7 +190,10 @@ three follow from this being a stream you opened for one pane by name:
 - **There is no `tool` field, ever.** The tool name is text the agent itself
   wrote, and widening the STATE to a pane mirror is the point while widening
   what the pane is typing is not — the same narrowing `/api/sessions` applies to
-  its `liveness` field. Read `tool` off `/api/events` or not at all.
+  its `liveness` field. Read `tool` off `/api/events` or not at all. `state`
+  still reaches you as `tool` or `awaiting_permission` — render those as plain
+  "working" and "waiting for you" here, never as a header with a hole where a
+  tool name was going to go.
 
 Liveness is a state rather than a "something changed" ping, so a duplicate frame
 is idempotent: a client showing the same pane in two places can render both
@@ -375,7 +378,8 @@ outlives the agent process and every reboot — a pane that ran Claude keeps
 saying so while the shell sits at a prompt. What is running *now* is `liveness`
 and the `agent.liveness` frames, never this.
 
-`cwdLeaf` is the last segment of `cwd`, absent for an empty cwd or a bare root.
+`cwdLeaf` is the last segment of `cwd`, absent when there is no readable one —
+an empty cwd, a root (`/` and `C:\` alike), or whitespace.
 It is the label of last resort, computed once by the daemon so every client
 agrees on it. Like `cwd` it is the directory the pane's own process last
 claimed, so it is a label and never a path to act on.
