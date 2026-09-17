@@ -161,6 +161,13 @@ async function loadForPlatform(
     probeVolume: vi.fn(() => ({ volume: 'C:\\', freeBytes: 9e12 })),
     readDaemonPid: vi.fn((): number | null => null),
     readAbortMarker: vi.fn((): string | null => null),
+    // #1341 — the structured read the boot notice now uses. Defaults to
+    // whatever readAbortMarker says, with no target version, so every test
+    // written before the stamp existed keeps exercising the same path.
+    readAbortRecord: vi.fn((): { reason: string; targetVersion: string | null } | null => {
+      const reason = teardown.readAbortMarker();
+      return reason === null ? null : { reason, targetVersion: null };
+    }),
     clearAbortMarker: vi.fn(),
     sweepStaleWaiterTasks: vi.fn(() => 0),
     // #1056 — resolves true by default so existing tests exercise the same
@@ -1107,6 +1114,67 @@ describe('AutoUpdater #866 — a refused install is reported on the next boot', 
     const updater = new loaded.AutoUpdater(() => null, quitHooks());
     expect(await takeHandler(loaded)()).toBeNull();
     expect(loaded.teardown.clearAbortMarker).toHaveBeenCalledTimes(1);
+    updater.stop();
+  });
+
+  it('#1341 win32: a marker stamped with the version we are running is a COMPLETED install', async () => {
+    // Squirrel starts the new app before Setup.exe exits, so the marker the
+    // waiter wrote pessimistically is still on disk when we boot. Running the
+    // version it targeted proves the install finished; reporting a refusal
+    // here is what three consecutive real updates did.
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord.mockReturnValueOnce({
+      reason: 'install-aborted: wmux quit to install the update and the install waiter did start, but it was stopped before it could run the installer',
+      targetVersion: FAKE_VERSION,
+    });
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBeNull();
+    // Cleared by US, not by the waiter: the waiter may be dead (#1264), and a
+    // marker left behind would repeat the false refusal on every later boot.
+    expect(loaded.teardown.clearAbortMarker).toHaveBeenCalledTimes(1);
+    updater.stop();
+  });
+
+  it('#1341 win32: a marker stamped with an OLDER version is still a real refusal', async () => {
+    // The install did not land — we are running what we ran before. This is
+    // the #1264/#1056 case, and it must keep reaching the user.
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord.mockReturnValueOnce({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: '9.9.8',
+    });
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBe('install-aborted: install root still locked');
+    expect(loaded.teardown.clearAbortMarker).toHaveBeenCalledTimes(1);
+    updater.stop();
+  });
+
+  it('#1341 win32: an unstamped (pre-fix) marker keeps the old behaviour', async () => {
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord.mockReturnValueOnce({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: null,
+    });
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBe('install-aborted: install root still locked');
+    updater.stop();
+  });
+
+  it('#1341 win32: a marker the waiter clears LATE never becomes a refusal', async () => {
+    // Same boot, two asks: the first lands inside the Squirrel window (marker
+    // present, stamped with our own version), the second after the waiter
+    // finally removed it. Neither may report a refusal.
+    const loaded = await loadForPlatform('win32');
+    loaded.teardown.readAbortRecord
+      .mockReturnValueOnce({ reason: 'install-aborted: interrupted', targetVersion: FAKE_VERSION })
+      .mockReturnValueOnce(null);
+
+    const updater = new loaded.AutoUpdater(() => null, quitHooks());
+    expect(await takeHandler(loaded)()).toBeNull();
+    expect(await takeHandler(loaded)()).toBeNull();
     updater.stop();
   });
 
