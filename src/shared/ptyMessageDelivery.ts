@@ -37,29 +37,47 @@ export function isMultilinePtyPayload(text: string): boolean {
 //
 // The gap is not cosmetic. A TUI that classifies a rapid run of input as a
 // paste (Codex ships `tui/src/bottom_pane/paste_burst.rs` and a
-// `disable_paste_burst` config key) absorbs an Enter that arrives while the
-// burst is still open, so the nudge is left sitting in the composer and the
-// agent never starts a turn. That is #1337.
+// `disable_paste_burst` config key) can absorb an Enter that arrives while the
+// burst is still open, leaving the nudge in the composer with no turn started.
+// That is the most likely mechanism behind #1337; it is inferred from the
+// render-timing measurements below, not observed directly in Codex's input
+// buffer (see the bound stated after the table).
 //
 // MEASURED, not reasoned. codex-cli 0.154.0, driven through a real ConPTY on
 // Windows, fed the exact bytes this function writes (bracketed paste, wait,
-// CR), screen read back with a headless terminal:
+// CR), screen read back with a headless terminal and scored on the COMPOSER:
+// a composer showing its placeholder took the draft, a composer still holding
+// the nudge did not.
 //
-//     gap     idle composer
-//     0 ms    submitted (1 run)
-//     100 ms  STRANDED in 5 of 6 runs   <- the old global default
-//     250 ms  STRANDED in 3 of 5 runs
-//     300 ms  submitted (1 of 1)
-//     350 ms  submitted (1 of 1)
-//     400 ms  submitted (3 of 3)
-//     500 ms  submitted (5 of 5)
-//     600 / 800 / 1000 / 2000 ms  submitted (1 of 1 each)
+// Two machines, same binary and probe, pooled:
 //
-// Nothing at or above 300 ms was ever stranded: 14 idle runs out of 14, plus 2
-// mid-turn runs at 500 ms (a mid-turn Codex QUEUES the message, which is a real
-// wake, not a stranding). The value below is 500 ms: double the last observed
-// failure, and still well under the point where an asynchronous nudge feels
-// delayed.
+//     gap     paste PAINTED in the composer     nudge stranded
+//             by the time the CR was written
+//     100 ms  7 of 40 runs                      2 of 40 runs
+//     500 ms  20 of 20 runs                     0 of 20 runs
+//
+// The RACE is the durable finding, not the rate. At 100 ms the Enter is
+// usually written before the paste is even on screen; at 500 ms it never was.
+// That ordering reproduced on both machines (5 of 20 and 2 of 20 painted at
+// 100 ms, 10 of 10 each at 500 ms). The stranding is bursty and rare — both
+// failures fell in one batch of ten, and the second machine saw 0 in 20 — so
+// a short clean run does not disprove it and a short bad run does not size it.
+// Roughly 5% here; do not quote it as a rate.
+//
+// WHAT THE ORDERING SIGNAL ACTUALLY IS, since the last table got over-read:
+// it is read off the RENDERED SCREEN, so it says the paste had not been
+// PAINTED yet, not that Codex's input buffer had not received it. The
+// mechanism is an inference from render timing plus correlation (both stranded
+// runs sat in the not-yet-painted group, and every 500 ms run was painted
+// first), not a direct observation of the buffer. It is enough to size a
+// conservative default. It is not proof of what the burst logic did.
+//
+// Do not trust any "stranded" count taken before this scorer existed: the
+// earlier one keyed on the "Working" footer, which disappears as soon as the
+// turn fails, so it miscounted submitted runs as stranded. It could not
+// produce the opposite error, so its "submitted" observations still stand —
+// which is why 300, 350, 400, 600, 800, 1000 and 2000 ms are all still known
+// to submit.
 //
 // Two facts are keyed off the same signal, so they live in one table rather
 // than two parallel ones that can drift:
@@ -96,7 +114,9 @@ export const DEFAULT_SUBMIT_DELAY_MS = 100;
 
 /**
  * The gap for agents that run a paste-burst heuristic on their input. See the
- * measurement table above for where this number comes from.
+ * measurement table above for where this number comes from. It is sized to
+ * close a race, not to beat an exact threshold: 500 ms is where the paste was
+ * observed to have reached the composer before the Enter in every run.
  *
  * The tradeoff being accepted: a wider gap is also a wider window in which a
  * human can type into the same composer before our Enter lands, submitting a
