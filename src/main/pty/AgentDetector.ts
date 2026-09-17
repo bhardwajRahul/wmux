@@ -435,6 +435,34 @@ function isClaudeBannerChrome(line: string): boolean {
   return /^Claude\s*Code\b/i.test(v);
 }
 
+/**
+ * The splash line Claude Code draws at launch: its logo glyphs and the
+ * versioned product name on ONE row (` ▐▛███▛█   Claude Code v2.1.274`).
+ *
+ * #1392 — the compound gate's prompt signal is the permission footer
+ * (`bypass permissions on` / `shift+tab to cycle`), which a pane started with
+ * `--permission-mode default` never draws, so such a pane was never detected
+ * at all. The splash is product chrome no other source prints in this shape:
+ * a btop row has no logo, a README or changelog line quoting the version has
+ * no logo, and `claude --version` prints `2.1.274 (Claude Code)`. It therefore
+ * stands in for both signals. The glyph requirement is what keeps the plain
+ * `Claude Code v2.1.172` banner line — which agents working this repo print
+ * from source, and which #850's tests feed as banner-only — from opening the
+ * gate on its own.
+ */
+// Whitespace is dropped before the test, not made optional: Claude Code paints
+// the row with cursor moves (` ▐ ESC[48;2;0;0;0m ▛███▛█ ESC[12G ESC[1m Claude
+// Code ESC[24G v2.1.274` on 2.1.274), so after the ANSI strip the glyphs and
+// the name may touch with no space at all.
+// The whole Block Elements range, not the six glyphs of one build: a future
+// logo drawn with other shades must not reopen this gap.
+const CLAUDE_SPLASH_RE = /[\u2580-\u259f]+ClaudeCodev\d+\.\d+/;
+function isClaudeSplashLine(line: string): boolean {
+  const stripped = stripAnsi(line);
+  if (SOURCE_LINE_RE.test(stripped)) return false;
+  return CLAUDE_SPLASH_RE.test(stripped.replace(/\s+/g, ''));
+}
+
 /** Idle-footer fragment that is not a source/comment/regex dump of that fragment. */
 function isClaudePromptChrome(line: string): boolean {
   const stripped = stripAnsi(line);
@@ -655,9 +683,19 @@ export class AgentDetector {
         // this prefilter runs on the stripped probe as well as the raw one.
         probe.includes('bypass permissions') || probe.includes('bypasspermissions') || probe.includes('shift+tab')
       );
+      // #1392 — the versioned splash satisfies both signals (see
+      // isClaudeSplashLine). Its own prefilter, because the banner one is
+      // switched off once an OSC title has named the pane, and the prompt one
+      // only looks for footer words the default permission mode never draws.
+      const mayContainSplash = !this.claudePromptSeen && probe.includes('Claude');
 
-      if (mayContainBanner || mayContainPrompt) {
+      if (mayContainBanner || mayContainPrompt || mayContainSplash) {
         for (const line of candidateLines(probe)) {
+          if (mayContainSplash && !this.claudePromptSeen && isClaudeSplashLine(line)) {
+            this.claudeBannerSeen = true;
+            this.claudePromptSeen = true;
+            continue;
+          }
           if (mayContainBanner && !this.claudeBannerSeen && isClaudeBannerChrome(line)) {
             this.claudeBannerSeen = true;
           }
