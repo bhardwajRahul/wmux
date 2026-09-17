@@ -42,6 +42,7 @@ import {
   type BrowserToolDeps,
 } from '../browserScope';
 import { recordAction } from '../../browser-replay/actionRing';
+import { getScreenshotScale } from '../screenshotRefs';
 
 // Optional surfaceId schema reused across tools
 const optionalSurfaceId = z
@@ -70,6 +71,14 @@ const BROWSER_CLICK_SHAPE = {
     .number()
     .optional()
     .describe('Viewport CSS px, only when ref/smartRef is omitted. Needs x.'),
+  imageX: z
+    .number()
+    .optional()
+    .describe('Pixel read off the last browser_screenshot; divided by that capture\'s scale. Needs imageY.'),
+  imageY: z
+    .number()
+    .optional()
+    .describe('Pixel read off the last browser_screenshot; divided by that capture\'s scale. Needs imageX.'),
   smartRef: z
     .number()
     .optional()
@@ -1166,22 +1175,45 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
   // -----------------------------------------------------------------------
   server.tool(
     'browser_click',
-    'Click an element by ref (browser_snapshot) or smartRef (browser_smart_snapshot), or — when neither is available — at x/y. Coordinates are VIEWPORT CSS PIXELS: divide a browser_screenshot pixel by the devicePixelRatio that shot reports. A fullPage or element screenshot is in a different coordinate space and cannot be used for x/y at all. Coordinates need a live page (chrome backend); the RPC lane is ref-only.',
+    'Click an element by ref (browser_snapshot) or smartRef (browser_smart_snapshot), or — when neither is available — at x/y. x/y are VIEWPORT CSS PIXELS; to click something you can see in a screenshot pass imageX/imageY instead and the pixels are divided by that capture\'s reported scale for you. A fullPage or element screenshot is in a different coordinate space and cannot be used for coordinates at all. Coordinates need a live page (chrome backend); the RPC lane is ref-only.',
     BROWSER_CLICK_SHAPE,
-    async ({ ref, smartRef, x, y, double, modifiers, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ ref, smartRef, x, y, imageX, imageY, double, modifiers, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
+        // Image-space coordinates are viewport coordinates once divided by the
+        // scale the last viewport screenshot of this surface reported (#1358).
+        // Converted up front so everything below sees one coordinate space.
+        let clickX = x;
+        let clickY = y;
+        let imageNote = '';
+        if (imageX !== undefined || imageY !== undefined) {
+          if (ref !== undefined || smartRef !== undefined || x !== undefined || y !== undefined) {
+            throw new Error('Pass imageX/imageY alone — not with ref, smartRef, x or y.');
+          }
+          if (imageX === undefined || imageY === undefined) {
+            throw new Error('Image-space clicks need both imageX and imageY.');
+          }
+          const known = getScreenshotScale(browserScopeKey(scope));
+          if (!known) {
+            throw new Error(
+              'No screenshot scale is known for this surface: take a viewport browser_screenshot first (fullPage and element captures set no scale), then pass imageX/imageY.',
+            );
+          }
+          clickX = Math.round((imageX / known.scale) * 100) / 100;
+          clickY = Math.round((imageY / known.scale) * 100) / 100;
+          imageNote = ` (image px (${imageX}, ${imageY}) / scale ${known.scale})`;
+        }
         // Coordinate clicking is an ESCAPE HATCH, not a second addressing mode:
         // a ref survives a re-render and a coordinate does not, so a call that
         // carries both is a mistake worth refusing rather than silently
         // resolving in favour of one.
         // mirrors browser-use tools/service.py coordinate clicking (set_coordinate_clicking)
-        const hasCoords = x !== undefined || y !== undefined;
+        const hasCoords = clickX !== undefined || clickY !== undefined;
         if (hasCoords && (ref !== undefined || smartRef !== undefined)) {
           throw new Error(
             'Pass either ref/smartRef or x/y, not both — a ref survives a re-render and a coordinate does not.',
           );
         }
-        if (hasCoords && (x === undefined || y === undefined)) {
+        if (hasCoords && (clickX === undefined || clickY === undefined)) {
           throw new Error('Coordinate clicks need both x and y (viewport CSS pixels).');
         }
 
@@ -1209,7 +1241,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
         if (hasCoords && page) {
           // Refuse a coordinate the viewport does not contain instead of
           // clicking nothing and reporting success.
-          (await viewportBoundsCheck(page))(x as number, y as number);
+          (await viewportBoundsCheck(page))(clickX as number, clickY as number);
 
           // Same popup contract as a ref click — a coordinate click on a link
           // with target=_blank opens a popup just as readily.
@@ -1220,13 +1252,13 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
               : null;
           try {
             await withModifiers(page, modifierKeys, () =>
-              page.mouse.click(x as number, y as number, {
+              page.mouse.click(clickX as number, clickY as number, {
                 ...(double && { clickCount: 2 }),
               }),
             );
             // Keep the tracker honest: the next ref click should approach from
             // here, not from wherever the pointer was before this one.
-            setLastPointer(page, { x: x as number, y: y as number });
+            setLastPointer(page, { x: clickX as number, y: clickY as number });
             const note = coordWatch ? await coordWatch.note() : '';
             // Coordinate clicks are deliberately NOT recorded: a coordinate
             // does not survive a re-render, so a trace built on one replays a
@@ -1236,7 +1268,7 @@ export function registerInteractionTools(server: McpServer, deps: BrowserToolDep
               content: [
                 {
                   type: 'text' as const,
-                  text: `Clicked${double ? ' (double)' : ''} at viewport CSS px (${x}, ${y})${modifiersNote(modifierKeys)}${note}`,
+                  text: `Clicked${double ? ' (double)' : ''} at viewport CSS px (${clickX}, ${clickY})${imageNote}${modifiersNote(modifierKeys)}${note}`,
                 },
               ],
             };
