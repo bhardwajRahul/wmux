@@ -37,9 +37,11 @@ export function isMultilinePtyPayload(text: string): boolean {
 //
 // The gap is not cosmetic. A TUI that classifies a rapid run of input as a
 // paste (Codex ships `tui/src/bottom_pane/paste_burst.rs` and a
-// `disable_paste_burst` config key) absorbs an Enter that arrives while the
-// burst is still open, so the nudge is left sitting in the composer and the
-// agent never starts a turn. That is #1337.
+// `disable_paste_burst` config key) can absorb an Enter that arrives while the
+// burst is still open, leaving the nudge in the composer with no turn started.
+// That is the most likely mechanism behind #1337; it is inferred from the
+// render-timing measurements below, not observed directly in Codex's input
+// buffer (see the bound stated after the table).
 //
 // MEASURED, not reasoned. codex-cli 0.154.0, driven through a real ConPTY on
 // Windows, fed the exact bytes this function writes (bracketed paste, wait,
