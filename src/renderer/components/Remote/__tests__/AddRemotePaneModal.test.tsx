@@ -124,7 +124,13 @@ describe('AddRemotePaneModal', () => {
     });
     await flush();
 
-    expect(onCreated).toHaveBeenCalledWith('host-1', 'sess-1');
+    // #1329 — the minted workspace id must reach the caller: it is the key the
+    // remote daemon groups /api/workspaces by, and therefore the only way the
+    // resulting pane can ever learn its own agent's name and status (#1322).
+    // It is the id this modal handed workspaceCreate, not a second mint.
+    const mintedId = workspaceCreate.mock.calls[0][1] as string;
+    expect(mintedId).toMatch(/^remote-pane-/);
+    expect(onCreated).toHaveBeenCalledWith('host-1', 'sess-1', mintedId);
     expect(onClose).toHaveBeenCalled();
   });
 

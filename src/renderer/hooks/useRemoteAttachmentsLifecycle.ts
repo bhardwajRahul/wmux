@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useStore } from '../stores';
+import { collectRemoteSurfaceWorkspaces } from '../../shared/paneUtils';
+import { remoteAttachmentKey } from '../../shared/remoteHosts';
 import type {
   RemoteAttachmentDescriptor,
   RemotePaneSummary,
   RemoteWorkspaceSummary,
 } from '../../shared/remoteHosts';
+import type { Workspace } from '../../shared/types';
 
 // ─── Remote attachment lifecycle ─────────────────────────────────────────────
 //
@@ -28,6 +31,35 @@ import type {
 //     refetch-and-diff, and both are debounced/serialised so an exit burst
 //     costs one round of requests. No daemon-side change is involved, so this
 //     keeps working against older remote builds (version skew is real here).
+//
+//  ③ SURFACE ROWS (#1329). A remote-terminal SURFACE — "New remote pane",
+//     "Split right|down — remote" — is not an attachment: it lives in a local
+//     pane tree and nothing ever put it in `remoteWorkspaces`. But ① and ②
+//     above derive the polled host set from exactly that array, so such a pane
+//     had no liveness feed at all, and both readers of the feed (the sidebar's
+//     WorkspaceAgentRoster and `pane.list`'s `agents:` builder) reported no
+//     agent no matter what was really running on the host (#1322).
+//
+//     Fixed by giving each such surface an EPHEMERAL row (invisible,
+//     unpersisted — see AttachedRemoteWorkspace.ephemeral) and RECONCILING
+//     that set against the surfaces that actually exist:
+//
+//        surfaces in state.workspaces          remoteWorkspaces
+//        ────────────────────────────          ────────────────────────
+//        remote-terminal + hostId
+//          + remoteWorkspaceId   ──track──▶    { …, ephemeral: true }
+//                                                     │
+//        (tab closed / Ctrl+W / pane            prune │ key no longer
+//         teardown / workspace delete /        ◀──────┘ produced by any
+//         split rolled back / app quit)                 surface
+//
+//     Derivation is the whole point. The nine explicit teardown call sites
+//     that destroy a remote session would each have needed a matching detach,
+//     and any close path nobody enumerated would still have leaked a row.
+//     Here every one of them ends the same way — the surface is gone from
+//     `state.workspaces` — so the next reconcile drops the row and, with it,
+//     the poll. Two panes on one host share one row, so there is never a
+//     second poller for the same workspace.
 //
 // Every host in a round is queried in PARALLEL and every response is treated
 // as untrusted: one dead or misbehaving machine must not delay, or abort, the
@@ -107,6 +139,47 @@ function noteHostResult(backoff: Map<string, BackoffEntry>, hostId: string, ok: 
   const failures = (backoff.get(hostId)?.failures ?? 0) + 1;
   const delay = Math.min(POLL_INTERVAL_MS * 2 ** (failures - 1), BACKOFF_MAX_MS);
   backoff.set(hostId, { failures, nextAttemptAt: Date.now() + delay });
+}
+
+/**
+ * #1329 — every (host, remote workspace) a remote-terminal surface anywhere in
+ * the local workspaces needs a liveness feed for, plus a stable string key for
+ * that set.
+ *
+ * MEMOISED ON THE `workspaces` ARRAY IDENTITY, deliberately. A zustand
+ * selector re-runs on EVERY store update, and the busiest of them (terminal
+ * output, agent status, hook events) live in other slices and leave
+ * `workspaces` untouched — so without this cache a single noisy pane would
+ * re-walk every pane tree in the app dozens of times a second. Writes that DO
+ * touch `workspaces` (a shell's OSC title, say) still pay the walk; the cache
+ * removes the common case, not every case.
+ *
+ * Sound because every write goes through immer, which replaces the whole path
+ * including the top-level array — a content change can never reuse an
+ * identity. Writing a module slot from inside a selector is a render-phase
+ * write, but an idempotent one: concurrent renders can thrash the single slot,
+ * which costs a recompute and can never produce a wrong answer.
+ */
+let surfaceWorkspacesCache:
+  | { source: readonly Workspace[]; keys: ReadonlyMap<string, { hostId: string; workspaceId: string }>; signature: string }
+  | null = null;
+
+/** The result is CACHED and shared — treat `keys` as read-only, or the next
+ *  selector call gets a corrupted answer. */
+function remoteSurfaceWorkspaces(workspaces: readonly Workspace[]): {
+  keys: ReadonlyMap<string, { hostId: string; workspaceId: string }>;
+  signature: string;
+} {
+  if (surfaceWorkspacesCache?.source === workspaces) return surfaceWorkspacesCache;
+  const keys = new Map<string, { hostId: string; workspaceId: string }>();
+  for (const ws of workspaces) {
+    for (const ref of collectRemoteSurfaceWorkspaces(ws)) {
+      keys.set(remoteAttachmentKey(ref.hostId, ref.workspaceId), ref);
+    }
+  }
+  const signature = [...keys.keys()].sort().join('\n');
+  surfaceWorkspacesCache = { source: workspaces, keys, signature };
+  return surfaceWorkspacesCache;
 }
 
 export function useRemoteAttachmentsLifecycle(): void {
@@ -231,6 +304,85 @@ export function useRemoteAttachmentsLifecycle(): void {
       }
     };
   }, [refresh]);
+
+  // ③ Surface rows — reconcile the ephemeral set against the remote-terminal
+  //   surfaces that exist. Subscribed to a SIGNATURE, not to either list, so
+  //   this effect fires when the two diverge and at no other time; a pane
+  //   merely printing output, or a poll round rewriting pane snapshots, never
+  //   re-runs it.
+  //
+  //   The signature carries BOTH terms on purpose. The surface set alone would
+  //   miss the case where the rows go away under a pane that is still open:
+  //   the user attaches the same host workspace from the sidebar (which
+  //   PROMOTES the ephemeral row to a real one) and then detaches it, or
+  //   removes the host entirely — `handleRemoveHost` drops every row it has.
+  //   The pane's surfaces never changed, so a surface-only signature would sit
+  //   still and that pane would stay agent-less for the rest of the session:
+  //   #1322, silently restored. Naming the missing keys makes the effect
+  //   re-mint them instead. It converges: once tracked, they are no longer
+  //   missing, and the signature settles.
+  const reconcileSignature = useStore((s) => {
+    const want = remoteSurfaceWorkspaces(s.workspaces);
+    if (want.keys.size === 0) return '';
+    const have = new Set(s.remoteWorkspaces.map((r) => r.key));
+    const missing = [...want.keys.keys()].filter((k) => !have.has(k)).sort();
+    return missing.length === 0 ? want.signature : `${want.signature}|missing:${missing.join(',')}`;
+  });
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const refs = remoteSurfaceWorkspaces(useStore.getState().workspaces).keys;
+      // Labels are cosmetic (the roster's origin badge) and this list is a
+      // local IPC read, so a missing route on an older preload bundle, or a
+      // rejection, degrades to the hostId rather than costing the pane its
+      // agent. Only fetched when there is something to label.
+      let labels = new Map<string, string>();
+      if (refs.size > 0) {
+        try {
+          const hosts = await window.electronAPI?.remote?.hostsList?.();
+          if (Array.isArray(hosts)) {
+            labels = new Map(hosts.map((h) => [h.id, h.label || h.origin || h.id]));
+          }
+        } catch {
+          /* see above — hostId is a correct, if terse, label */
+        }
+      }
+      if (cancelled) return;
+      // Re-read: the await above may have let a pane close under us, and a row
+      // for a surface that is gone would poll a host for nothing until the
+      // next reconcile. Prune LAST so a key that is both tracked and kept in
+      // the same round is never briefly dropped.
+      const current = remoteSurfaceWorkspaces(useStore.getState().workspaces).keys;
+      const had = new Set(useStore.getState().remoteWorkspaces.map((r) => r.key));
+      for (const [key, ref] of current) {
+        // A host that failed a few rounds is backed off up to BACKOFF_MAX_MS,
+        // and it stays in `hostIds` (an ephemeral row keeps it there), so the
+        // backoff would survive and the refresh below would skip it — turning
+        // "a new pane gets its agent immediately" into a five-minute wait.
+        // Opening a pane on a host is the user saying to try it now, exactly
+        // like detach-then-reattach starting from a clean slate.
+        if (!had.has(key)) backoff.current.delete(ref.hostId);
+        useStore.getState().trackRemoteSurfaceWorkspace({
+          key,
+          hostId: ref.hostId,
+          hostLabel: labels.get(ref.hostId) ?? ref.hostId,
+          workspaceId: ref.workspaceId,
+          name: '',
+          // Panes always come from the poll below, never assumed. `stale`
+          // until a host actually answers, so no reader can report an agent
+          // this desktop has never heard of.
+          panes: [],
+          stale: true,
+        });
+      }
+      useStore.getState().pruneRemoteSurfaceWorkspaces(new Set(current.keys()));
+      if (cancelled || current.size === 0) return;
+      // A fresh row would otherwise wait a full poll interval for its first
+      // answer, so a brand-new remote pane would sit agent-less for 10s.
+      await refresh();
+    })();
+    return () => { cancelled = true; };
+  }, [reconcileSignature, refresh]);
 
   // ②-b Safety-net poll — armed only while something is attached, so an app
   //     with no mirrors makes no periodic requests at all.

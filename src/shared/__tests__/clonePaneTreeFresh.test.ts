@@ -92,12 +92,15 @@ describe('clonePaneTreeFresh', () => {
 
   it('#1100 CodeRabbit round 1 — strips remoteHostId/remoteSessionId so the clone does not double-attach the source\'s live remote session', () => {
     const src = leaf(
-      [surface({ id: 's1', surfaceType: 'remote-terminal', remoteHostId: 'host-a', remoteSessionId: 'sess-live-1', remoteOwned: true })],
+      [surface({ id: 's1', surfaceType: 'remote-terminal', remoteHostId: 'host-a', remoteSessionId: 'sess-live-1', remoteWorkspaceId: 'remote-pane-1', remoteOwned: true })],
       's1',
     );
     const clone = clonePaneTreeFresh(src) as PaneLeaf;
     expect(clone.surfaces[0].remoteHostId).toBeUndefined();
     expect(clone.surfaces[0].remoteSessionId).toBeUndefined();
+    // #1329 — and the host-side workspace id, or the clone would register a
+    // liveness feed for a workspace it holds no session in.
+    expect(clone.surfaces[0].remoteWorkspaceId).toBeUndefined();
     // #1129 — the ownership claim goes with the pointer, or the clone would
     // offer to destroy a session it does not point at.
     expect(clone.surfaces[0].remoteOwned).toBeUndefined();

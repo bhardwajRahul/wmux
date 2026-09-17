@@ -736,6 +736,24 @@ describe('surfaceSlice.addRemoteSurface (#1086/#1091)', () => {
     expect(pane.surfaces[1].remoteOwned).toBeUndefined();
   });
 
+  // #1329 — the host-side workspace id is what the liveness poll asks
+  // /api/workspaces about; without it the pane's agent is invisible to the
+  // sidebar roster and to pane_list.
+  it('stores the remote workspace id when the caller knows it', () => {
+    const { state, slice } = createHarness();
+    const paneId = state.workspaces[0].rootPane.id;
+
+    slice.addRemoteSurface(paneId, 'host-abc', 'minted', undefined, undefined, undefined, true, 'remote-pane-xyz');
+    slice.addRemoteSurface(paneId, 'host-abc', 'no-workspace');
+
+    const pane = state.workspaces[0].rootPane;
+    if (pane.type !== 'leaf') throw new Error('expected leaf pane');
+    expect(pane.surfaces[0].remoteWorkspaceId).toBe('remote-pane-xyz');
+    // Absent, not empty: a surface persisted before #1329 must read the same
+    // as one whose caller genuinely had no id to give.
+    expect(pane.surfaces[1].remoteWorkspaceId).toBeUndefined();
+  });
+
   it('is a no-op when the target pane does not exist', () => {
     const { state, slice } = createHarness();
 

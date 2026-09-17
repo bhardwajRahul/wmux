@@ -35,6 +35,29 @@ export interface AttachedRemoteWorkspace {
    *  because a laptop slept would be silent data loss — it just renders
    *  disconnected until a refresh succeeds or the user detaches. */
   stale?: boolean;
+  /**
+   * #1329 — this row exists ONLY to drive the per-host poll for a
+   * remote-terminal SURFACE (the "New remote pane" / "Split right|down —
+   * remote" flows), not because the user attached a mirror.
+   *
+   * `attachRemoteWorkspace` fuses three things into one row: the poll input,
+   * a permanent sidebar mirror, and an on-disk descriptor replayed on every
+   * boot. A surface wants the FIRST only — it is a "tab = mine to operate"
+   * leaf in a local pane tree, not a "mirror = watching" attachment
+   * (remoteSessionTeardown.ts states that split). So an ephemeral row is:
+   *
+   *   - invisible: filtered out by `selectAttachedRemoteWorkspaces`, which
+   *     both the sidebar and WorkspaceCenter read (an unfiltered row would
+   *     also mount a SECOND RemoteWorkspaceView and double-attach the same
+   *     SSE stream);
+   *   - unpersisted: no `attachmentsAdd`, so it can never resurrect on a
+   *     later boot as an unreapable `stale: true` ghost;
+   *   - never selected: `activeRemoteKey` is not touched when one lands.
+   *
+   * Reaped by reconciliation, not by teardown call sites — see
+   * `pruneRemoteSurfaceWorkspaces`.
+   */
+  ephemeral?: boolean;
   /** Bumped every time this entry recovers from `stale`. A host that slept
    *  long enough for RemoteHostClient to give up reconnecting comes back with
    *  the SAME remote sessionIds, so the pane list is byte-identical and
@@ -121,6 +144,15 @@ export interface RemoteWorkspacesSlice {
    * selecting it (a restore must not steal the user's view) and without
    * re-persisting what it just read. ADDITIVE ONLY — see the implementation. */
   restoreRemoteWorkspace: (w: AttachedRemoteWorkspace) => void;
+  /** #1329 — register the invisible, unpersisted poll input a remote-terminal
+   * SURFACE needs (see `AttachedRemoteWorkspace.ephemeral`). ADDITIVE ONLY:
+   * a key that is already present wins, so a real sidebar attachment on the
+   * same `hostId:workspaceId` is never demoted to an invisible row. */
+  trackRemoteSurfaceWorkspace: (w: AttachedRemoteWorkspace) => void;
+  /** #1329 — drop every EPHEMERAL row whose key is not in `keepKeys`. Rows the
+   * user attached are never touched, so pane teardown can never reap an
+   * attachment. Nothing is unpersisted because nothing was persisted. */
+  pruneRemoteSurfaceWorkspaces: (keepKeys: ReadonlySet<string>) => void;
   /** Remove the entry AND its persisted descriptor; clears activeRemoteKey
    * only if it was the active one. */
   detachRemoteWorkspace: (key: string) => void;
@@ -157,7 +189,37 @@ export function isRemoteMirrorVisible(state: {
   activeRemoteKey: string | null;
 }): boolean {
   if (!state.activeRemoteKey) return false;
-  return state.remoteWorkspaces.some((r) => r.key === state.activeRemoteKey);
+  // #1329 — an EPHEMERAL row is a poll input, not a mirror: nothing renders it,
+  // so treating one as visible would hide the local tree behind a blank centre.
+  // Nothing sets activeRemoteKey to an ephemeral key today; this keeps the two
+  // halves of the gate reading the same list rather than relying on that.
+  return state.remoteWorkspaces.some((r) => r.key === state.activeRemoteKey && !r.ephemeral);
+}
+
+/**
+ * #1329 — the ONE definition of "a remote mirror the user attached", i.e. every
+ * row that renders: a sidebar entry and a mounted RemoteWorkspaceView.
+ *
+ * Kept here, next to `isRemoteMirrorVisible`, for the same reason that
+ * predicate lives here: the sidebar and WorkspaceCenter must never disagree
+ * about which rows exist. A row they disagreed on would either be clickable
+ * with nothing behind it, or would silently double-attach an SSE stream the
+ * user cannot see.
+ *
+ * Subscribe through `useShallow`, never bare. `remoteWorkspaces` gets a new
+ * array identity on every 10s poll round that changes ANY row — including the
+ * invisible ones behind remote-terminal panes, whose agent status flips are
+ * deliberately part of `samePanes` — so a bare subscription would re-render
+ * the whole sidebar and every mounted mirror on a tick that changed nothing
+ * they display. Shallow-comparing the filtered result is what keeps an
+ * ephemeral row's churn off the visible components entirely.
+ */
+export function selectAttachedRemoteWorkspaces(state: {
+  remoteWorkspaces: AttachedRemoteWorkspace[];
+}): AttachedRemoteWorkspace[] {
+  return state.remoteWorkspaces.some((r) => r.ephemeral)
+    ? state.remoteWorkspaces.filter((r) => !r.ephemeral)
+    : state.remoteWorkspaces;
 }
 
 export const createRemoteWorkspacesSlice: StateCreator<StoreState, [['zustand/immer', never]], [], RemoteWorkspacesSlice> = (set) => ({
@@ -209,6 +271,44 @@ export const createRemoteWorkspacesSlice: StateCreator<StoreState, [['zustand/im
   restoreRemoteWorkspace: (w) => set((state: StoreState) => {
     if (state.remoteWorkspaces.some((r: AttachedRemoteWorkspace) => r.key === w.key)) return;
     state.remoteWorkspaces.push(w);
+  }),
+
+  // ADDITIVE ONLY, for the same class of reason restoreRemoteWorkspace is.
+  // The mint flows behind a remote-terminal surface create a REAL workspace on
+  // the host (`remote-pane-*`), which AttachRemoteModal lists like any other —
+  // so the user can legitimately attach the very same `hostId:workspaceId` as
+  // a visible mirror. Present key wins, always: overwriting would hide a row
+  // the user is looking at, wipe its #1086 label/color, and orphan its
+  // persisted descriptor. The reverse order is safe without extra code —
+  // attachRemoteWorkspace replaces the entry with a snapshot that carries no
+  // `ephemeral`, promoting the row to a real attachment.
+  trackRemoteSurfaceWorkspace: (w) => set((state: StoreState) => {
+    if (state.remoteWorkspaces.some((r: AttachedRemoteWorkspace) => r.key === w.key)) return;
+    state.remoteWorkspaces.push({ ...w, ephemeral: true });
+  }),
+
+  pruneRemoteSurfaceWorkspaces: (keepKeys) => set((state: StoreState) => {
+    // Plain strings, captured BEFORE the array is rebuilt: a draft that has
+    // been detached from the tree is not something to keep reading fields off.
+    const doomed = new Set<string>(
+      state.remoteWorkspaces
+        .filter((r: AttachedRemoteWorkspace) => r.ephemeral === true && !keepKeys.has(r.key))
+        .map((r: AttachedRemoteWorkspace) => r.key),
+    );
+    if (doomed.size === 0) return; // no new array identity on a no-op round
+    // The `ephemeral` re-check is belt and braces: keys are unique across both
+    // kinds of row, so `doomed` alone would do. "Prune never reaps an
+    // attachment" is the invariant this whole design rests on, and it should
+    // not depend on a uniqueness argument made somewhere else.
+    state.remoteWorkspaces = state.remoteWorkspaces.filter(
+      (r: AttachedRemoteWorkspace) => !(r.ephemeral === true && doomed.has(r.key)),
+    );
+    // Defensive: nothing selects an ephemeral row, but a dangling
+    // activeRemoteKey would make isRemoteMirrorVisible disagree with what is
+    // mounted. Cheap to keep the two in step here rather than reason about it.
+    if (state.activeRemoteKey && doomed.has(state.activeRemoteKey)) {
+      state.activeRemoteKey = null;
+    }
   }),
 
   detachRemoteWorkspace: (key) => {

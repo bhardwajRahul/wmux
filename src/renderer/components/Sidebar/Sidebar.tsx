@@ -12,6 +12,7 @@ import MissionsSection from './MissionsSection';
 import type { AgentStatus, Workspace } from '../../../shared/types';
 import { getWorkspacePtyIds } from '../../../shared/paneUtils';
 import { destroyWorkspaceRemoteSessions } from '../../utils/remoteSessionTeardown';
+import { selectAttachedRemoteWorkspaces } from '../../stores/slices/remoteWorkspacesSlice';
 import { useT } from '../../hooks/useT';
 import { buildWorkspaceMarkdown } from '../../utils/sessionInfoMarkdown';
 import { tokenAttrs } from '../../themes';
@@ -72,7 +73,12 @@ export default function Sidebar() {
     [filteredWorkspaces, agentStatusById, sidebarAttentionFirst],
   );
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
-  const remoteWorkspaces = useStore((s) => s.remoteWorkspaces);
+  // #1329 — rows that only exist to poll a remote-terminal PANE's host are not
+  // attachments and must not render here: the user never asked for a mirror,
+  // and a row they cannot detach (nothing persists it) would be a ghost.
+  // useShallow, not a bare subscription: those invisible rows are rewritten on
+  // every poll round, and this list must not re-render the sidebar for them.
+  const remoteWorkspaces = useStore(useShallow(selectAttachedRemoteWorkspaces));
   const activeRemoteKey = useStore((s) => s.activeRemoteKey);
   const setActiveRemoteKey = useStore((s) => s.setActiveRemoteKey);
   const detachRemoteWorkspace = useStore((s) => s.detachRemoteWorkspace);
