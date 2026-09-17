@@ -1672,6 +1672,89 @@ async function fetchQueryMatchedTree(
   }
 }
 
+// ---------------------------------------------------------------------------
+// `selector` fast path
+// ---------------------------------------------------------------------------
+//
+// The same trade the `q` fast path above makes, for the same reason: a scoped
+// snapshot is a small subtree by construction, but it used to pay for the whole
+// document first — 3.3 s of `getFullAXTree` on the 35 000-node fixture — only to
+// index one element out of it and throw the rest away (#1371).
+//
+// `Accessibility.getPartialAXTree` fetches the matched element, then one
+// `getChildAXNodes` per internal node walks its subtree. Everything after that
+// is the code the slow path ran, unchanged: the same buildTree over the same CDP
+// nodes, so the same AXNode forest comes out under the same backendDOMNodeId,
+// and the refs and lines are byte-identical.
+//
+// Null — "use the full tree" — whenever the subtree route cannot prove it would
+// answer the same: the element is absent from the a11y tree, the subtree is
+// bigger than the budget below (past it the round trips cost more than the one
+// big fetch they replace), or CDP refuses.
+const MAX_SCOPE_FETCHED_NODES = 2000;
+
+/**
+ * The nodeId of the synthetic parent the matched element is fetched under.
+ *
+ * buildTree materialises `nodes[0]` as the document root even when it is
+ * `ignored`, and indexes it as itself. Handing it the matched element directly
+ * would therefore give an IGNORED element a materialised node where the full
+ * tree gives the forest its children were spliced into. A synthetic parent that
+ * no DOM element backs takes that role instead, so the matched element is
+ * converted as a child exactly as it is on the slow path. Chrome mints numeric
+ * nodeIds, so this cannot collide.
+ */
+const SCOPE_ROOT_NODE_ID = 'wmux-scope-root';
+
+/** Build the tree a `selector` scope needs out of partial fetches, or null. */
+async function fetchScopedTree(
+  client: CdpClient,
+  backendNodeId: number,
+): Promise<BuiltTree | null> {
+  try {
+    // Same reason the full fetch enables it: the domain computes the tree
+    // lazily, and querying it unenabled is racy on a heavy page.
+    await client.send('Accessibility.enable').catch(() => { /* best-effort */ });
+    const passwordBackendIds = await getPasswordFieldBackendIds(client);
+    const partial = (await client.send('Accessibility.getPartialAXTree', {
+      backendNodeId,
+      fetchRelatives: false,
+    })) as { nodes?: CdpAXNode[] };
+    const target = (partial?.nodes ?? []).find((n) => n.backendDOMNodeId === backendNodeId);
+    if (!target) return null;
+
+    const collected = new Map<string, CdpAXNode>([[target.nodeId, target]]);
+    const expanded = new Set<string>();
+    const frontier: CdpAXNode[] = [target];
+    while (frontier.length > 0) {
+      const node = frontier.pop()!;
+      if (expanded.has(node.nodeId)) continue;
+      expanded.add(node.nodeId);
+      if ((node.childIds ?? []).length === 0) continue;
+      const kids = (await client.send('Accessibility.getChildAXNodes', {
+        id: node.nodeId,
+      })) as { nodes?: CdpAXNode[] };
+      for (const child of kids?.nodes ?? []) {
+        if (!collected.has(child.nodeId)) collected.set(child.nodeId, child);
+        frontier.push(collected.get(child.nodeId)!);
+      }
+      if (collected.size > MAX_SCOPE_FETCHED_NODES) return null;
+    }
+
+    const root: CdpAXNode = { nodeId: SCOPE_ROOT_NODE_ID, childIds: [target.nodeId] };
+    const built = buildTree([root, ...collected.values()], passwordBackendIds);
+    // An element with no a11y presence contributes nothing, and "nothing" is a
+    // claim only the full tree is allowed to make here — the caller reads it as
+    // "fall back to the DOM listing", which is a different snapshot entirely.
+    if (!built || (built.byBackendId.get(backendNodeId)?.length ?? 0) === 0) return null;
+    return built;
+  } catch {
+    // A detached session, a refused domain, an older target whose stand-in does
+    // not implement the partial calls — the full tree is the answer.
+    return null;
+  }
+}
+
 /** Fetch and build the full a11y tree over an already-open CDP session. */
 async function fetchAccessibilityTree(
   client: CdpClient,
@@ -2419,11 +2502,11 @@ export async function generateSnapshot(
  * so scope through it instead and keep the DOM listing as the fallback.
  *
  * Scoping resolves DOM → a11y through `backendNodeId`, the id space both CDP
- * domains share: `DOM.querySelector` for the element, then the tree's
- * backendDOMNodeId index. Chosen over `Accessibility.getPartialAXTree`, which
- * returns a node with its ancestors and immediate children only — a deep
- * subtree would cost one round-trip per node, whereas the full tree is a single
- * call we already make for every unscoped snapshot and can index for free.
+ * domains share: `DOM.querySelector` for the element, then only that element's
+ * subtree, fetched with `Accessibility.getPartialAXTree` +
+ * `Accessibility.getChildAXNodes` (see fetchScopedTree). The full tree stays the
+ * fallback for everything the subtree fetch will not answer for, and is indexed
+ * by backendDOMNodeId exactly as it was — the output is the same either way.
  *
  * Returns null (never a partial or wrong-scope result) when the a11y route
  * cannot serve the request — no CDP session, collapsed tree, selector miss, or
@@ -2457,7 +2540,11 @@ export async function generateScopedSnapshot(
         return { forest: null, occlusion: null, ...emptyDomFacts() };
       }
 
-      const built = await fetchAccessibilityTree(client);
+      // The subtree first, the whole document only if that route abstains
+      // (#1371). Both produce the same forest under `backendId`, so nothing
+      // downstream can tell which one ran.
+      const built =
+        (await fetchScopedTree(client, backendId)) ?? (await fetchAccessibilityTree(client));
       if (!built || isRootOnly(built.root)) {
         return { forest: null, occlusion: null, ...emptyDomFacts() };
       }

@@ -45,23 +45,56 @@ const SELECTORS: Record<string, number> = {
   'span.detached': 99, // matches in the DOM but has no node in the a11y tree
 };
 
-function makePage(opts: { nodes?: CdpNode[]; noSession?: boolean } = {}) {
+function makePage(
+  opts: {
+    nodes?: CdpNode[];
+    noSession?: boolean;
+    /**
+     * Serve `Accessibility.getPartialAXTree` / `getChildAXNodes` out of the same
+     * node list, which is what a real Chrome does. Off by default so the older
+     * tests below keep exercising the full-tree path they were written for.
+     */
+    partialAx?: boolean;
+    /** selector → backendNodeId, when the default table is not what is wanted. */
+    selectors?: Record<string, number>;
+  } = {},
+) {
   const sends: string[] = [];
+  const nodes = opts.nodes ?? PAGE;
+  const selectors = opts.selectors ?? SELECTORS;
+  const byNodeId = new Map(nodes.map((n) => [n.nodeId, n]));
   const client = {
-    send: vi.fn(async (method: string, params?: { selector?: string; nodeId?: number }) => {
+    send: vi.fn(async (
+      method: string,
+      params?: { selector?: string; nodeId?: number; backendNodeId?: number; id?: string },
+    ) => {
       sends.push(method);
       switch (method) {
         case 'DOM.getDocument':
           return { root: { nodeId: 1 } };
         case 'DOM.querySelector': {
-          const backendId = SELECTORS[params?.selector ?? ''];
+          const backendId = selectors[params?.selector ?? ''];
           // The fake reuses the backendNodeId as the nodeId; 0 means no match.
           return { nodeId: backendId ?? 0 };
         }
         case 'DOM.describeNode':
           return { node: { backendNodeId: params?.nodeId } };
         case 'Accessibility.getFullAXTree':
-          return { nodes: opts.nodes ?? PAGE };
+          return { nodes };
+        case 'Accessibility.getPartialAXTree': {
+          if (!opts.partialAx) return {};
+          const node = nodes.find((n) => n.backendDOMNodeId === params?.backendNodeId);
+          return { nodes: node ? [node] : [] };
+        }
+        case 'Accessibility.getChildAXNodes': {
+          if (!opts.partialAx) return {};
+          const node = byNodeId.get(params?.id ?? '');
+          return {
+            nodes: (node?.childIds ?? [])
+              .map((id) => byNodeId.get(id))
+              .filter((n): n is CdpNode => n !== undefined),
+          };
+        }
         default:
           return {};
       }
@@ -197,6 +230,102 @@ describe('generateScopedSnapshot — fail-open to the DOM listing', () => {
     // A miss costs one DOM round-trip, not a full-tree fetch.
     expect(sends).not.toContain('Accessibility.getFullAXTree');
     expect(client.detach).toHaveBeenCalled();
+  });
+});
+
+// #1371: the scope used to fetch the WHOLE accessibility tree and index one
+// element out of it — 5.3 s on a 35 000-node page for a subtree of ten nodes.
+// It now fetches the matched element's subtree only. The contract of that change
+// is that nothing about the output moves: same lines, same refs, byte for byte.
+describe('generateScopedSnapshot — subtree fetch (#1371)', () => {
+  const OPTIONS = [
+    { format: 'ai' as const },
+    { format: 'aria' as const },
+    { format: 'ai' as const, filter: 'interactive' as const },
+    { format: 'ai' as const, q: 'Docs' },
+  ];
+
+  for (const selector of ['main', 'nav', 'header', '#wrap']) {
+    for (const options of OPTIONS) {
+      it(`is byte-identical to the full-tree answer for ${selector} ${JSON.stringify(options)}`, async () => {
+        const full = await generateScopedSnapshot(makePage().page as never, selector, options);
+        const partial = await generateScopedSnapshot(
+          makePage({ partialAx: true }).page as never,
+          selector,
+          options,
+        );
+
+        expect(partial).toBe(full);
+      });
+    }
+  }
+
+  it('never asks for the full tree when the subtree fetch answers', async () => {
+    const { page, sends } = makePage({ partialAx: true });
+    const out = await generateScopedSnapshot(page as never, 'main', { format: 'ai' });
+
+    expect(out).toContain('- main "Content"');
+    expect(sends).toContain('Accessibility.getPartialAXTree');
+    expect(sends).not.toContain('Accessibility.getFullAXTree');
+  });
+
+  it('walks only the matched subtree, one child fetch per internal node', async () => {
+    const { page, client } = makePage({ partialAx: true });
+    await generateScopedSnapshot(page as never, 'nav', { format: 'aria' });
+
+    // navigation → link: the navigation node is the only one with children.
+    const childCalls = client.send.mock.calls.filter(
+      ([method]) => method === 'Accessibility.getChildAXNodes',
+    );
+    expect(childCalls).toHaveLength(1);
+  });
+
+  it('falls back to the full tree when the element has no a11y node', async () => {
+    const { page, sends } = makePage({ partialAx: true });
+    // The fallback reaches the same verdict the full tree always reached.
+    expect(
+      await generateScopedSnapshot(page as never, 'span.detached', { format: 'ai' }),
+    ).toBeNull();
+    expect(sends).toContain('Accessibility.getFullAXTree');
+  });
+
+  it('falls back to the full tree when the subtree is larger than the budget', async () => {
+    // One container over the 2000-node budget, so the walk bails mid-way and the
+    // single big fetch answers instead.
+    const big: CdpNode[] = [
+      { nodeId: '1', backendDOMNodeId: 1, role: role('RootWebArea'), name: name('Page'), childIds: ['10'] },
+      {
+        nodeId: '10',
+        backendDOMNodeId: 10,
+        role: role('main'),
+        name: name('Content'),
+        childIds: Array.from({ length: 2100 }, (_, i) => `c${i}`),
+      },
+      ...Array.from({ length: 2100 }, (_, i) => ({
+        nodeId: `c${i}`,
+        backendDOMNodeId: 1000 + i,
+        role: role('button'),
+        name: name(`B${i}`),
+        childIds: [],
+      })),
+    ];
+    const { page, sends } = makePage({ partialAx: true, nodes: big });
+    const out = await generateScopedSnapshot(page as never, 'main', { format: 'aria' });
+
+    expect(out).toContain('- button "B0"');
+    expect(sends).toContain('Accessibility.getFullAXTree');
+  });
+
+  it('falls back to the full tree when the partial calls throw (older targets, RPC lane)', async () => {
+    const { page, client } = makePage({ partialAx: true });
+    const send = client.send;
+    client.send = vi.fn(async (method: string, params?: unknown) => {
+      if (method.startsWith('Accessibility.getPartial')) throw new Error('not implemented');
+      return send(method, params as never);
+    }) as never;
+
+    const out = await generateScopedSnapshot(page as never, 'main', { format: 'ai' });
+    expect(out).toContain('- main "Content"');
   });
 });
 
