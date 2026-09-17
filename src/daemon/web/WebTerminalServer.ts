@@ -19,7 +19,15 @@ import type { ApprovalEvent, ApprovalRegistryApi, ApprovalRequest } from '../app
 import type { TranscriptProjector } from '../transcript/TranscriptProjector';
 // Type only — the projection from hook envelope to header state lives in the
 // hooks layer (see agentLiveness.ts). This module only fans the result out.
-import { isTerminalLiveness, type AgentLivenessBody } from '../hooks/agentLiveness';
+import {
+  isTerminalLiveness,
+  type AgentLivenessBody,
+  type AgentLivenessState,
+} from '../hooks/agentLiveness';
+// Value import from main, the same precedent HookIngest sets (it imports
+// AgentDetector): this is a pure, dependency-free reader of a transcript file,
+// not a piece of the Electron main process.
+import { readLastAssistantMessageAsync } from '../../main/claude/lastAssistantMessage';
 import { ENV_KEYS, isBrainPty } from '../../shared/constants';
 import { webHostIsLoopback, type PairRefusal, type WebTlsConfig } from '../../shared/web';
 import type { RemotePaneSummary } from '../../shared/remoteHosts';
@@ -545,6 +553,35 @@ const TRANSCRIPT_NUDGE_COALESCE_MS = 1000;
  * states skip the window entirely (`isTerminalLiveness`).
  */
 const AGENT_LIVENESS_COALESCE_MS = 1000;
+/**
+ * How long a WORKING liveness state stays believable in the `/api/sessions`
+ * snapshot. The SSE header is a live channel — it gets a new state whenever one
+ * happens — but the list is a poll, and the last state it kept may be the one a
+ * pane was in when its agent crashed, lost its hooks, or was killed by a signal
+ * no hook reports. Past this age a `busy`/`tool` row is omitted rather than
+ * rendered as a pane that has been "running Bash" for an hour.
+ *
+ * Only the working states expire. `idle` and `awaiting_*` are RESTING states:
+ * an agent that stopped an hour ago is still stopped, and aging those out would
+ * blank the one part of the list a user is scanning for.
+ */
+const LIVENESS_SNAPSHOT_STALE_MS = 300_000;
+/**
+ * Grapheme budget for `lastAssistantText` in `/api/sessions`. A list row shows
+ * a line or two; the full message is one `/turns` call away for a device that
+ * opened the pane. Counted in graphemes, not code units, so a Hangul or emoji
+ * line is cut where a reader would see 140 characters.
+ */
+const LAST_ASSISTANT_GRAPHEMES = 140;
+/**
+ * How many transcript tails one `/api/sessions` poll may START reading.
+ *
+ * The reads are off the event loop, but they are still disk: a fleet of forty
+ * panes that all rotated their transcripts at once would otherwise fire forty
+ * concurrent 256 KB reads on one poll. The panes that miss out are read on the
+ * next poll — the field is a summary, and arriving a second late costs nothing.
+ */
+const MAX_LAST_ASSISTANT_READS_PER_POLL = 8;
 /** A decision body is two fields; anything larger is not one of ours. */
 const MAX_JSON_BODY_BYTES = 8 * 1024;
 /**
@@ -851,6 +888,42 @@ export class WebTerminalServer {
   private readonly livenessTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Latest liveness state per pane, held for the open coalescing window. */
   private readonly pendingLiveness = new Map<string, AgentLivenessBody>();
+  /**
+   * Last liveness state seen per pane, for the `/api/sessions` snapshot.
+   *
+   * DELIBERATE WIDENING (and the reason this map exists at all): until now
+   * liveness was watcher-only — it reached a device's SSE channel only for
+   * panes whose turn view that device had opened. The list field publishes the
+   * same state to any bearer-authenticated device BEFORE it has read any pane,
+   * because a fleet list that cannot say which panes are working is a list you
+   * have to open every row of to use. What is widened is the STATE only: the
+   * tool name never rides along (see `livenessSummary`), so the list still says
+   * "working", not what it is working on.
+   *
+   * Recorded only for sessions the daemon actually knows — see
+   * `emitAgentLiveness` — and dropped on delete.
+   */
+  private readonly latestLiveness = new Map<string, { state: AgentLivenessState; at: number }>();
+  /**
+   * Memoized `lastAssistantText` per pane, keyed by (path, size, mtime).
+   *
+   * `/api/sessions` is polled, and re-reading every pane's transcript tail on
+   * every poll would put a 256 KB read per pane on a route that answers in
+   * microseconds today. The key is the projector's own change signal, so an
+   * appended transcript invalidates itself. A null text is cached too —
+   * otherwise a pane whose transcript holds no assistant message (a fresh
+   * session, a tool-only turn) would be re-read on every single poll.
+   */
+  private readonly lastAssistantCache = new Map<string, { key: string; text: string | null }>();
+  /**
+   * Panes whose transcript tail is being read right now.
+   *
+   * `/api/sessions` may be polled by several devices at once, and a poll that
+   * missed the cache starts the read rather than waiting for it — without this
+   * set, three phones polling a busy fleet would each start the same read of
+   * the same file.
+   */
+  private readonly lastAssistantReads = new Set<string>();
 
   /**
    * Attention replay state.
@@ -1827,8 +1900,35 @@ export class WebTerminalServer {
     workspace?: string;
     /** Short program name (`pwsh`, `bash`) — what to call a pane with no agent. */
     shell?: string;
+    /**
+     * What the pane's agent is doing, when the daemon has seen a liveness
+     * signal for it recently enough to believe. ADDITIVE and OPTIONAL: absent
+     * means "not known", never "idle".
+     *
+     * See `latestLiveness` for why this is a deliberate widening of a
+     * watcher-only channel, and `livenessSummary` for what is withheld.
+     */
+    liveness?: { state: AgentLivenessState; at: number };
+    /**
+     * The agent's last message to the human, flattened to one line and cut to
+     * `LAST_ASSISTANT_GRAPHEMES`. Present only on a server started with
+     * `--allow-transcript` — it is conversation content, and it rides the same
+     * grant `/api/sessions/:id/turns` does.
+     *
+     * ABSENT UNTIL READ. The transcript tail is read off the event loop, so the
+     * first poll after a pane's transcript changes carries no field and the
+     * next one carries the new text. A polled list may lag by one poll; it may
+     * not hold the HTTP surface behind a disk read.
+     */
+    lastAssistantText?: string;
   }> {
-    return this.deps.sessionManager.listLiveSessions()
+    const sessions = this.deps.sessionManager.listLiveSessions();
+    // Against the FULL live set, not the filtered rows: the brain pane is
+    // excluded from the list but is a real session, and evicting its entries
+    // here would just make the next liveness signal re-create them.
+    this.evictClosedSessionState(new Set(sessions.map((s) => s.id)));
+    const reads = { left: MAX_LAST_ASSISTANT_READS_PER_POLL };
+    return sessions
       // The orchestrator brain's own TUI is not a worker pane: it must not show
       // up in the phone's pane list (nor be attachable/approvable from there),
       // exactly as the fleet pane listing already excludes it. Same shared
@@ -1844,7 +1944,126 @@ export class WebTerminalServer {
         lastActivity: s.lastActivity,
         ...workspaceLabelOf(s.env),
         ...shellLabelOf(s.cmd),
+        ...this.livenessSummary(s.id),
+        ...this.lastAssistantSummary(s.id, reads),
       }));
+  }
+
+  /**
+   * Drop per-session snapshot state for panes that are no longer live.
+   *
+   * `DELETE /api/sessions/:id` cleans up its own pane, but that is not the only
+   * way a pane ends: a process exits, a machine sleeps, an agent is killed. The
+   * web server does not observe PTY exit (it subscribes to `session:critical` /
+   * `session:notification`, neither of which is a death), so without this sweep
+   * a long-lived daemon accumulates one liveness entry and one cached preview
+   * per pane it has ever seen. `/api/sessions` is the natural place for it:
+   * it already has the authoritative live set in hand.
+   *
+   * In-flight reads are dropped from the set but not cancelled — the read
+   * itself checks the session is still there before it writes a cache entry.
+   */
+  private evictClosedSessionState(liveIds: Set<string>): void {
+    for (const id of this.latestLiveness.keys()) {
+      if (!liveIds.has(id)) this.latestLiveness.delete(id);
+    }
+    for (const id of this.lastAssistantCache.keys()) {
+      if (!liveIds.has(id)) this.lastAssistantCache.delete(id);
+    }
+    for (const id of this.lastAssistantReads) {
+      if (!liveIds.has(id)) this.lastAssistantReads.delete(id);
+    }
+  }
+
+  /**
+   * The list row's view of a pane's liveness, or nothing.
+   *
+   * `tool` — the name of the tool the agent is running — is deliberately NOT
+   * carried. It is agent-authored text off the hook pipe, and the SSE channel
+   * that does carry it only ever reaches a device that already opened the
+   * pane's turn view. Widening the STATE to every paired device is the point of
+   * the field; widening what the pane is typing is not.
+   */
+  private livenessSummary(sessionId: string): { liveness?: { state: AgentLivenessState; at: number } } {
+    const seen = this.latestLiveness.get(sessionId);
+    if (!seen) return {};
+    const working = seen.state === 'busy' || seen.state === 'tool';
+    if (working && this.now() - seen.at > LIVENESS_SNAPSHOT_STALE_MS) return {};
+    return { liveness: { state: seen.state, at: seen.at } };
+  }
+
+  /**
+   * The list row's one-line summary of the agent's last message, or nothing.
+   *
+   * Gated on `--allow-transcript`, the same grant `/api/sessions/:id/turns`
+   * refuses without (`transcript-disabled:`) — this is a shorter serving of
+   * exactly the same content, so it cannot be readable where that route is not.
+   * A daemon with no projector wired has no path to read and returns nothing,
+   * matching that route's 503 rather than inventing a fallback.
+   */
+  private lastAssistantSummary(
+    sessionId: string,
+    reads: { left: number },
+  ): { lastAssistantText?: string } {
+    if (this.opts?.allowTranscript !== true) return {};
+    const projector = this.deps.projector?.() ?? null;
+    if (!projector) return {};
+    // ONE resolve, not two. `status()` and `transcriptPath()` both walk the
+    // resume binding and both re-run the containment check, and calling them
+    // together on every row of every poll doubles that for a size and an mtime
+    // this can stat for itself.
+    const transcriptPath = projector.transcriptPath(sessionId);
+    if (!transcriptPath) return {};
+    // lstat ONLY — no open, no read. A stat is a constant-time metadata call
+    // (the same one the projector's own watch fallback polls with); it is the
+    // 256 KB read that may not happen on this thread. lstat and a regular-file
+    // check for the same reason the reader does it: a FIFO must never be
+    // opened here.
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(transcriptPath);
+    } catch {
+      return {}; // purged, rotated away, unmounted — the pane simply has no preview
+    }
+    if (!stat.isFile()) return {};
+    // NUL-delimited: a path may contain anything a filename may contain, and
+    // concatenating without a separator lets two different (path, size) pairs
+    // collide into one key.
+    const key = `${transcriptPath} ${stat.size} ${stat.mtimeMs}`;
+    const cached = this.lastAssistantCache.get(sessionId);
+    if (cached?.key === key) {
+      return cached.text === null ? {} : { lastAssistantText: cached.text };
+    }
+    // Miss: answer WITHOUT the field and read in the background. The previous
+    // text is deliberately not served — it belongs to a transcript that has
+    // since changed, and a stale last message is exactly the lie this field
+    // exists to remove. The next poll carries the fresh one.
+    if (reads.left > 0 && !this.lastAssistantReads.has(sessionId)) {
+      reads.left -= 1;
+      this.startLastAssistantRead(sessionId, transcriptPath, key);
+    }
+    return {};
+  }
+
+  /** Read one pane's transcript tail off the event loop and memoize the result. */
+  private startLastAssistantRead(sessionId: string, transcriptPath: string, key: string): void {
+    this.lastAssistantReads.add(sessionId);
+    // Bounded (256 KB tail) and null on every failure — see
+    // lastAssistantMessage.ts, including why it lstats before it opens.
+    void readLastAssistantMessageAsync(transcriptPath)
+      .then((message) => {
+        // The pane may have closed while the disk was busy. Writing the entry
+        // now would re-create exactly what `evictClosedSessionState` just swept.
+        if (!this.deps.sessionManager.getSession(sessionId)) return;
+        const text = message ? assistantPreview(message.text) : null;
+        this.lastAssistantCache.set(sessionId, { key, text });
+      })
+      .catch(() => {
+        /* best-effort: a pane with no preview is a normal row */
+      })
+      .finally(() => {
+        this.lastAssistantReads.delete(sessionId);
+      });
   }
 
   /**
@@ -2538,6 +2757,13 @@ export class WebTerminalServer {
           this.livenessTimers.delete(id);
         }
         this.pendingLiveness.delete(id);
+        // ...and the `/api/sessions` snapshot state for the same pane, so a
+        // closed pane's liveness and preview are gone by the time the next
+        // list is served rather than on the poll after it. A pane that dies on
+        // its own (no DELETE) is swept by `evictClosedSessionState`.
+        this.latestLiveness.delete(id);
+        this.lastAssistantCache.delete(id);
+        this.lastAssistantReads.delete(id);
         res.writeHead(204, this.securityHeaders());
         res.end();
       })
@@ -3345,8 +3571,21 @@ export class WebTerminalServer {
    * open window, so "waiting for you" never queues behind a stale tool name.
    */
   emitAgentLiveness(body: AgentLivenessBody): void {
-    if (this.eventClients.size === 0) return;
     const { sessionId } = body;
+    // Record BEFORE the no-subscribers bail and before coalescing: the list
+    // snapshot must be right for a phone that polls `/api/sessions` without
+    // ever holding an SSE stream open, and it wants the newest state, not the
+    // one a coalescing window happened to deliver.
+    //
+    // Gated on a session the daemon actually has. `sessionId` arrives from the
+    // hook pipe, which is not a trusted producer — a pane can write anything
+    // into it — and an ungated `set` would let a loop of invented ids grow this
+    // map for the daemon's life. A pane the manager does not know is also a
+    // pane `listSessions` would never render.
+    if (this.deps.sessionManager.getSession(sessionId)) {
+      this.recordLiveness(sessionId, body.state, body.at);
+    }
+    if (this.eventClients.size === 0) return;
     if (isTerminalLiveness(body.state)) {
       const timer = this.livenessTimers.get(sessionId);
       if (timer) {
@@ -3371,6 +3610,34 @@ export class WebTerminalServer {
     }, AGENT_LIVENESS_COALESCE_MS);
     timer.unref?.();
     this.livenessTimers.set(sessionId, timer);
+  }
+
+  /**
+   * Write one pane's liveness into the `/api/sessions` snapshot, if the payload
+   * can be believed.
+   *
+   * `at` is a number off the hook pipe, and the list renders elapsed time from
+   * it, so three cases have to be handled before it is stored — all of them
+   * producing a row that reads as an agent working since a time that never
+   * happened:
+   *
+   *   - NOT A FINITE NUMBER (absent, NaN, a string that slipped the type).
+   *     Refused outright: there is no sensible stand-in, and the previous entry
+   *     is at least true.
+   *   - IN THE FUTURE. Clamped to now, which is the earliest moment the state
+   *     can actually have been observed. A clock skewed an hour forward would
+   *     otherwise pin a row at "0s" forever, and — worse — outlive the staleness
+   *     cutoff no matter how long the agent has been dead.
+   *   - OLDER THAN WHAT IS STORED. Dropped. Hook delivery is not ordered (the
+   *     pipe coalesces, retries, and interleaves panes), so an `idle` that
+   *     arrives after a later `busy` must not resurrect the earlier state.
+   */
+  private recordLiveness(sessionId: string, state: AgentLivenessState, at: number): void {
+    if (!Number.isFinite(at)) return;
+    const stamped = Math.min(at, this.now());
+    const previous = this.latestLiveness.get(sessionId);
+    if (previous && previous.at > stamped) return;
+    this.latestLiveness.set(sessionId, { state, at: stamped });
   }
 
   /**
@@ -4059,6 +4326,48 @@ function workspaceLabelOf(env: Record<string, string> | undefined): { workspace?
   const value = env?.[ENV_KEYS.WORKSPACE_NAME];
   const workspace = typeof value === 'string' ? value.trim() : '';
   return workspace ? { workspace } : {};
+}
+
+/**
+ * One list row's worth of an agent's last message, or null when there is
+ * nothing left to show.
+ *
+ * The input is AGENT-AUTHORED TEXT — the same trust class as `screenTail` — so
+ * it is flattened before it goes anywhere: C0/C1 control codes (which carry the
+ * escape byte, and with it cursor moves and OSC sequences) become spaces, then
+ * every whitespace run collapses to one. A list row is a single line; newlines
+ * in it are noise at best and terminal control at worst.
+ *
+ * The invisibles go too. Zero-width spaces and the bidi overrides
+ * (U+202A–U+202E, U+2066–U+2069) let a message reorder how it renders without
+ * changing what it says — the classic trick for making one string read as
+ * another in a list. U+200D (ZWJ) is deliberately KEPT: it is not decoration,
+ * it is what holds a family emoji or a flag sequence together, and stripping it
+ * would shatter one grapheme into several.
+ *
+ * Cut by GRAPHEME, and from the END. `readLastAssistantMessage` already keeps
+ * the last 600 characters of a long message for the same reason this keeps the
+ * last 140 of those: an agent's ask — the question, the conclusion, the "shall
+ * I?" — is at the end of what it wrote, and a head-cut preview reliably shows
+ * the recap and drops the point. The leading `…` says the front was dropped.
+ * Graphemes, not code units, because slicing at 140 UTF-16 units can land
+ * inside a surrogate pair or a Hangul jamo sequence and end the row in a
+ * replacement character.
+ */
+function assistantPreview(raw: string): string | null {
+  const flattened = raw
+    .replace(/\p{Cc}/gu, ' ')
+    .replace(/[\u200B\u200C\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!flattened) return null;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const graphemes = [...segmenter.segment(flattened)].map((s) => s.segment);
+  if (graphemes.length <= LAST_ASSISTANT_GRAPHEMES) return flattened;
+  // The ellipsis counts against the budget, so the result is never longer than
+  // an untruncated one — a consumer sizing a row off the constant is not
+  // surprised by the truncated case being the wider one.
+  return `…${graphemes.slice(-(LAST_ASSISTANT_GRAPHEMES - 1)).join('')}`;
 }
 
 /**

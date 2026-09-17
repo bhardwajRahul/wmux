@@ -206,6 +206,9 @@ function makeDeps() {
   // mockReturnValue on the same object.
   const projectorMock = {
     status: vi.fn<(id: string) => TranscriptStatus>(() => ({ available: false, reason: 'no-hook' })),
+    // `/api/sessions`'s lastAssistantText reads the file itself, so it needs the
+    // full path status() deliberately withholds from the wire.
+    transcriptPath: vi.fn<(id: string) => string | null>(() => null),
     snapshot: vi.fn((): unknown => null),
     delta: vi.fn((): unknown => null),
     codeBlock: vi.fn((): unknown => null),
@@ -4180,6 +4183,187 @@ describe('WebTerminalServer', () => {
       } finally {
         ac.abort();
         await pump;
+      }
+    });
+
+    it('★ /api/sessions carries liveness state (never the tool) with no stream or watcher', async () => {
+      const info = await startRO();
+      // No SSE client, no turn-view watcher: the whole point of the list field
+      // is that a phone which only polls still knows which panes are working.
+      server.emitAgentLiveness({
+        sessionId: 's1',
+        state: 'busy',
+        tool: 'Bash',
+        agent: 'Claude Code',
+        at: Date.now(),
+      });
+
+      const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+      const body = (await res.json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string; tool?: string; at: number } }>;
+      };
+      const s1 = body.sessions.find((s) => s.id === 's1');
+      expect(s1?.liveness?.state).toBe('busy');
+      // The tool name is watcher-only and must not have been widened with the state.
+      expect(s1?.liveness).not.toHaveProperty('tool');
+      expect(JSON.stringify(body)).not.toContain('Bash');
+      // A pane with no liveness signal carries no field at all — absent means
+      // "not known", not "idle".
+      expect(body.sessions.find((s) => s.id === 's2')).not.toHaveProperty('liveness');
+    });
+
+    it('★ a stale working state drops out of /api/sessions; a resting one does not', async () => {
+      const info = await startRO();
+      const old = Date.now() - 301_000;
+      server.emitAgentLiveness({ sessionId: 's1', state: 'busy', agent: 'Claude Code', at: old });
+      server.emitAgentLiveness({ sessionId: 's2', state: 'idle', agent: 'Claude Code', at: old });
+
+      const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+      const body = (await res.json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string } }>;
+      };
+      // "Running Bash" from five minutes ago is a crashed agent, not a busy one.
+      expect(body.sessions.find((s) => s.id === 's1')).not.toHaveProperty('liveness');
+      // An agent that stopped five minutes ago is still stopped.
+      expect(body.sessions.find((s) => s.id === 's2')?.liveness?.state).toBe('idle');
+    });
+
+    it('★ liveness is not recorded for a sessionId the daemon does not have', async () => {
+      const info = await startRO();
+      // The hook pipe is not a trusted producer; an invented id must not enter
+      // the map (which nothing else would ever evict).
+      server.emitAgentLiveness({ sessionId: 'no-such-pane', state: 'busy', agent: 'Claude Code', at: Date.now() });
+
+      const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+      const body = (await res.json()) as { sessions: Array<{ id: string }> };
+      expect(body.sessions.map((s) => s.id)).toEqual(['s1', 's2', 's3']);
+      expect(JSON.stringify(body)).not.toContain('no-such-pane');
+    });
+
+    it('★ a liveness `at` is clamped forward and never walks backward', async () => {
+      const info = await startRO();
+      // A pane whose clock runs an hour fast would otherwise sit at "0s" for an
+      // hour AND outlive the staleness cutoff however long it had been dead.
+      const future = Date.now() + 3_600_000;
+      server.emitAgentLiveness({ sessionId: 's1', state: 'busy', agent: 'Claude Code', at: future });
+      // Hook delivery is not ordered: an older state arriving late must not
+      // resurrect itself over the newer one.
+      server.emitAgentLiveness({ sessionId: 's1', state: 'idle', agent: 'Claude Code', at: 1_000 });
+      // Not a number at all → refused; the believable entry survives.
+      server.emitAgentLiveness({
+        sessionId: 's1', state: 'idle', agent: 'Claude Code',
+        at: Number.NaN,
+      });
+
+      const body = (await (
+        await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+      ).json()) as { sessions: Array<{ id: string; liveness?: { state: string; at: number } }> };
+      const liveness = body.sessions.find((s) => s.id === 's1')?.liveness;
+      expect(liveness?.state).toBe('busy');
+      expect(liveness?.at).toBeLessThan(future);
+      expect(liveness?.at).toBeGreaterThan(Date.now() - 10_000);
+    });
+
+    it('★ /api/sessions sweeps snapshot state for panes that died without a DELETE', async () => {
+      const info = await startRO();
+      const h = bearer(info.token as string);
+      server.emitAgentLiveness({ sessionId: 's2', state: 'idle', agent: 'Claude Code', at: Date.now() });
+      const first = (await (await fetch(`${base()}/api/sessions`, { headers: h })).json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string } }>;
+      };
+      expect(first.sessions.find((s) => s.id === 's2')?.liveness?.state).toBe('idle');
+
+      // s2's process exits. Nothing tells the web server — it subscribes to no
+      // death event — so the sweep on the next list is the only thing that can
+      // drop the entry.
+      const [dead] = live.splice(1, 1);
+      await fetch(`${base()}/api/sessions`, { headers: h });
+      // Put an identically-named pane back. A leaked entry would show up here as
+      // a brand-new pane that is somehow already idle.
+      live.splice(1, 0, dead);
+      const after = (await (await fetch(`${base()}/api/sessions`, { headers: h })).json()) as {
+        sessions: Array<{ id: string; liveness?: { state: string } }>;
+      };
+      expect(after.sessions.find((s) => s.id === 's2')).not.toHaveProperty('liveness');
+    });
+
+    it('★ lastAssistantText rides --allow-transcript, is tail-cut to 140 graphemes, and is read off the loop', async () => {
+      // A real transcript on disk: the reader lstats and tail-reads the file, so
+      // a mock would test nothing that ships.
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-web-transcript-'));
+      const transcript = path.join(dir, 'session.jsonl');
+      // Over 600 characters, so `condense()` in the reader keeps the TAIL and
+      // the preview is cutting an already-cut string. Newlines on purpose — a
+      // list row is one line, and the flattening is part of the contract.
+      // U+200B and the RLO are the invisibles that must not survive; the ZWJ in
+      // the emoji must, or one grapheme shatters into three.
+      const said = `${Array.from({ length: 400 }, (_, i) => `줄${i}`).join('\n')}\n\u200b\u202e끝 👩\u200d💻`;
+      expect(said.length).toBeGreaterThan(600);
+      const entry = (text: string) =>
+        `${JSON.stringify({
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text }] },
+        })}\n`;
+      fs.writeFileSync(transcript, entry(said));
+      // Pin mtime to a whole millisecond so the (path, size, mtime) cache key can
+      // be reproduced exactly below — a natural mtime carries sub-ms precision
+      // that `utimesSync` cannot round-trip.
+      const pinned = new Date(1_700_000_000_000);
+      fs.utimesSync(transcript, pinned, pinned);
+      projectorMock.transcriptPath.mockReturnValue(transcript);
+
+      try {
+        // Transcript grant OFF → conversation content stays off the list, even
+        // though the projector would happily hand over the path.
+        const ro = await startRO();
+        const off = (await (
+          await fetch(`${base()}/api/sessions`, { headers: bearer(ro.token as string) })
+        ).json()) as { sessions: Array<{ id: string; lastAssistantText?: string }> };
+        expect(off.sessions.every((s) => s.lastAssistantText === undefined)).toBe(true);
+        // The path is the projector's ONE resolve per row; status() is not part
+        // of this path at all (it would re-walk the same binding for a size this
+        // stats for itself).
+        expect(projectorMock.status).not.toHaveBeenCalled();
+        await server.stop();
+
+        const on = await startWithTranscript();
+        const h = bearer(on.token as string);
+        const poll = async () => {
+          const body = (await (await fetch(`${base()}/api/sessions`, { headers: h })).json()) as {
+            sessions: Array<{ id: string; lastAssistantText?: string }>;
+          };
+          return body.sessions.find((s) => s.id === 's1')?.lastAssistantText;
+        };
+
+        // The FIRST poll answers with no field: the 256 KB read is started in
+        // the background, never on the request's own thread.
+        expect(await poll()).toBeUndefined();
+
+        let text: string | undefined;
+        await vi.waitFor(async () => {
+          text = await poll();
+          expect(text).toBeDefined();
+        });
+
+        expect(text).not.toContain('\n');
+        // Cut from the END: an agent's ask is the last thing it wrote.
+        expect(text?.startsWith('…')).toBe(true);
+        expect(text?.endsWith('끝 👩\u200d💻')).toBe(true);
+        expect(text).not.toContain('\u200b');
+        expect(text).not.toContain('\u202e');
+        const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+        // 140 INCLUDING the ellipsis — the truncated row is never the wider one.
+        expect([...segmenter.segment(text as string)].length).toBe(140);
+
+        // Same (path, size, mtime) → served from the memo. Rewriting the file
+        // with a byte-identical, content-different message and restoring the
+        // pinned mtime is the only way to prove the second poll never re-read:
+        // a re-read would answer with the new ending.
+        fs.writeFileSync(transcript, entry(said.replace('끝', '꾰')));
+        fs.utimesSync(transcript, pinned, pinned);
+        expect(await poll()).toBe(text);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
       }
     });
   });
