@@ -30,8 +30,15 @@ import {
  * landed the layout between breakpoints. Remembering the size here is what
  * lets the reset put it back in the same call. Keyed weakly, so a closed page
  * takes its entry with it.
+ *
+ * `null` is a recorded value, not a missing one: it means the page had no
+ * Playwright viewport at all and followed its window — which is every page the
+ * chrome backend drives. Such a page must never be given one, because
+ * Playwright has no way to hand a pinned viewport back to the window: the reset
+ * could then only keep the phone's size, and re-applying it dropped the real
+ * devicePixelRatio to 1 (#1357, found on the chrome backend after the first fix).
  */
-const prePresetViewport = new WeakMap<Page, { width: number; height: number }>();
+const prePresetViewport = new WeakMap<Page, { width: number; height: number } | null>();
 
 /** Used only when a reset finds neither a remembered nor a current viewport. */
 const DEFAULT_RESET_VIEWPORT = { width: 1280, height: 720 };
@@ -550,9 +557,16 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
               // in a row must still reset to the pre-emulation desktop size.
               if (!prePresetViewport.has(page)) {
                 const before = page.viewportSize();
-                if (before) prePresetViewport.set(page, { ...before });
+                prePresetViewport.set(page, before ? { ...before } : null);
               }
-              await page.setViewportSize(deviceDescriptor.viewport);
+              // A window-sized page (chrome backend) gets the preset's size from
+              // the device-metrics override applyUserAgentEmulation sends below,
+              // which the reset can clear. Pinning a Playwright viewport here
+              // instead is what left it stuck at the phone's size.
+              const windowSized = prePresetViewport.get(page) === null;
+              if (!windowSized) {
+                await page.setViewportSize(deviceDescriptor.viewport);
+              }
               // Apply user agent via extra headers
               await context.setExtraHTTPHeaders({
                 ...(headers ?? {}),
@@ -591,6 +605,15 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
                 // Client Hints stay on the real browser's values; the UA header
                 // is still applied. Worth reporting, not worth failing on.
                 applied.push('clientHints=unavailable (UA header applied without matching hints or device metrics)');
+                if (windowSized) {
+                  // Without the held session there is no override to carry the
+                  // size, so fall back to a Playwright viewport — and forget the
+                  // window-sized record, because that viewport cannot be undone
+                  // and a reset must not claim it returned to the window.
+                  await page.setViewportSize(deviceDescriptor.viewport);
+                  prePresetViewport.delete(page);
+                  applied.push('note=viewport pinned by Playwright; device:null cannot return this page to its window size');
+                }
               }
               applied.push(`device=${device} (${deviceDescriptor.viewport.width}x${deviceDescriptor.viewport.height})`);
               // A Safari/iOS preset on a Chromium browser cannot be made whole:
@@ -634,16 +657,26 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
               // pre-preset size back here rather than telling the caller to run
               // browser_resize: a page left at the phone width keeps matching
               // the preset's media queries (#1357).
+              const hadRecord = prePresetViewport.has(page);
               const remembered = prePresetViewport.get(page);
               prePresetViewport.delete(page);
-              const current = page.viewportSize();
-              const target = remembered ?? current ?? DEFAULT_RESET_VIEWPORT;
-              const how = remembered
-                ? 'restored'
-                : current
-                  ? 'kept (no pre-preset viewport recorded)'
-                  : 'default (no pre-preset viewport recorded)';
-              await page.setViewportSize(target);
+              let summary: string;
+              if (hadRecord && remembered === null) {
+                // Window-sized page: the preset only ever lived in the metrics
+                // override, and clearUserAgentEmulation above has already
+                // dropped it. Setting any viewport now would pin the page again.
+                summary = 'window size restored';
+              } else {
+                const current = page.viewportSize();
+                const target = remembered ?? current ?? DEFAULT_RESET_VIEWPORT;
+                const how = remembered
+                  ? 'restored'
+                  : current
+                    ? 'kept (no pre-preset viewport recorded)'
+                    : 'default (no pre-preset viewport recorded)';
+                await page.setViewportSize(target);
+                summary = `viewport ${target.width}x${target.height} ${how}`;
+              }
               // The page's media queries and `ontouchstart` checks already ran
               // under the preset, so their results cannot be trusted without a
               // fresh evaluation.
@@ -652,9 +685,7 @@ export function registerStateTools(server: McpServer, deps: BrowserToolDeps): vo
                 reloaded = false;
               });
               applied.push(
-                `device=reset (viewport ${target.width}x${target.height} ${how}, ${
-                  reloaded ? 'reloaded' : 'reload failed'
-                })`,
+                `device=reset (${summary}, ${reloaded ? 'reloaded' : 'reload failed'})`,
               );
             }
             // Say what the page actually reports now, on apply and on reset

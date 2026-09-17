@@ -168,3 +168,65 @@ describe('browser_emulate device reset (Playwright lane)', () => {
   });
 });
 
+// The chrome backend drives a real Chrome window: the page has no Playwright
+// viewport (`viewportSize()` is null) and follows the window. The first #1357
+// fix recorded nothing for such a page and pinned the phone's size with
+// setViewportSize, which Playwright cannot hand back to the window — measured
+// live, a 1036x703 dpr-1.25 page reset to 390x664 dpr 1.
+describe('browser_emulate device reset (window-sized page, chrome backend)', () => {
+  beforeEach(() => {
+    viewport = null;
+  });
+
+  it('never pins a viewport, and the reset leaves the page to its window', async () => {
+    const applied = await emulate({ device: 'iPhone 13' });
+
+    expect(setViewportSize).not.toHaveBeenCalled();
+    // The preset's size still reaches the page, through the metrics override.
+    expect(applyUserAgentEmulation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.any(String),
+      undefined,
+      expect.objectContaining({ width: 390, mobile: true, hasTouch: true }),
+    );
+    expect(applied.content[0].text).toContain('device=iPhone 13');
+
+    uaEmulated = true;
+    const reset = await emulate({ device: null });
+
+    expect(clearUserAgentEmulation).toHaveBeenCalled();
+    expect(setViewportSize).not.toHaveBeenCalled();
+    expect(viewport).toBeNull();
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(reset.content[0].text).toContain('device=reset (window size restored, reloaded)');
+    expect(reset.content[0].text).not.toContain('no pre-preset viewport recorded');
+  });
+
+  it('stays window-sized through a chain of presets', async () => {
+    await emulate({ device: 'iPhone 13' });
+    await emulate({ device: 'Pixel 5' });
+    uaEmulated = true;
+
+    const reset = await emulate({ device: null });
+
+    expect(setViewportSize).not.toHaveBeenCalled();
+    expect(reset.content[0].text).toContain('window size restored');
+  });
+
+  it('pins a viewport only when the metrics override is unavailable, and says the reset cannot undo it', async () => {
+    applyUserAgentEmulation.mockResolvedValueOnce(false);
+
+    const applied = await emulate({ device: 'iPhone 13' });
+
+    expect(setViewportSize).toHaveBeenCalledWith(expect.objectContaining({ width: 390 }));
+    expect(applied.content[0].text).toContain('device:null cannot return this page to its window size');
+
+    const reset = await emulate({ device: null });
+
+    // No claim of a window restore it could not perform.
+    expect(reset.content[0].text).not.toContain('window size restored');
+    expect(reset.content[0].text).toContain('kept (no pre-preset viewport recorded)');
+  });
+});
+
