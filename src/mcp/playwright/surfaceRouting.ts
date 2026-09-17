@@ -123,6 +123,18 @@ export function clearPinnedSurface(): void {
   writePin(null);
 }
 
+/**
+ * Drop the pin only while it still names this surface.
+ *
+ * A blanket clear would take a pin another call of this same connection has
+ * already moved on to — the phantom surface below is discovered seconds after
+ * it was opened, and an interleaved open may have pinned a real one since.
+ */
+export function clearPinIfSurface(workspaceId: string, surfaceId: string): void {
+  const pin = readPin();
+  if (pin && pin.workspaceId === workspaceId && pin.surfaceId === surfaceId) writePin(null);
+}
+
 /** Test seam: forget the module-fallback identity (single-child path only). */
 export function __resetSurfaceRoutingForTesting(): void {
   moduleOpenerKey = undefined;
@@ -223,9 +235,10 @@ export function scopeTargets(
  */
 async function surfaceListing(
   workspaceId: string,
+  timeoutMs?: number,
 ): Promise<{ status: 'listed'; surfaceIds: string[] } | { status: 'unknown' }> {
   try {
-    const result = (await sendRpc('browser.tabs', { action: 'list', workspaceId })) as
+    const result = (await sendRpc('browser.tabs', { action: 'list', workspaceId }, timeoutMs)) as
       | { ok?: unknown; action?: unknown; tabs?: Array<{ surfaceId?: unknown; opener?: unknown }> }
       | undefined;
     if (result?.ok !== true || result.action !== 'list' || !Array.isArray(result.tabs)) {
@@ -326,8 +339,38 @@ export async function openSurfaceForConnection(
   // browser_navigate opened its own pane and was refused a millisecond later.
   // (The page lane does its own settling after an auto-open, so it does not
   // ask and does not pay for this twice.)
-  if (opts.awaitReady) await awaitSurfaceRegistered(workspaceId, opened);
+  if (opts.awaitReady) {
+    const readiness = await awaitSurfaceRegistered(workspaceId, opened);
+    if (readiness === 'absent') {
+      // The pin would otherwise aim every later unsaid call of this connection
+      // at a surface that does not exist, so each of them fails the same way.
+      clearPinIfSurface(workspaceId, opened);
+      throw new SurfaceNotRegisteredError(opened);
+    }
+  }
   return opened;
+}
+
+/**
+ * A surface was opened for this caller and never became addressable.
+ *
+ * Its own class so the callers that swallow "could not open" can still tell
+ * this apart: sending the call unnamed after THIS failure would hand it to
+ * main's workspace-blind default, which is the defect the routing exists to
+ * prevent (#1328).
+ */
+export class SurfaceNotRegisteredError extends Error {
+  constructor(public readonly surfaceId: string) {
+    super(
+      `BROWSER_SURFACE_NOT_REGISTERED: a browser surface was opened for you (${surfaceId}) but ` +
+        'never became addressable — main lists no CDP target for it and this workspace does not ' +
+        // Not "nothing was navigated": this is thrown from the shared open
+        // path, so it reaches browser_click, browser_screenshot and the rest
+        // as often as browser_navigate.
+        'hold it. Nothing was done. Retry, or open one explicitly with browser_open.',
+    );
+    this.name = 'SurfaceNotRegisteredError';
+  }
 }
 
 /** How long to wait for a freshly opened surface to become addressable. */
@@ -335,14 +378,38 @@ const SURFACE_READY_TIMEOUT_MS = 6_000;
 const SURFACE_READY_POLL_MS = 150;
 
 /**
+ * What the wait below could establish about a freshly opened surface.
+ *
+ * `unconfirmed` is not a failure and must never be treated as one: it is the
+ * slow guest, and the lane that cannot be asked.
+ */
+type SurfaceReadiness = 'registered' | 'unconfirmed' | 'absent';
+
+/**
  * Wait until main lists the surface among the caller's targets.
  *
  * That listing is exactly the condition every target-addressing handler
  * checks, so it is the honest readiness signal rather than a fixed sleep. A
- * timeout is not an error: the call proceeds and main answers for itself —
- * waiting longer would turn a slow guest into a hung tool.
+ * timeout on its own is still not an error — waiting longer would turn a slow
+ * guest into a hung tool — but a timeout used to end the wait silently, and a
+ * surface that was ANSWERED and never existed then took the whole call with
+ * it: the navigate was fired into the gap and the caller was told it worked
+ * (#1328). So the timeout asks the control plane, which knows a pane before
+ * its guest registers a CDP target, and only the two answers TOGETHER convict:
+ *
+ *   cdp.info lists it ─────────────────────────────► registered
+ *   cdp.info throws ───────────────────────────────► unconfirmed  (cannot ask)
+ *   6s, no listing ──┬── tabs list unreadable ─────► unconfirmed  (cannot ask)
+ *                    ├── tabs list HAS it ─────────► unconfirmed  (slow guest)
+ *                    └── tabs list lacks it
+ *                          ├── workspace owns it ──► unconfirmed  (stashed)
+ *                          ├── cannot check ───────► unconfirmed
+ *                          └── workspace has not ──► absent       (never existed)
  */
-async function awaitSurfaceRegistered(workspaceId: string, surfaceId: string): Promise<void> {
+async function awaitSurfaceRegistered(
+  workspaceId: string,
+  surfaceId: string,
+): Promise<SurfaceReadiness> {
   const deadline = Date.now() + SURFACE_READY_TIMEOUT_MS;
   for (;;) {
     try {
@@ -351,13 +418,62 @@ async function awaitSurfaceRegistered(workspaceId: string, surfaceId: string): P
         openerKey: getOpenerKey(),
       })) as RoutableCdpInfo;
       if (Array.isArray(info?.targets) && info.targets.some((t) => t.surfaceId === surfaceId)) {
-        return;
+        return 'registered';
       }
     } catch {
-      return; // cannot ask — let the call itself report whatever happens
+      return 'unconfirmed'; // cannot ask — let the call itself report whatever happens
     }
-    if (Date.now() >= deadline) return;
+    if (Date.now() >= deadline) break;
     await new Promise((resolve) => setTimeout(resolve, SURFACE_READY_POLL_MS));
+  }
+  const listing = await surfaceListing(workspaceId, CONVICTION_PROBE_TIMEOUT_MS);
+  if (listing.status === 'unknown') return 'unconfirmed';
+  if (listing.surfaceIds.includes(surfaceId)) return 'unconfirmed';
+  return (await workspaceOwnsSurface(workspaceId, surfaceId)) === false ? 'absent' : 'unconfirmed';
+}
+
+/**
+ * How long each conviction probe may take.
+ *
+ * Short on purpose. These run only after the readiness wait has already spent
+ * its 6s, and the state that produces a phantom surface — a wedged or
+ * restarting main — is exactly the state where `sendRpc`'s default budget (10s
+ * per attempt, three attempts, plus the pipe-path loop and the TCP fallback)
+ * would add half a minute to a tool call the agent is blocked on. A probe that
+ * cannot answer quickly answers "cannot check", which acquits.
+ */
+const CONVICTION_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Does this workspace OWN the surface — stashed panes included?
+ *
+ * `browser.tabs list` walks the VISIBLE pane tree (renderer/utils/browserTabs
+ * uses `getLeafPanes(rootPane)`, not `getWorkspaceLeafPanes`), and a stashed
+ * browser pane has no mounted webview either, so a surface stashed inside the
+ * readiness window looks identical to one that was never created. It is not:
+ * it exists, it is unstashable, and convicting it would drop the pin and open
+ * a fresh pane on every retry.
+ *
+ * `surface.list` with `includeStashed` is the question actually being asked.
+ * Three answers, like every other check here: `false` only when the list was
+ * read and does not hold it. A lane that denies the method, a malformed reply,
+ * or an EMPTY list (which `surface.list` also returns for a workspace it could
+ * not resolve) is `undefined` — cannot check, so acquit.
+ */
+async function workspaceOwnsSurface(
+  workspaceId: string,
+  surfaceId: string,
+): Promise<boolean | undefined> {
+  try {
+    const rows = (await sendRpc(
+      'surface.list',
+      { workspaceId, includeStashed: true },
+      CONVICTION_PROBE_TIMEOUT_MS,
+    )) as Array<{ id?: unknown }> | undefined;
+    if (!Array.isArray(rows) || rows.length === 0) return undefined;
+    return rows.some((row) => row?.id === surfaceId);
+  } catch {
+    return undefined;
   }
 }
 
@@ -442,7 +558,10 @@ export async function resolveDefaultSurface(
       // somebody else is working in.
       return { kind: 'surface', surfaceId: pick.surfaceId };
     }
-    clearPinnedSurface();
+    // Conditional, for the same reason the open path's drop is: an awaited
+    // listing sits between reading this pin and clearing it, and another call
+    // of this connection may have opened and pinned a real surface meanwhile.
+    clearPinIfSurface(workspaceId, pick.surfaceId);
     // The pin was the only reason the other steps were skipped, so run them
     // now that it is gone — against the targets already in hand.
     pick = pickDefaultSurface(scoped, workspaceId, null);

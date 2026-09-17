@@ -7,6 +7,7 @@ import {
   openSurfaceForConnection,
   pinnedSurfaceFor,
   resolveDefaultSurface,
+  SurfaceNotRegisteredError,
 } from './surfaceRouting';
 
 /** Stable error code for browser operations whose caller cannot be scoped. */
@@ -206,6 +207,11 @@ async function surfaceForScopedRpc(
   try {
     opened = await openSurfaceForConnection(scope.workspaceId, { awaitReady: true });
   } catch (err) {
+    // A surface that was answered and never existed is not "could not open".
+    // Swallowing it would leave `opened` null and send this call UNNAMED,
+    // which is main's workspace-blind pick — another connection's tab
+    // whenever one exists (#1328).
+    if (err instanceof SurfaceNotRegisteredError) throw err;
     console.error(
       `[browserScope] ${method}: could not open a surface for this caller:`,
       err instanceof Error ? err.message : String(err),
@@ -260,7 +266,53 @@ export async function sendScopedBrowserRpc<T = unknown>(
   const surfaceId = scope.surfaceId ?? (await surfaceForScopedRpc(method, scope));
   if (surfaceId) scopedParams.surfaceId = surfaceId;
   else delete scopedParams.surfaceId;
-  return sendRpc(method, scopedParams) as Promise<T>;
+  return rejectErrorPayload(await sendRpc(method, scopedParams)) as T;
+}
+
+/**
+ * Turn "answered ok, did nothing" back into an error.
+ *
+ * The transport rejects only when a main handler THREW (`wmux-client`
+ * attemptRpc: `response.error` → reject). A handler that RETURNS
+ * `{ error: '...' }` — main's own refusals, and every failure the renderer
+ * bridge reports, such as `browser: surface <id> not found or not a browser`
+ * for a pane whose webview is not mounted — arrives as a perfectly successful
+ * result. `browser_navigate` then printed `Navigated to <url>` for a page
+ * nothing ever loaded (#1328).
+ *
+ * Main's builtin-reuse path already post-checks exactly this shape
+ * (browser.rpc.ts, "Reported, not swallowed"). Doing it here, at the one
+ * funnel every scoped browser RPC passes through, retires the whole class
+ * rather than navigate's instance of it.
+ *
+ * Both of wmux's returned-failure conventions count: the bare
+ * `{ error: string }` the renderer bridge and main's own refusals use, and the
+ * `{ ok: false, error: { code, message } }` `browser.tabs` answers with.
+ *
+ * A success is never rewritten. `ok === true` short-circuits, and a payload
+ * that merely CARRIES data under some other key is untouched — the check reads
+ * `error` and nothing else. The invariant it rests on (no browser method
+ * answers a top-level `error` on a path that worked) is pinned by a test in
+ * browserScope.errorPayload.test.ts rather than by this comment alone.
+ */
+function rejectErrorPayload(result: unknown): unknown {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const shape = result as { ok?: unknown; error?: unknown };
+  if (shape.ok === true) return result;
+  const message = describeReturnedFailure(shape.error);
+  if (message) throw new Error(message);
+  return result;
+}
+
+/** The human-readable half of either returned-failure convention, or null. */
+function describeReturnedFailure(error: unknown): string | null {
+  if (typeof error === 'string') return error.length > 0 ? error : null;
+  if (!error || typeof error !== 'object') return null;
+  const structured = error as { code?: unknown; message?: unknown };
+  const text = typeof structured.message === 'string' ? structured.message : '';
+  const code = typeof structured.code === 'string' ? structured.code : '';
+  if (text && code) return `${code}: ${text}`;
+  return text || code || null;
 }
 
 /**
@@ -311,6 +363,10 @@ export async function leaseSurfaceScope(scope: BrowserTargetScope): Promise<Brow
     const opened = await openSurfaceForConnection(scope.workspaceId, { awaitReady: true });
     if (opened) return Object.freeze({ workspaceId: scope.workspaceId, surfaceId: opened });
   } catch (err) {
+    // Reported here rather than left to the body: the body would open a SECOND
+    // surface against the same broken workspace before failing with the same
+    // answer, so the caller pays for two doomed opens to learn one thing.
+    if (err instanceof SurfaceNotRegisteredError) throw err;
     console.error(
       '[browserScope] could not open a surface to lease for this caller:',
       err instanceof Error ? err.message : String(err),
