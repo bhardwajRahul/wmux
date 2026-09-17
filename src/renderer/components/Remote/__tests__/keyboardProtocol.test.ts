@@ -80,4 +80,41 @@ describe('foldRemoteKeyboardState', () => {
   it('picks 9001 out of a combined DECSET list', () => {
     expect(foldRemoteKeyboardState(INIT, '\x1b[?1;9001h').win32Input).toBe(true);
   });
+
+  // #1363: every ConPTY session opens with ?9001h on conhost's own behalf.
+  it('ignores a ?9001h enable when win32-input-mode is not trusted', () => {
+    const opts = { trustWin32Input: false };
+    expect(foldRemoteKeyboardState(INIT, '\x1b[?9001h', opts).win32Input).toBe(false);
+    expect(foldRemoteKeyboardState(INIT, '\x1b[?1;9001h', opts).win32Input).toBe(false);
+  });
+
+  it('still honours a ?9001l disable when win32-input-mode is not trusted', () => {
+    const on = foldRemoteKeyboardState(INIT, '\x1b[?9001h');
+    expect(on.win32Input).toBe(true);
+    expect(
+      foldRemoteKeyboardState(on, '\x1b[?9001l', { trustWin32Input: false }).win32Input,
+    ).toBe(false);
+  });
+
+  it('keeps folding kitty and modifyOtherKeys when win32 is not trusted', () => {
+    const opts = { trustWin32Input: false };
+    expect(acceptsCsiU(foldRemoteKeyboardState(INIT, '\x1b[>1u', opts))).toBe(true);
+    expect(foldRemoteKeyboardState(INIT, '\x1b[>4;2m', opts).modifyOtherKeys).toBe(2);
+  });
+
+  // A shell prompt means no app is negotiating any more — the reset no longer
+  // waits for the 15 s process-liveness poll (#1363).
+  it('resets everything on an OSC 133;A prompt start', () => {
+    const armed = foldRemoteKeyboardState(INIT, '\x1b[>1u\x1b[?9001h\x1b[>4;2m');
+    expect(armed.kitty).toBe(true);
+    const back = foldRemoteKeyboardState(armed, '\x1b]133;A\x07PS D:\\> ');
+    expect(back).toEqual(INIT);
+  });
+
+  it('applies a negotiation that follows the prompt start in the same chunk', () => {
+    const armed = foldRemoteKeyboardState(INIT, '\x1b[?9001h');
+    const after = foldRemoteKeyboardState(armed, '\x1b]133;A\x07\x1b[>1u');
+    expect(after.win32Input).toBe(false);
+    expect(after.kitty).toBe(true);
+  });
 });

@@ -55,7 +55,7 @@
     var remoteAcceptsCsiU = !!opts.remoteAcceptsCsiU;
     var remoteWin32Input = !!opts.remoteWin32Input;
     // Keep in lockstep with newlineKeys.ts SHIFT_ENTER_WIN32.
-    var WIN32_SHIFT_ENTER = '\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_';
+    var WIN32_SHIFT_ENTER = '\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_';
 
     // Shift+Enter. Encoding depends on what the pane negotiated: win32-input-
     // mode (Codex on Windows, #1152) first, then kitty CSI-u. A pane that

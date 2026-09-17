@@ -48,6 +48,14 @@ const MODIFY_OTHER_KEYS = new RegExp('\\x1b\\[>4;([0-2])m', 'g');
  * Combined DECSET (`CSI ? 1 ; 9001 h`) is matched by walking the mode list.
  */
 const DECSET_PRIVATE = new RegExp('\\x1b\\[\\?([\\d;]+)([hl])', 'g');
+/**
+ * OSC 133;A — shell-integration "a new prompt starts here" (see
+ * daemon/shell-integration.ts). The pane is back at its shell, so whatever the
+ * previous foreground app negotiated is gone. Resetting on this edge makes the
+ * state self-clearing from the pane's own output instead of depending on the
+ * 15 s process-liveness poll the renderer used to be the only reset (#1363).
+ */
+const PROMPT_START = new RegExp('\\x1b\\]133;A', 'g');
 /* eslint-enable no-control-regex */
 
 export interface RemoteKeyboardState {
@@ -77,9 +85,24 @@ export const INITIAL_REMOTE_KEYBOARD_STATE: RemoteKeyboardState = {
  * — carrying a partial-sequence buffer — would have to be correct about every
  * escape shape to avoid holding bytes forever.
  */
+export interface FoldKeyboardStateOptions {
+  /**
+   * Whether `CSI ? 9001 h` in this pane's output means the *app* asked for
+   * win32-input-mode.
+   *
+   * False for a pane hosted on Windows: every ConPTY session emits `?9001h`
+   * as its very first bytes — conhost asking the terminal, not the app — so
+   * on that host the sequence carries no information about the app and would
+   * arm win32 key records for every pane on the box (#1363). kitty and
+   * modifyOtherKeys are unaffected: an app must request those itself.
+   */
+  trustWin32Input?: boolean;
+}
+
 export function foldRemoteKeyboardState(
   prev: RemoteKeyboardState,
   bytes: string | Uint8Array,
+  opts?: FoldKeyboardStateOptions,
 ): RemoteKeyboardState {
   // The mirror hands xterm raw BYTES so multi-byte UTF-8 split across the wire
   // decodes in xterm's parser rather than in a lossy JS round-trip. Every
@@ -88,7 +111,8 @@ export function foldRemoteKeyboardState(
   const chunk = typeof bytes === 'string'
     ? bytes
     : Array.from(bytes, (b) => String.fromCharCode(b)).join('');
-  if (!chunk.includes('\x1b[')) return prev;
+  if (!chunk.includes('\x1b')) return prev;
+  const trustWin32Input = opts?.trustWin32Input ?? true;
 
   let kitty = prev.kitty;
   let modifyOtherKeys = prev.modifyOtherKeys;
@@ -121,8 +145,24 @@ export function foldRemoteKeyboardState(
     const modes = m[1].split(';');
     if (!modes.includes('9001')) continue;
     const enable = m[2] === 'h';
+    // An enable we do not trust (ConPTY's own startup request) is dropped; a
+    // disable is always honoured — turning the mode back off can only make us
+    // more conservative.
+    if (enable && !trustWin32Input) continue;
     const index = m.index;
     events.push({ index, apply: () => { win32Input = enable; } });
+  }
+  PROMPT_START.lastIndex = 0;
+  for (let m = PROMPT_START.exec(chunk); m; m = PROMPT_START.exec(chunk)) {
+    const index = m.index;
+    events.push({
+      index,
+      apply: () => {
+        kitty = INITIAL_REMOTE_KEYBOARD_STATE.kitty;
+        modifyOtherKeys = INITIAL_REMOTE_KEYBOARD_STATE.modifyOtherKeys;
+        win32Input = INITIAL_REMOTE_KEYBOARD_STATE.win32Input;
+      },
+    });
   }
 
   if (events.length === 0) return prev;

@@ -65,7 +65,7 @@ describe('decideMirrorKey — the four conveniences #895 asked for', () => {
       key({ key: 'Enter', code: 'Enter', shiftKey: true }),
       opts({ protocol: { win32Input: true } }),
     );
-    expect(d).toEqual({ kind: 'write', data: '\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_' });
+    expect(d).toEqual({ kind: 'write', data: '\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_' });
   });
 
   it('hands Shift+Enter back to xterm when the remote never negotiated', () => {

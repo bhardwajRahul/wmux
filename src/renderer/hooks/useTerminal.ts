@@ -1737,8 +1737,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     const keyboardRef = { current: adopted && !parkedKnownGone
       ? parkedKeyboardByTerminal.get(terminal) ?? INITIAL_REMOTE_KEYBOARD_STATE
       : INITIAL_REMOTE_KEYBOARD_STATE };
+    // On Windows `?9001h` says nothing about the app: ConPTY emits it at the
+    // start of every session on its own behalf, so trusting it armed win32 key
+    // records for every pane on the box (#1363). kitty / modifyOtherKeys still
+    // fold normally — an app has to ask for those itself.
+    const foldOpts = { trustWin32Input: window.electronAPI.platform !== 'win32' };
     const noteKeyboard = (data: string | Uint8Array) => {
-      keyboardRef.current = foldRemoteKeyboardState(keyboardRef.current, data);
+      keyboardRef.current = foldRemoteKeyboardState(keyboardRef.current, data, foldOpts);
       parkedKeyboardByTerminal.set(terminal, keyboardRef.current);
     };
     // #1228 review (C1): the fold is liveness-scoped. When process-truth or
@@ -2386,9 +2391,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       deliverPtyData({ ...payload, data: restingCursor.process(payload.data) });
     };
     const deliverPtyData = (payload: PtyDataPayload) => {
-      // Fold before the resync buffer so a ?9001h that arrives mid-resync
-      // still arms Shift+Enter encoding (#1152).
-      noteKeyboard(payload.data);
+      // Fold before the resync buffer so a mid-resync negotiation still arms
+      // the encoding (#1152). Replay is history, not a negotiation: it
+      // re-delivers the dead session's `?9001h` on every restart (#1363).
+      if (!payload.replay) noteKeyboard(payload.data);
       const st = resyncRef.current;
       if (st.pending) {
         st.buffer.push(payload);
