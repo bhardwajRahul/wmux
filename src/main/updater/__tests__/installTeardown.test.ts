@@ -25,6 +25,7 @@ import {
   readDaemonPid,
   terminatePids,
   readAbortMarker,
+  readAbortRecord,
   clearAbortMarker,
   waitForWaiterHeartbeat,
   INSTALL_ABORT_MARKER,
@@ -414,6 +415,74 @@ describe('consumeAbortMarker', () => {
     fs.writeFileSync(marker, '   \n');
     expect(readAbortMarker(marker)).toBe('install-aborted');
   });
+
+  // #1341 — the marker now names the version the install was FOR, so the app
+  // that boots out of it can tell "this install finished and the waiter has
+  // not cleaned up yet" from "this install was refused".
+  it('#1341: splits the target version out, and keeps it out of the reason', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'install-aborted: install root still locked\nwmux-install-target: 3.57.0\n');
+
+    expect(readAbortRecord(marker)).toEqual({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: '3.57.0',
+    });
+    // Nothing that renders the reason may ever show the machine-readable line.
+    expect(readAbortMarker(marker)).toBe('install-aborted: install root still locked');
+  });
+
+  it('#1341: a leading v compares equal, like normalizeVersion', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'install-aborted: x\r\nwmux-install-target: v3.57.0\r\n');
+    expect(readAbortRecord(marker)?.targetVersion).toBe('3.57.0');
+  });
+
+  it('#1341: a pre-fix marker with no stamp reads as target-unknown', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'install-aborted: install root still locked\n');
+    expect(readAbortRecord(marker)).toEqual({
+      reason: 'install-aborted: install root still locked',
+      targetVersion: null,
+    });
+  });
+
+  it('#1341: a marker that is nothing but a stamp still reports a refusal', () => {
+    const dir = tempDir();
+    const marker = path.join(dir, INSTALL_ABORT_MARKER);
+    fs.writeFileSync(marker, 'wmux-install-target: 3.57.0\n');
+    expect(readAbortRecord(marker)).toEqual({ reason: 'install-aborted', targetVersion: '3.57.0' });
+  });
+});
+
+describe('buildWaiterScript — #1341 target-version stamp', () => {
+  it('stamps every abort path through one writer, so no branch can forget it', () => {
+    const s = buildWaiterScript({ ...PLAN, targetVersion: '3.57.0' }) ?? '';
+    expect(s).toContain(`$targetLine = 'wmux-install-target: 3.57.0'`);
+    // One writer, one write: a reason and its stamp in two Set-Content calls
+    // would leave a window where the new app reads an unstamped reason — the
+    // very race this fixes.
+    expect(s).toContain('function Write-InstallAbortMarker($reason) {');
+    expect(s).not.toMatch(/Set-Content -LiteralPath \$marker -Value 'install-aborted/);
+    const writes = (s.match(/Write-InstallAbortMarker /g) ?? []).length;
+    // interrupted sentinel + stuck handle + locked root + cannot-start +
+    // incomplete-install = 5 marker writes, all stamped.
+    expect(writes).toBe(5);
+  });
+
+  it('omits the stamp when the caller cannot name the target, instead of failing the build', () => {
+    const s = buildWaiterScript(PLAN) ?? '';
+    expect(s).toContain('$targetLine = $null');
+    expect(s).toContain('Write-InstallAbortMarker ');
+  });
+
+  it('drops an unusable version rather than refusing to update', () => {
+    const s = buildWaiterScript({ ...PLAN, targetVersion: "3.57.0'; rm -rf" }) ?? '';
+    expect(s).not.toBe('');
+    expect(s).toContain('$targetLine = $null');
+  });
 });
 
 describe('buildWaiterScript — the lock probe covers loadable images, not just .exe', () => {
@@ -560,7 +629,10 @@ describe('buildWaiterScript — one waiter per install root (#980, coderabbit)',
     // #1056 heartbeat write IS expected before this point — it says "a
     // process ran," not "the install was refused," and every waiter
     // (incumbent or newcomer) writes its own regardless of the mutex outcome.
-    expect(s.slice(0, yieldAt)).not.toContain('-LiteralPath $marker');
+    // #1341 — the marker writer is DEFINED before the mutex (a function
+    // definition writes nothing); what must not appear above the yield is a
+    // CALL to it.
+    expect(s.slice(0, yieldAt)).not.toMatch(/^Write-InstallAbortMarker /m);
     expect(s.slice(0, yieldAt)).toContain('-LiteralPath $ready');
   });
 

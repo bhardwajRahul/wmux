@@ -76,6 +76,32 @@ export const INSTALL_ABORT_MARKER = 'update-install-aborted.txt';
  */
 export const INSTALL_READY_MARKER = 'update-install-ready.tmp';
 
+/**
+ * #1341 — machine-readable line the waiter appends to the abort marker naming
+ * the version the install was FOR.
+ *
+ * The marker is written pessimistically, up front, and only removed once the
+ * waiter has seen Setup.exe exit and verified the tree. But Squirrel launches
+ * the freshly installed app (`--squirrel-firstrun`) BEFORE Setup.exe exits, so
+ * the new app boots inside that window, reads a marker that is about to be
+ * deleted, and reports a refusal for an install that actually succeeded.
+ *
+ * Carrying the target version turns that guess into a fact: if we are already
+ * running the version the marker was written for, the install plainly worked,
+ * whatever the marker's text says. Version equality (not waiting on the
+ * waiter's mutex) is deliberate — it is the one signal that is still correct
+ * when the waiter is dead, which is exactly the case #1264 exists for.
+ */
+export const INSTALL_ABORT_TARGET_PREFIX = 'wmux-install-target:';
+
+/** A parsed abort marker: why it was written, and for which version. */
+export interface InstallAbortRecord {
+  /** Human-readable reason, marker lines minus the machine-readable ones. */
+  reason: string;
+  /** Version the refused install targeted; null for a pre-#1341 marker. */
+  targetVersion: string | null;
+}
+
 /** Result of the pre-flight space check. `null` when there is enough room. */
 export interface SpaceShortfall {
   volume: string;
@@ -113,6 +139,13 @@ export interface WaiterPlan {
   /** How long an eligible pid gets before the waiter kills it. Short: see
    *  OWN_TREE_FORCE_KILL_GRACE_MS in AutoUpdater.ts for the reasoning. */
   forceKillGraceMs: number;
+  /**
+   * #1341 — the version this install is FOR, stamped into every marker the
+   * waiter writes. Optional: a caller that cannot name the target (an adopted
+   * artifact with no pending release info) simply gets a marker without the
+   * stamp, which the reader treats exactly like a pre-#1341 one.
+   */
+  targetVersion?: string;
 }
 
 /**
@@ -567,6 +600,14 @@ export function buildWaiterScript(plan: WaiterPlan, launchStampPath?: string): s
 
   const pidList = plan.pids.join(',');
   const eligibleList = plan.forceKillEligiblePids.join(',');
+  // #1341 — diagnostics, not a correctness input: an unrecognizable version is
+  // dropped (the marker then reads like a pre-#1341 one) rather than failing
+  // the whole build the way a bad pid or budget does. Refusing to update
+  // because a release was named oddly would be the worse trade.
+  const targetVersion =
+    plan.targetVersion && /^[A-Za-z0-9][A-Za-z0-9.+-]{0,63}$/.test(plan.targetVersion)
+      ? plan.targetVersion
+      : null;
   return [
     `$ErrorActionPreference = 'SilentlyContinue'`,
     `$root = ${psQuote(plan.installRoot)}`,
@@ -574,6 +615,18 @@ export function buildWaiterScript(plan: WaiterPlan, launchStampPath?: string): s
     `$marker = ${psQuote(plan.abortMarkerPath)}`,
     `$ready = ${psQuote(plan.readyMarkerPath)}`,
     `$budget = ${plan.lockBudgetMs}`,
+    // #1341 — every marker write goes through here so the target-version stamp
+    // cannot be forgotten on one branch, and so the reason and the stamp land
+    // in a SINGLE write: two writes would leave a window where the new app can
+    // read a reason with no version and conclude a refusal that did not happen,
+    // which is the bug this is fixing.
+    `$targetLine = ${targetVersion === null ? '$null' : psQuote(`${INSTALL_ABORT_TARGET_PREFIX} ${targetVersion}`)}`,
+    `function Write-InstallAbortMarker($reason) {`,
+    `  try {`,
+    `    if ($targetLine) { Set-Content -LiteralPath $marker -Value @($reason, $targetLine) -Encoding utf8 }`,
+    `    else { Set-Content -LiteralPath $marker -Value $reason -Encoding utf8 }`,
+    `  } catch { }`,
+    `}`,
     // #1056 — the very first thing this script does, before even the mutex.
     // A real machine showed the waiter's PowerShell engine starting and then
     // going silent forever, in the same second the app called app.quit(), with
@@ -640,7 +693,7 @@ export function buildWaiterScript(plan: WaiterPlan, launchStampPath?: string): s
     // #1043 newcomer-marker note above). Written BEFORE the WinForms block so
     // an Add-Type failure cannot eat it, and only AFTER the mutex so a
     // yielding newcomer (exit 5) cannot clobber the incumbent's outcome.
-    `try { Set-Content -LiteralPath $marker -Value 'install-aborted: wmux quit to install the update and the install waiter did start, but it was stopped before it could run the installer — interrupted before it could report an outcome. Try again, or run the installer from the releases page.' -Encoding utf8 } catch { }`,
+    `Write-InstallAbortMarker 'install-aborted: wmux quit to install the update and the install waiter did start, but it was stopped before it could run the installer — interrupted before it could report an outcome. Try again, or run the installer from the releases page.'`,
     // #1043 — best-effort "please wait" indicator for the whole silent
     // window below. Deliberately outside every correctness path: every use
     // of $form is null-checked and wrapped in its own try/catch, so a
@@ -767,7 +820,7 @@ export function buildWaiterScript(plan: WaiterPlan, launchStampPath?: string): s
     `}`,
     `if ($stuck) {`,
     `  if ($form) { try { $form.Close() } catch { } }`,
-    `  Set-Content -LiteralPath $marker -Value 'install-aborted: a process under the install root would not exit' -Encoding utf8`,
+    `  Write-InstallAbortMarker 'install-aborted: a process under the install root would not exit'`,
     `  exit 3`,
     `}`,
     // Everything we knew about is gone. That is necessary, not sufficient: the
@@ -800,7 +853,7 @@ export function buildWaiterScript(plan: WaiterPlan, launchStampPath?: string): s
     // Refusing leaves a working old version. Launching anyway is precisely the
     // failure this module exists to prevent, so there is no "best effort" here.
     `  if ($form) { try { $form.Close() } catch { } }`,
-    `  Set-Content -LiteralPath $marker -Value 'install-aborted: install root still locked' -Encoding utf8`,
+    `  Write-InstallAbortMarker 'install-aborted: install root still locked'`,
     `  exit 2`,
     `}`,
     // The wait is over — Squirrel's own UI takes it from here once
@@ -814,7 +867,7 @@ export function buildWaiterScript(plan: WaiterPlan, launchStampPath?: string): s
     `$setupProc = $null`,
     `try { $setupProc = Start-Process -FilePath $setup -PassThru -ErrorAction Stop } catch { $started = $false }`,
     `if (-not $started) {`,
-    `  Set-Content -LiteralPath $marker -Value 'install-aborted: the installer could not be started' -Encoding utf8`,
+    `  Write-InstallAbortMarker 'install-aborted: the installer could not be started'`,
     `  exit 4`,
     `}`,
     // #1046 -- post-exit verification. A Squirrel install can throw partway
@@ -853,7 +906,7 @@ export function buildWaiterScript(plan: WaiterPlan, launchStampPath?: string): s
     `if (-not $updateExeOk) { $missing += 'Update.exe' }`,
     `if (-not $icuOk) { $missing += 'icudtl.dat' }`,
     `$reason = 'install-aborted: the installer exited but left an incomplete installation (missing ' + ($missing -join ', ') + '). Reinstall wmux from the latest Setup.exe.'`,
-    `try { Set-Content -LiteralPath $marker -Value $reason -Encoding utf8 } catch { }`,
+    `Write-InstallAbortMarker $reason`,
     // The marker only helps if the app can still boot; when icudtl.dat is
     // what went missing, it cannot. This MessageBox is the only surface that
     // reaches that user -- best-effort, gated on the Forms assembly having
@@ -1445,13 +1498,44 @@ export function terminatePids(pids: readonly number[]): number[] {
  * then it is never reportable again.
  */
 export function readAbortMarker(markerPath: string): string | null {
+  return readAbortRecord(markerPath)?.reason ?? null;
+}
+
+/**
+ * #1341 — the same read, with the machine-readable lines split out.
+ *
+ * The target-version line is stripped from `reason` so nothing that renders
+ * the reason (a toast, the quit watchdog's error) ever shows it to a user. A
+ * marker without the line is a pre-#1341 one (or an install whose caller could
+ * not name its target): `targetVersion` is null and every caller falls back to
+ * the behaviour that shipped before this change.
+ */
+export function readAbortRecord(markerPath: string): InstallAbortRecord | null {
+  let raw: string;
   try {
     if (!fs.existsSync(markerPath)) return null;
-    return fs.readFileSync(markerPath, 'utf-8').trim() || 'install-aborted';
+    raw = fs.readFileSync(markerPath, 'utf-8');
   } catch {
     // A read failure is not a refusal — say nothing rather than invent one.
     return null;
   }
+  let targetVersion: string | null = null;
+  const reasonLines: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.toLowerCase().startsWith(INSTALL_ABORT_TARGET_PREFIX)) {
+      // Leading "v" stripped here so "v3.57.0" and "3.57.0" compare equal
+      // against app.getVersion(), exactly like normalizeVersion does.
+      const value = trimmed.slice(INSTALL_ABORT_TARGET_PREFIX.length).trim().replace(/^v/i, '');
+      if (value) targetVersion = value;
+      continue;
+    }
+    reasonLines.push(line);
+  }
+  return {
+    reason: reasonLines.join('\n').trim() || 'install-aborted',
+    targetVersion,
+  };
 }
 
 /**
