@@ -13,6 +13,17 @@ vi.mock('../../wmux-client', () => ({
 
 vi.mock('../../browser-replay/actionRing', () => ({ recordAction: vi.fn() }));
 
+// #1359: the chrome lane now runs the shared resolving URL policy before it
+// drives the page. These hosts are fictional, so the resolver is stubbed to
+// miss — keeping the suite off the machine's DNS. A host that does not resolve
+// is not a positive block, so the navigation still goes out and fails the way
+// this suite is about.
+vi.mock('node:dns/promises', () => ({
+  lookup: vi.fn(async (hostname: string) => {
+    throw new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+  }),
+}));
+
 const getPageForScope = vi.fn();
 const resolveWorkspaceBackend = vi.fn(async () => 'chrome');
 vi.mock('../PlaywrightEngine', () => ({
