@@ -168,10 +168,38 @@ POST /api/stream-ticket        (Authorization header, as always)
 | `snapshot` | base64 of the initial paint |
 | `data` | base64 of live PTY bytes |
 | `exit` | `1` |
+| `agent.liveness` | `{sessionId, state, agent, at}` — what this pane's agent is doing right now |
 
 The first paint is **capped**, and never cut mid-character or mid-escape. When
 `truncated` is true, `omittedBytes` says how much history is above — surface it
 rather than pretending the buffer starts there.
+
+**`agent.liveness` on this stream is the terminal face's activity header.** Same
+event name and same `state` union as the fleet copy in the next section, and the
+same live-only rules — no backlog, no replay, no `id:`, so a reconnecting client
+shows a neutral header until the next event. Three things are different, and all
+three follow from this being a stream you opened for one pane by name:
+
+- **No `/turns` read is needed, and `--allow-transcript` is irrelevant.** The
+  fleet copy reaches a device only after it has read that pane's turn view,
+  which is itself 403 without that flag. A client that only ever mirrors the
+  terminal now gets the header anyway.
+- **It is scoped to this pane.** `sessionId` always equals the `session` you
+  opened with; it is carried so a client holding several streams can route the
+  frame without tracking which reader it came from.
+- **There is no `tool` field, ever.** The tool name is text the agent itself
+  wrote, and widening the STATE to a pane mirror is the point while widening
+  what the pane is typing is not — the same narrowing `/api/sessions` applies to
+  its `liveness` field. Read `tool` off `/api/events` or not at all. `state`
+  still reaches you as `tool` or `awaiting_permission` — render those as plain
+  "working" and "waiting for you" here, never as a header with a hole where a
+  tool name was going to go.
+
+Liveness is a state rather than a "something changed" ping, so a duplicate frame
+is idempotent: a client showing the same pane in two places can render both
+copies and land in the same place. Render an unrecognised `state` as a neutral
+"working" — the union is additive. The brain pane and any session the daemon
+does not have are refused here, so a frame you receive always names your pane.
 
 ### `GET /api/events?ticket=<t>` — fleet-wide attention
 
@@ -233,6 +261,13 @@ skip the window entirely and are sent immediately — those are the transitions 
 user is watching the header to catch. A client that reconnects gets no liveness
 replay and should show a neutral header until the next event; a pane that went
 idle while the SSE was down is caught by the turn view, not by this channel.
+
+The watcher gate is why the per-pane stream also carries `agent.liveness` (see
+the `/api/stream` section above): a client that mirrors a terminal without ever
+opening its turn view — and on a daemon with no `--allow-transcript` it cannot
+open one — has no way to become a watcher, and used to get no header at all.
+Open the pane stream for that, and keep this channel for the fleet view. The
+pane copy omits `tool`; this one keeps it.
 
 Identity fields (`id`, `epoch`) — and `tier` — are stamped **last**, so a
 pane-supplied payload can never shadow them.
@@ -318,12 +353,42 @@ GET /api/events?since=<cursor>     (Bearer)
 GET /api/config    → {allowInput, allowUpload, allowTranscript, gatedTools,
                       gateEnabled?, protocolVersion, minProtocolVersion,
                       serverVersion}
-GET /api/sessions  → {sessions: [{id, cwd, cols, rows, state, agent, lastActivity, workspace?, shell?}]}
+GET /api/sessions  → {sessions: [{id, cwd, cols, rows, state, agent, lastActivity,
+                      workspace?, shell?, lastDetectedAgent?, cwdLeaf?,
+                      liveness?, lastAssistantText?}]}
 POST /api/input?session=<id>   body: raw bytes
 ```
 
 `agent` is null when the pane is not running one; `shell` then says what to call
 it.
+
+Every `?` field above is **additive and optional**, and absent always means "not
+known" rather than a value. Naming a pane is a fallback chain — `agent`, then
+`shell`, then `cwdLeaf` — and a client that ignores all of them behaves exactly
+as it did before they existed.
+
+`lastDetectedAgent` is the canonical slug of the agent the daemon last detected
+in the pane (`claude`, `codex`, …). It exists because `agent` is a mixed
+vocabulary — creation-time role metadata for some panes, this same slug for
+others — so a client holding only `agent` cannot tell an unlabelled agent pane
+from a plain shell, which is how every shell pane's chip collapsed to one word.
+Two rules: treat an unrecognised value as "some agent" (the set is not closed on
+the wire), and read it as **identity, not presence**. It is persisted, so it
+outlives the agent process and every reboot — a pane that ran Claude keeps
+saying so while the shell sits at a prompt. What is running *now* is `liveness`
+and the `agent.liveness` frames, never this.
+
+`cwdLeaf` is the last segment of `cwd`, absent when there is no readable one —
+an empty cwd, a root (`/` and `C:\` alike), or whitespace.
+It is the label of last resort, computed once by the daemon so every client
+agrees on it. Like `cwd` it is the directory the pane's own process last
+claimed, so it is a label and never a path to act on.
+
+`liveness` is `{state, at}` — the last agent state the daemon saw, with the same
+`state` union as the SSE event and no `tool`, dropped once a `busy`/`tool` state
+is too old to believe. `lastAssistantText` is a one-line cut of the agent's last
+message; it rides `--allow-transcript` and is absent until the first poll after
+the transcript changed.
 
 `gatedTools` lists the tools whose calls wait for a remote answer, so a client
 can say *why* something is pending. `gateEnabled` says whether that gate is

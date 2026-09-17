@@ -1934,6 +1934,49 @@ export class WebTerminalServer {
     /** Short program name (`pwsh`, `bash`) — what to call a pane with no agent. */
     shell?: string;
     /**
+     * The agent the daemon last DETECTED running in this pane, as the canonical
+     * slug (`claude`, `codex`, …) — #1319.
+     *
+     * `agent` above is a mixed vocabulary: creation-time role metadata when the
+     * pane has any, otherwise this same slug, otherwise null. A client holding
+     * only that field cannot tell "Codex" the role label from `codex` the
+     * detection, and cannot tell a plain shell from an agent whose role was
+     * never stamped — which is how every shell pane's chip collapsed to the
+     * word "pane". This says one thing and says it in one vocabulary.
+     *
+     * Nothing new is exposed: the same value already reaches the phone through
+     * `agent`'s fallback.
+     *
+     * STICKY, and that is the one thing a client must know about it. It is the
+     * persisted last detection, so it outlives the agent process and every
+     * reboot — `/api/workspaces` refuses this very field for exactly that
+     * reason (a ROSTER row has to vanish when its agent exits). Here it is a
+     * LABEL and stickiness is the point: a pane that ran Claude is still "the
+     * Claude pane" while the shell sits at a prompt. It answers "what is this
+     * pane", never "is an agent running right now" — `liveness` below and the
+     * `agent.liveness` frames answer that, and a client that reads this one as
+     * presence will show a dead agent as alive forever.
+     *
+     * Typed `string` on the wire rather than the `AgentSlug` union it comes
+     * from: the daemon rehydrates the field from persisted JSON without
+     * re-validating it (`src/daemon/index.ts` recovery path), so promising a
+     * closed 9-value set here would strand a client that switched on it. Treat
+     * an unrecognised value as "some agent", the same additive rule the
+     * liveness `state` union follows.
+     */
+    lastDetectedAgent?: string;
+    /**
+     * Last segment of `cwd` — the phone's label of last resort (#1319). See
+     * `cwdLeafOf`. Absent for a pane whose cwd is empty or a bare root.
+     *
+     * Deliberately ONE segment, which is what the issue asked for and what the
+     * field name promises. The bundled browser client builds its own row label
+     * from the last TWO segments (`shortenCwd` in `frontend/app.js`); that is a
+     * client's presentation choice and is left alone rather than renamed into
+     * this contract.
+     */
+    cwdLeaf?: string;
+    /**
      * What the pane's agent is doing, when the daemon has seen a liveness
      * signal for it recently enough to believe. ADDITIVE and OPTIONAL: absent
      * means "not known", never "idle".
@@ -1975,6 +2018,8 @@ export class WebTerminalServer {
         state: s.state,
         agent: s.agent?.displayName ?? s.lastDetectedAgent ?? null,
         lastActivity: s.lastActivity,
+        ...(s.lastDetectedAgent ? { lastDetectedAgent: s.lastDetectedAgent } : {}),
+        ...cwdLeafOf(s.cwd),
         ...workspaceLabelOf(s.env),
         ...shellLabelOf(s.cmd),
         ...this.livenessSummary(s.id),
@@ -3641,9 +3686,13 @@ export class WebTerminalServer {
    *     Liveness is a live signal by nature: a header state from before the
    *     reconnect is worthless, so there is nothing to replay anyway.
    *   - COALESCED per pane, keeping the newest state (see the constant).
-   *   - WATCHERS ONLY. A device that never opened this pane's turn view has no
-   *     header to feed, and its SSE channel should not carry another pane's
-   *     per-tool-call traffic.
+   *   - WATCHERS ONLY on the FLEET stream (`/api/events`). A device that never
+   *     opened this pane's turn view has no header to feed there, and its
+   *     fleet-wide channel should not carry another pane's per-tool-call
+   *     traffic. The per-pane stream is the other half (#1315): a client of
+   *     `/api/stream?session=<id>` gets this pane's state unconditionally,
+   *     minus `tool`, because it asked for that one pane by name. See
+   *     `deliverPaneLiveness`.
    *
    * Terminal states (`isTerminalLiveness`) flush immediately and cancel any
    * open window, so "waiting for you" never queues behind a stale tool name.
@@ -3663,7 +3712,20 @@ export class WebTerminalServer {
     if (this.deps.sessionManager.getSession(sessionId)) {
       this.recordLiveness(sessionId, body.state, body.at);
     }
-    if (this.eventClients.size === 0) return;
+    // #1315 — past this line the id arms a per-pane coalescing timer and ends
+    // up on a wire, so it has to name a pane a phone may be told about. It used
+    // to be inert on its own: an invented id could hold no watcher, so delivery
+    // found nobody. With the pane stream as a second sink that is no longer
+    // true, and `this.clients` is not keyed by pane — one open stream for pane A
+    // would otherwise let an id off the untrusted hook pipe reach
+    // `pendingLiveness`/`livenessTimers`, the same growth `recordLiveness` above
+    // is gated against. Same gate as the transcript routes, so the orchestrator
+    // brain's pane is refused here too.
+    if (!this.readableSession(sessionId)) return;
+    // Both sinks, not just the fleet one (#1315): a phone on the terminal face
+    // holds a pane stream and no `/api/events` connection at all, and bailing on
+    // `eventClients` alone left it with nothing to render.
+    if (this.eventClients.size === 0 && this.clients.size === 0) return;
     if (isTerminalLiveness(body.state)) {
       const timer = this.livenessTimers.get(sessionId);
       if (timer) {
@@ -3744,10 +3806,62 @@ export class WebTerminalServer {
 
   private deliverLiveness(body: AgentLivenessBody): void {
     const watchers = this.transcriptWatchers.get(body.sessionId);
-    if (!watchers || watchers.size === 0) return;
-    const wire = JSON.stringify(body);
-    for (const client of this.eventClients) {
-      if (!watchers.has(this.watcherKey(client.principal))) continue;
+    if (watchers && watchers.size > 0) {
+      const wire = JSON.stringify(body);
+      for (const client of this.eventClients) {
+        if (!watchers.has(this.watcherKey(client.principal))) continue;
+        try {
+          writeSse(client.res, 'agent.liveness', wire);
+        } catch {
+          /* client stream broken — its own 'close' handler cleans up */
+        }
+      }
+    }
+    this.deliverPaneLiveness(body);
+  }
+
+  /**
+   * #1315 — the same liveness state, on the pane stream the terminal face is
+   * already holding open.
+   *
+   * The fleet copy above reaches a device only after it has read that pane's
+   * `/api/sessions/:id/turns`, which is itself 403 without `--allow-transcript`.
+   * A phone that only ever opens the terminal mirror therefore never saw a
+   * liveness frame and had to infer "is it running" from a 30 s poll plus an
+   * activity window — up to ~150 s of lag on a state the daemon knew exactly.
+   *
+   * No new route, no new ticket, no new registry: the subscription IS the SSE
+   * connection, so it ends when the socket does (`handleStream`'s `close`
+   * handler removes the client from `this.clients`). That is the difference
+   * from `transcriptWatchers`, which is deliberately never undone.
+   *
+   * Scoped to the client's OWN pane, so this reaches nobody who was not already
+   * receiving that pane's raw PTY bytes on the same connection — strictly less
+   * than the stream already carries.
+   *
+   * `tool` is withheld, exactly as `livenessSummary` withholds it from
+   * `/api/sessions`: it is per-call content the pane itself chose, arriving over
+   * a hook pipe that is not a trusted producer, and widening the STATE is the
+   * point here while widening what the pane is typing is not. `agent` stays
+   * because it is the pane's identity, which `/api/sessions` already serves in
+   * its own `agent` field — this is not a second, narrower trust claim about the
+   * pipe, only about which of its fields this wire needs. The body is rebuilt
+   * field by field rather than deleted from, so a future field on
+   * `AgentLivenessBody` is opt-in rather than leaked by default.
+   *
+   * Which pane a frame may name is settled in `emitAgentLiveness`, which refuses
+   * an unknown id and the brain pane before a timer is ever armed.
+   */
+  private deliverPaneLiveness(body: AgentLivenessBody): void {
+    if (this.clients.size === 0) return;
+    const wire = JSON.stringify({
+      sessionId: body.sessionId,
+      state: body.state,
+      agent: body.agent,
+      at: body.at,
+    });
+    for (const client of this.clients) {
+      if (client.sessionId !== body.sessionId) continue;
       try {
         writeSse(client.res, 'agent.liveness', wire);
       } catch {
@@ -4404,6 +4518,42 @@ function workspaceLabelOf(env: Record<string, string> | undefined): { workspace?
   const value = env?.[ENV_KEYS.WORKSPACE_NAME];
   const workspace = typeof value === 'string' ? value.trim() : '';
   return workspace ? { workspace } : {};
+}
+
+/**
+ * The last segment of a pane's working directory — the label of last resort
+ * (#1319).
+ *
+ * The phone's chip falls back `agent -> shell -> cwd leaf -> "pane"`, and it
+ * used to compute that leaf itself from `cwd`. Doing it here costs one string
+ * split and means every client agrees on what the leaf is instead of each one
+ * re-deriving it from a path whose separator depends on the host.
+ *
+ * Leaks strictly less than the row already carries: `cwd` is served in full
+ * one field over. It is the OSC 7 cwd, so it is whatever the pane's own
+ * process last claimed — a label, never a directory to act on (see
+ * `DaemonSession.cwd`). Both separators are split on because a Windows daemon
+ * can hold a pane whose shell reports a POSIX path (WSL, git-bash), and a
+ * trailing separator must not yield an empty leaf.
+ *
+ * Three inputs have no leaf and get the field withheld rather than a label a
+ * human cannot read:
+ *
+ *   - A ROOT. `/` has always had none; `C:\` — which is exactly what OSC 7
+ *     `/C:/` parses to on the daemon's primary platform — must behave the same,
+ *     or a pane sitting at a drive root renders a chip reading "C:".
+ *   - WHITESPACE. A segment of spaces is an invisible chip. `cwd` is whatever
+ *     the pane's own process claimed, so degenerate values are a thing that
+ *     happens rather than a hypothetical.
+ *   - Nothing at all (absent, empty).
+ */
+function cwdLeafOf(cwd: string | undefined): { cwdLeaf?: string } {
+  if (typeof cwd !== 'string') return {};
+  const segments = cwd.split(/[\\/]/).filter((segment) => segment.trim().length > 0);
+  const leaf = segments[segments.length - 1]?.trim() ?? '';
+  // A bare drive letter is the Windows spelling of `/` — a root, not a folder.
+  if (!leaf || /^[A-Za-z]:$/.test(leaf)) return {};
+  return { cwdLeaf: leaf };
 }
 
 /**

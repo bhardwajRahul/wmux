@@ -603,6 +603,69 @@ describe('WebTerminalServer', () => {
     expect(wire).not.toContain('ws-legacy');
   });
 
+  it('★ #1319 a pane row names the detected agent and the cwd leaf, or carries neither key', async () => {
+    // s1 runs an agent the detector recognised; s2 and s3 are plain shells.
+    // Before this the phone had only `agent`, whose value is a role display
+    // name for some panes and this same slug for others — so every shell pane's
+    // chip collapsed to the generic word.
+    live[0].lastDetectedAgent = 'claude';
+    const info = await startRO();
+    const res = await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) });
+    expect(res.status).toBe(200);
+    const { sessions } = (await res.json()) as { sessions: Array<Record<string, unknown>> };
+
+    expect(sessions[0].lastDetectedAgent).toBe('claude');
+    // `agent` keeps the shape it always had — the new field is additive, not a
+    // replacement, so a client that ignores it behaves exactly as before.
+    expect(sessions[0].agent).toBe('claude');
+    // Absent means "no agent was ever detected here", never null-the-value: a
+    // client must be able to tell "not known" from "known to be nothing".
+    expect('lastDetectedAgent' in sessions[1]).toBe(false);
+    expect('lastDetectedAgent' in sessions[2]).toBe(false);
+
+    // The leaf of the pane's own cwd — the label of last resort, computed once
+    // by the daemon instead of separately by every client.
+    expect(sessions[0].cwdLeaf).toBe('x');
+    expect(sessions[1].cwdLeaf).toBe('y');
+  });
+
+  it('★ #1319 the cwd leaf survives both separators and a trailing one', async () => {
+    // A Windows daemon can hold a pane whose shell reports a POSIX path (WSL,
+    // git-bash), so neither separator can be the only one split on, and a
+    // trailing separator must not swallow the leaf.
+    live[0].cwd = 'C:\\Users\\dev\\wmux\\';
+    live[1].cwd = '/home/dev/projects/relay';
+    live[2].cwd = '\\\\build-01\\share\\out';
+    const info = await startRO();
+    const { sessions } = (await (
+      await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+    ).json()) as { sessions: Array<Record<string, unknown>> };
+
+    expect(sessions[0].cwdLeaf).toBe('wmux');
+    expect(sessions[1].cwdLeaf).toBe('relay');
+    expect(sessions[2].cwdLeaf).toBe('out');
+  });
+
+  it('★ #1319 a cwd with no readable leaf carries no key — including a DRIVE root', async () => {
+    // `cwd` is whatever the pane's own process last claimed over OSC 7, so the
+    // degenerate values are real. The key is withheld rather than filled with
+    // something a human cannot read: absent is a label the client can fall back
+    // from, "C:" and " " are labels it would print.
+    live[0].cwd = '/';
+    // What OSC 7 `/C:/` parses to on the daemon's primary platform. Before the
+    // drive-letter check this rendered a pane chip reading "C:".
+    live[1].cwd = 'C:\\';
+    live[2].cwd = '   ';
+    const info = await startRO();
+    const { sessions } = (await (
+      await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+    ).json()) as { sessions: Array<Record<string, unknown>> };
+
+    expect('cwdLeaf' in sessions[0]).toBe(false);
+    expect('cwdLeaf' in sessions[1]).toBe(false);
+    expect('cwdLeaf' in sessions[2]).toBe(false);
+  });
+
   it('rejects input when started read-only (403), accepts and writes when --allow-input (204)', async () => {
     // read-only
     let info = await startRO();
@@ -4298,6 +4361,261 @@ describe('WebTerminalServer', () => {
       // A pane with no liveness signal carries no field at all — absent means
       // "not known", not "idle".
       expect(body.sessions.find((s) => s.id === 's2')).not.toHaveProperty('liveness');
+    });
+
+    // ── #1315: liveness on the pane stream the terminal face already holds ──
+    //
+    // The fleet copy above needs a `/turns` read, which is itself 403 without
+    // --allow-transcript, so a phone that only ever opens the terminal mirror
+    // saw no liveness at all and had to infer "is it running" from a poll plus
+    // an activity window. These four cover the contract: it arrives, it is
+    // narrowed, it is scoped to one pane, and it dies with the socket.
+
+    /** Drain an SSE body into a growing buffer until the test aborts it. */
+    const pumpSse = (res: Awaited<ReturnType<typeof fetch>>) => {
+      const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+      const state = { wire: '' };
+      // One continuous pump, for the same reason the /api/events test above
+      // gives: a read-with-timeout loop orphans a pending read() on every
+      // timeout, and the orphan swallows the next chunk into a promise nobody
+      // awaits — the event simply vanishes.
+      const done = (async () => {
+        try {
+          for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            if (chunk.value) state.wire += Buffer.from(chunk.value).toString('utf8');
+          }
+        } catch {
+          /* aborted at the end of the test */
+        }
+      })();
+      return { state, done };
+    };
+    const settleMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    /**
+     * Wait until a pumped buffer contains `want`, or fail at the deadline.
+     *
+     * A positive assertion must never be a fixed sleep: a loopback chunk that
+     * lands at 260 ms on a loaded runner would be a hard failure rather than a
+     * slower pass. Polling the buffer the pump already fills costs nothing and
+     * leaves no orphaned `read()` behind. (A NEGATIVE assertion is still a
+     * bounded sleep — proving absence has no event to wait for.)
+     */
+    const waitForWire = async (
+      state: { wire: string },
+      want: string,
+      budgetMs = 3_000,
+    ): Promise<void> => {
+      const deadline = Date.now() + budgetMs;
+      while (!state.wire.includes(want) && Date.now() < deadline) await settleMs(20);
+      expect(state.wire).toContain(want);
+    };
+
+    it('★ #1315 the pane stream carries liveness with no /turns read and no --allow-transcript', async () => {
+      const info = await startRO();
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      try {
+        // A settled state skips the coalescing window — it is the transition a
+        // header exists to catch.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(state, 'event: agent.liveness');
+        expect(state.wire).toContain('"state":"awaiting_input"');
+        expect(state.wire).toContain('"sessionId":"s1"');
+      } finally {
+        ac.abort();
+        await done;
+      }
+    });
+
+    it('★ #1315 a coalesced working state reaches the pane stream too', async () => {
+      // Every other case here emits a SETTLED state, which skips the coalescing
+      // window entirely. `busy`/`tool` take the other path — the one that arms a
+      // timer and delivers from its callback — so without this the whole
+      // setTimeout branch onto the pane stream is untested.
+      const info = await startRO();
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      try {
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'busy', agent: 'Claude Code', at: 1,
+        });
+        // Last-write-wins inside the window: the frame that lands is the newest
+        // state, not the one that opened it.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'tool', tool: 'Bash', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(state, 'event: agent.liveness');
+        expect(state.wire).toContain('"state":"tool"');
+        expect(state.wire).not.toContain('"state":"busy"');
+        expect(state.wire).not.toContain('Bash');
+      } finally {
+        ac.abort();
+        await done;
+      }
+    });
+
+    it('★ #1315 pane-stream liveness withholds the tool name and never crosses panes', async () => {
+      const info = await startRO();
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s2&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      try {
+        // This connection asked for s2 by name. Another pane's per-tool-call
+        // traffic is not its business.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_permission', tool: 'Bash', agent: 'Claude Code', at: 1,
+        });
+        await settleMs(200);
+        expect(state.wire).not.toContain('agent.liveness');
+
+        // Its own pane's state does arrive — but the tool name is agent-authored
+        // text off the hook pipe, withheld here exactly as /api/sessions
+        // withholds it. Widening the STATE is the point; widening what the pane
+        // is typing is not.
+        server.emitAgentLiveness({
+          sessionId: 's2', state: 'awaiting_permission', tool: 'Bash', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(state, 'event: agent.liveness');
+        expect(state.wire).toContain('"state":"awaiting_permission"');
+        expect(state.wire).not.toContain('Bash');
+        expect(state.wire).not.toContain('"tool"');
+      } finally {
+        ac.abort();
+        await done;
+      }
+    });
+
+    it('★ #1315 a closed pane stream leaves no liveness subscriber behind', async () => {
+      await startRO();
+      const phone = await pairDevice('Phone');
+      const ticket = await ticketFor(phone.token);
+      const ac = new AbortController();
+      const res = await fetch(
+        `${base()}/api/stream?session=s1&ticket=${encodeURIComponent(ticket)}`,
+        { signal: ac.signal },
+      );
+      expect(res.status).toBe(200);
+      const { state, done } = pumpSse(res);
+      server.emitAgentLiveness({
+        sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+      });
+      await waitForWire(state, 'event: agent.liveness');
+      expect(server.status().clients).toBe(1);
+
+      ac.abort();
+      await done;
+      const deadline = Date.now() + 3_000;
+      while (server.status().clients !== 0 && Date.now() < deadline) await settleMs(20);
+
+      // The subscription IS the connection, so nothing survives it — the
+      // server's own client count going back to zero is that claim, and it
+      // cannot pass for the wrong reason the way a revoke count could.
+      // `transcriptWatchers`, the fleet channel's registry, is deliberately
+      // never undone; this path has nothing to undo.
+      expect(server.status().clients).toBe(0);
+      // Revoking the device finds nothing left to cut either.
+      expect(server.disconnectDevice(phone.deviceId)).toBe(0);
+    });
+
+    it('★ #1315 pane-stream liveness refuses the brain pane and an invented session id', async () => {
+      // `sessionId` arrives from the hook pipe, which is not a trusted producer,
+      // and the orchestrator brain is not a worker pane a phone may learn
+      // anything about. `handleStream` itself still resolves with a bare
+      // getSession, so the delivery side takes the gate the transcript routes
+      // take rather than inheriting that pane route's older, looser check.
+      live.push({
+        id: 'brain-abc', cwd: '/b', cols: 80, rows: 24, state: 'attached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: { WMUX_BRAIN_PTY: '1' }, cmd: '/usr/local/bin/claude',
+      });
+      const ac = new AbortController();
+      try {
+        const info = await startRO();
+        const token = encodeURIComponent(info.token as string);
+        const brain = await fetch(`${base()}/api/stream?session=brain-abc&token=${token}`, {
+          signal: ac.signal,
+        });
+        expect(brain.status).toBe(200);
+        const brainPump = pumpSse(brain);
+        const pane = await fetch(`${base()}/api/stream?session=s1&token=${token}`, {
+          signal: ac.signal,
+        });
+        expect(pane.status).toBe(200);
+        const panePump = pumpSse(pane);
+
+        server.emitAgentLiveness({
+          sessionId: 'brain-abc', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+        });
+        // A pane the daemon does not have at all — an id a compromised pane
+        // could invent — reaches nobody either.
+        server.emitAgentLiveness({
+          sessionId: 'no-such-pane', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+        });
+        await settleMs(250);
+        expect(brainPump.state.wire).not.toContain('agent.liveness');
+        expect(panePump.state.wire).not.toContain('agent.liveness');
+
+        // ...and the gate is the pane's identity, not a blanket refusal: a real
+        // worker pane on the same server still gets its own state.
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 2,
+        });
+        await waitForWire(panePump.state, 'event: agent.liveness');
+
+        ac.abort();
+        await Promise.all([brainPump.done, panePump.done]);
+      } finally {
+        ac.abort();
+        live.length = 3;
+      }
+    });
+
+    it('★ #1315 the fleet stream keeps its watcher gate — the pane stream is a second door', async () => {
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const ac = new AbortController();
+      // A pane stream for s1 AND a fleet stream, on one principal that has never
+      // read s1's turn view. The pane copy must arrive; the fleet copy must not.
+      const pane = await fetch(
+        `${base()}/api/stream?session=s1&token=${encodeURIComponent(info.token as string)}`,
+        { signal: ac.signal },
+      );
+      expect(pane.status).toBe(200);
+      const panePump = pumpSse(pane);
+      const fleet = await fetch(`${base()}/api/events`, {
+        signal: ac.signal,
+        headers: { ...h, Accept: 'text/event-stream' },
+      });
+      expect(fleet.status).toBe(200);
+      const fleetPump = pumpSse(fleet);
+      try {
+        server.emitAgentLiveness({
+          sessionId: 's1', state: 'awaiting_input', agent: 'Claude Code', at: 1,
+        });
+        await waitForWire(panePump.state, 'event: agent.liveness');
+        expect(fleetPump.state.wire).not.toContain('agent.liveness');
+      } finally {
+        ac.abort();
+        await Promise.all([panePump.done, fleetPump.done]);
+      }
     });
 
     it('★ a stale working state drops out of /api/sessions; a resting one does not', async () => {
