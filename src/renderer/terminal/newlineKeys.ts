@@ -99,12 +99,18 @@ export const SHIFT_ENTER_LF = '\n';
 /**
  * win32-input-mode Shift+Enter (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`).
  *
- * VK_RETURN=13, scan 0x1C=28, Unicode CR=13, key-down, SHIFT_PRESSED=0x10,
+ * VK_RETURN=13, scan 0x1C=28, Unicode LF=10, key-down, SHIFT_PRESSED=0x10,
  * repeat 1 — then the matching key-up (Unicode 0, key-down 0). Codex on
  * Windows negotiates `?9001h` and does not understand CSI-u (#1152).
+ *
+ * The Unicode field carries LF, not CR: ConPTY hands the client the record's
+ * character and the SHIFT modifier does not survive that trip, so `Uc=13` is
+ * read as a plain Enter and the TUI submits. Measured 2026-09-17 against a
+ * live Claude Code pane on Windows — `Uc=13` submitted, `Uc=10` inserted a
+ * newline, same as the literal `\n` Ctrl+J sends (#1363).
  */
 export const SHIFT_ENTER_WIN32 =
-  '\x1b[13;28;13;1;16;1_\x1b[13;28;0;0;16;1_';
+  '\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_';
 
 /** xterm modifyOtherKeys mode 2: CSI 27 ; 2 ; 13 ~ */
 export const SHIFT_ENTER_MODIFY_OTHER_KEYS = '\x1b[27;2;13~';

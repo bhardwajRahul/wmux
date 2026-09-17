@@ -36,6 +36,7 @@ import { foldRemoteKeyboardState, INITIAL_REMOTE_KEYBOARD_STATE, type RemoteKeyb
 import { attachImeAnchor } from '../terminal/imeAnchor';
 import { attachImeResidueGuard } from '../terminal/imeResidueGuard';
 import { attachImeStormGuard } from '../terminal/imeStormGuard';
+import { attachCompositionCommitGate } from '../terminal/compositionCommitGate';
 import { webglContextPool } from '../terminal/webglContextPool';
 import { teardownWebglAddon } from '../terminal/webglTeardown';
 import { createGlyphRepaintScheduler, type GlyphRepaintScheduler } from '../terminal/glyphRepaint';
@@ -1333,6 +1334,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       },
     });
 
+    // #1361: keep a byte we write ourselves behind an IME commit that is still
+    // in flight. Chromium ends the composition before delivering a key it does
+    // not consume, and xterm's CompositionHelper then sends the composed text
+    // from a `setTimeout(…, 0)` — so a synchronous write from the custom key
+    // handler overtakes it and the newline lands in front of the last Korean
+    // syllable. See terminal/compositionCommitGate.ts.
+    const compositionCommitGate = attachCompositionCommitGate(terminal);
+
     // #874/#942: keep the IME candidate window on the cursor. xterm anchors
     // its hidden helper textarea at the ybase-relative cursor row while the
     // renderer paints the cursor at the ydisp-relative one, so a scrolled-up
@@ -1728,8 +1737,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     const keyboardRef = { current: adopted && !parkedKnownGone
       ? parkedKeyboardByTerminal.get(terminal) ?? INITIAL_REMOTE_KEYBOARD_STATE
       : INITIAL_REMOTE_KEYBOARD_STATE };
+    // On Windows `?9001h` says nothing about the app: ConPTY emits it at the
+    // start of every session on its own behalf, so trusting it armed win32 key
+    // records for every pane on the box (#1363). kitty / modifyOtherKeys still
+    // fold normally — an app has to ask for those itself.
+    const foldOpts = { trustWin32Input: window.electronAPI.platform !== 'win32' };
     const noteKeyboard = (data: string | Uint8Array) => {
-      keyboardRef.current = foldRemoteKeyboardState(keyboardRef.current, data);
+      keyboardRef.current = foldRemoteKeyboardState(keyboardRef.current, data, foldOpts);
       parkedKeyboardByTerminal.set(terminal, keyboardRef.current);
     };
     // #1228 review (C1): the fold is liveness-scoped. When process-truth or
@@ -1788,8 +1802,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
       if (newlineByte !== null) {
         e.preventDefault();
-        window.electronAPI.pty.write(ptyId, newlineByte);
-        noteUserKeystroke(newlineByte);
+        // #1361: ordered behind an IME commit that xterm has queued but not
+        // yet sent. With no IME in play this runs synchronously, exactly as
+        // before.
+        compositionCommitGate.runAfterCommit(() => {
+          window.electronAPI.pty.write(ptyId, newlineByte);
+          noteUserKeystroke(newlineByte);
+        });
         return false;
       }
 
@@ -2372,9 +2391,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       deliverPtyData({ ...payload, data: restingCursor.process(payload.data) });
     };
     const deliverPtyData = (payload: PtyDataPayload) => {
-      // Fold before the resync buffer so a ?9001h that arrives mid-resync
-      // still arms Shift+Enter encoding (#1152).
-      noteKeyboard(payload.data);
+      // Fold before the resync buffer so a mid-resync negotiation still arms
+      // the encoding (#1152). Replay is history, not a negotiation: it
+      // re-delivers the dead session's `?9001h` on every restart (#1363).
+      if (!payload.replay) noteKeyboard(payload.data);
       const st = resyncRef.current;
       if (st.pending) {
         st.buffer.push(payload);
@@ -2747,6 +2767,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       unregisterAtlasGuard();
       imeResidueGuard?.dispose();
       imeStormGuard.dispose();
+      compositionCommitGate.dispose();
       imeAnchor.dispose();
       deadInputWatchdog.dispose();
       autoCopy.dispose();

@@ -39,6 +39,7 @@ import {
   INSTALL_READY_MARKER,
   probeVolume,
   readAbortMarker,
+  readAbortRecord,
   spawnInstallWaiter,
   terminatePids,
   waitForWaiterHeartbeat,
@@ -344,8 +345,30 @@ export class AutoUpdater {
    */
   private takeRefusedInstall(): string | null {
     const markerPath = join(app.getPath('userData'), INSTALL_ABORT_MARKER);
-    const reason = readAbortMarker(markerPath);
-    if (!reason) return null;
+    const record = readAbortRecord(markerPath);
+    if (!record) return null;
+    // #1341 — the marker is written pessimistically before Setup.exe runs and
+    // only removed after it exits, but Squirrel starts the newly installed app
+    // BEFORE Setup.exe exits. So a successful install routinely boots us into
+    // a marker that is seconds away from being deleted, and three consecutive
+    // real updates all reported "install-aborted" for installs that worked.
+    //
+    // Running the version the marker was written for settles it: the install
+    // reached the end. Deliberately not "wait for the waiter to clear it" —
+    // that answer is wrong whenever the waiter is dead (#1264's whole failure
+    // mode) and would make every boot after a genuine refusal pay a delay for
+    // a verdict it already has. We clear the marker ourselves so a waiter that
+    // never gets to is not the difference between a correct boot and a stale
+    // warning on the next one.
+    if (record.targetVersion && record.targetVersion === normalizeVersion(app.getVersion())) {
+      console.log(
+        `[AutoUpdater] install marker targeted ${record.targetVersion} and that is the version now running — ` +
+        'the install completed; clearing the marker instead of reporting a refusal',
+      );
+      clearAbortMarker(markerPath);
+      return null;
+    }
+    const reason = record.reason;
     console.warn(`[AutoUpdater] previous install was refused: ${reason}`);
     // #1055 — when the installation is broken RIGHT NOW (Update.exe missing),
     // the warnOnInstallIntegrityGap boot notice already owns this user and
@@ -1094,6 +1117,11 @@ export class AutoUpdater {
       lockBudgetMs: INSTALL_LOCK_BUDGET_MS,
       forceKillEligiblePids,
       forceKillGraceMs: OWN_TREE_FORCE_KILL_GRACE_MS,
+      // #1341 — stamp the marker with what we are installing, so the version
+      // that boots out of it can tell "this install finished" from "the waiter
+      // has not cleared the marker yet". Empty when the artifact was adopted
+      // with no release info; the marker then behaves as it did before.
+      targetVersion: normalizeVersion(this.pendingUpdate?.name ?? '') || undefined,
     });
     if (!waiterPath) {
       // No waiter means no safe way to start the installer. Falling back to

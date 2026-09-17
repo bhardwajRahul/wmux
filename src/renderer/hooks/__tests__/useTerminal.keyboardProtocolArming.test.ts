@@ -1,0 +1,60 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import {
+  foldRemoteKeyboardState,
+  INITIAL_REMOTE_KEYBOARD_STATE,
+} from '../../components/Remote/keyboardProtocol';
+
+/**
+ * #1363 — what is allowed to arm the pane's keyboard-protocol state.
+ *
+ * Two sources armed it that never negotiated anything:
+ *   1. ConPTY's own `CSI ? 9001 h`, the first bytes of every Windows session.
+ *   2. Scrollback replay, which re-delivers those same bytes on every restart.
+ * Either one left Shift+Enter on win32 key records, where the SHIFT modifier
+ * does not survive ConPTY and the TUI submits instead of inserting a newline.
+ *
+ * jsdom cannot run xterm's data path faithfully, so the wiring is pinned at
+ * source level (as in useTerminal.ctrlLetterEncoding) and the decision itself
+ * is exercised against the real fold.
+ */
+
+const SRC = readFileSync(
+  path.resolve(process.cwd(), 'src/renderer/hooks/useTerminal.ts'),
+  'utf8',
+);
+
+/** The first bytes of every ConPTY session (verbatim from the field report). */
+const CONPTY_STARTUP = '\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H';
+
+describe('useTerminal keyboard-protocol arming (#1363)', () => {
+  it('replayed chunks are not folded into the tracker', () => {
+    expect(SRC).toMatch(/if \(!payload\.replay\) noteKeyboard\(payload\.data\);/);
+  });
+
+  it('the fold is told not to trust ?9001h on Windows', () => {
+    expect(SRC).toMatch(
+      /trustWin32Input: window\.electronAPI\.platform !== 'win32'/,
+    );
+    expect(SRC).toMatch(/foldRemoteKeyboardState\(keyboardRef\.current, data, foldOpts\)/);
+  });
+
+  it("ConPTY's startup ?9001h does not arm win32 input on a Windows host", () => {
+    const after = foldRemoteKeyboardState(
+      INITIAL_REMOTE_KEYBOARD_STATE,
+      CONPTY_STARTUP,
+      { trustWin32Input: false },
+    );
+    expect(after.win32Input).toBe(false);
+    expect(after).toBe(INITIAL_REMOTE_KEYBOARD_STATE);
+  });
+
+  it('a prompt start clears state without waiting for the liveness poll', () => {
+    const armed = foldRemoteKeyboardState(INITIAL_REMOTE_KEYBOARD_STATE, '\x1b[>1u');
+    expect(armed.kitty).toBe(true);
+    expect(foldRemoteKeyboardState(armed, '\x1b]133;A\x07')).toEqual(
+      INITIAL_REMOTE_KEYBOARD_STATE,
+    );
+  });
+});
