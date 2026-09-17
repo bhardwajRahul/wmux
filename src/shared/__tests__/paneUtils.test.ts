@@ -10,6 +10,7 @@ import {
   getWorkspacePtyIds,
   collectPaneTreeRemoteSessions,
   getWorkspaceRemoteSessions,
+  collectRemoteSurfaceWorkspaces,
 } from '../paneUtils';
 import type { Pane, PaneLeaf, PaneBranch } from '../types';
 
@@ -223,5 +224,83 @@ describe('collectPaneTreeRemoteSessions / getWorkspaceRemoteSessions', () => {
       { hostId: 'h1', sessionId: 'web-1' },
       { hostId: 'h2', sessionId: 'web-stashed' },
     ]);
+  });
+});
+
+// #1329 — the liveness-feed walk. Unlike the teardown walk above it is NOT
+// gated on `remoteOwned`: ownership decides who may DESTROY a session, not who
+// may watch one.
+describe('collectRemoteSurfaceWorkspaces', () => {
+  function remoteSurface(id: string, hostId?: string, workspaceId?: string, owned?: boolean) {
+    return {
+      id, ptyId: '', title: '', shell: '', cwd: '',
+      surfaceType: 'remote-terminal' as const,
+      ...(hostId ? { remoteHostId: hostId } : {}),
+      ...(workspaceId ? { remoteWorkspaceId: workspaceId } : {}),
+      ...(owned ? { remoteOwned: true } : {}),
+    };
+  }
+
+  const leaf: PaneLeaf = {
+    id: 'leaf-r',
+    type: 'leaf',
+    activeSurfaceId: 'a',
+    surfaces: [
+      remoteSurface('a', 'h1', 'remote-pane-1', true),
+      // a VIEWED session still wants its agent counted
+      remoteSurface('b', 'h1', 'remote-pane-2'),
+      // an ordinary local terminal in the same leaf
+      { id: 'c', ptyId: 'pty-1', title: '', shell: '', cwd: '' },
+    ],
+  };
+
+  it('collects owned AND merely viewed remote surfaces', () => {
+    expect(collectRemoteSurfaceWorkspaces({ rootPane: leaf })).toEqual([
+      { hostId: 'h1', workspaceId: 'remote-pane-1' },
+      { hostId: 'h1', workspaceId: 'remote-pane-2' },
+    ]);
+  });
+
+  it('skips a surface with no host or no remote workspace id', () => {
+    const partial: PaneLeaf = {
+      id: 'leaf-p',
+      type: 'leaf',
+      activeSurfaceId: 'x',
+      surfaces: [
+        remoteSurface('x', 'h1'),             // pre-#1329 surface: no workspace id
+        remoteSurface('y', undefined, 'ws-1'),
+      ],
+    };
+    expect(collectRemoteSurfaceWorkspaces({ rootPane: partial })).toEqual([]);
+  });
+
+  it('deduplicates two panes pointing at the same remote workspace', () => {
+    const dup: PaneLeaf = {
+      id: 'leaf-d',
+      type: 'leaf',
+      activeSurfaceId: 'd1',
+      surfaces: [remoteSurface('d1', 'h1', 'ws-1'), remoteSurface('d2', 'h1', 'ws-1')],
+    };
+    expect(collectRemoteSurfaceWorkspaces({ rootPane: dup })).toEqual([
+      { hostId: 'h1', workspaceId: 'ws-1' },
+    ]);
+  });
+
+  it('includes stashed panes — a stashed remote session is still live on the host', () => {
+    const stashed: PaneLeaf = {
+      id: 'leaf-s',
+      type: 'leaf',
+      activeSurfaceId: 's1',
+      surfaces: [remoteSurface('s1', 'h2', 'ws-stashed')],
+    };
+    expect(collectRemoteSurfaceWorkspaces({ rootPane: leaf, stashedPanes: [{ pane: stashed }] })).toEqual([
+      { hostId: 'h1', workspaceId: 'remote-pane-1' },
+      { hostId: 'h1', workspaceId: 'remote-pane-2' },
+      { hostId: 'h2', workspaceId: 'ws-stashed' },
+    ]);
+  });
+
+  it('returns nothing for a tree with no remote surfaces', () => {
+    expect(collectRemoteSurfaceWorkspaces({ rootPane: root })).toEqual([]);
   });
 });

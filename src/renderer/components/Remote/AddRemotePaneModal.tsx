@@ -6,8 +6,13 @@ export interface AddRemotePaneModalProps {
   onClose: () => void;
   /** Resolves once a session exists on the chosen host — the caller adds the
    *  surface to its own pane; this component only picks the host and mints
-   *  the remote session. */
-  onCreated: (hostId: string, sessionId: string) => void;
+   *  the remote session.
+   *
+   *  #1329 — `workspaceId` is the id this modal minted for that session on the
+   *  host. It used to stay private here ("opaque bookkeeping, never referenced
+   *  again"), which is precisely why the pane it produced had no way to ask
+   *  the host about its own agent: `/api/workspaces` is keyed by this id. */
+  onCreated: (hostId: string, sessionId: string, workspaceId: string) => void;
   /** Heading shown above the host list. The modal serves three menu entries
    *  since #1140 (tab, split right, split down), and the heading is the only
    *  place the dialog can say which one it is answering — omitted falls back
@@ -19,9 +24,14 @@ export interface AddRemotePaneModalProps {
  * #1086/#1091 — "Add remote pane": pick one of the already-paired hosts
  * (same list `AttachRemoteModal` shows) and bootstrap a fresh session on it
  * via `remote.workspaceCreate` (#1001's operator-mint path). The `workspaceId`
- * that call requires is opaque here — this feature does not create a remote
- * "workspace" at all, so a fresh id is minted purely to satisfy the
- * bootstrap contract and is never referenced again afterward.
+ * that call requires is minted here purely to satisfy the bootstrap contract —
+ * this feature does not create a remote "workspace" the user ever sees.
+ *
+ * #1329 — it IS handed back to the caller, though. The remote daemon groups its
+ * sessions into `/api/workspaces` rows by exactly this id, and that listing is
+ * the only channel carrying the session's agent name/status to this desktop.
+ * Dropping the id (the original behaviour) left every pane this modal created
+ * permanently agent-less in the sidebar roster and in `pane_list` (#1322).
  */
 export default function AddRemotePaneModal({ onClose, onCreated, title }: AddRemotePaneModalProps) {
   const t = useT();
@@ -63,7 +73,7 @@ export default function AddRemotePaneModal({ onClose, onCreated, title }: AddRem
     try {
       const res = await remote.workspaceCreate(hostId, freshId);
       if (res.ok) {
-        onCreated(hostId, res.sessionId);
+        onCreated(hostId, res.sessionId, freshId);
         onClose();
       } else {
         setError(res.error);

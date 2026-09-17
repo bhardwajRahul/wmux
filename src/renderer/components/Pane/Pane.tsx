@@ -506,7 +506,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     setAddRemoteModalOpen(true);
   }, [remoteSplitBlockedAtCap]);
 
-  const handleRemoteCreated = useCallback((hostId: string, sessionId: string) => {
+  const handleRemoteCreated = useCallback((hostId: string, sessionId: string, remoteWorkspaceId: string) => {
     const direction = remoteSplitDirectionRef.current;
     remoteSplitDirectionRef.current = null;
     // splitPane (when direction is set) creates an EMPTY leaf; EmptyLeafFunnel
@@ -523,7 +523,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
       // owned: true — AddRemotePaneModal MINTED this session (and the one-shot
       // `remote-pane-*` workspace row derived from it), so this tab is what has
       // to destroy it on close (#1129). Nothing else on the host ever will.
-      addRemoteSurface(targetPaneId, hostId, sessionId, undefined, undefined, workspace.id, true);
+      // #1329 — the LAST argument is the workspace the session lives in ON THE
+      // HOST (not `workspace.id`, this desk's local one). It is what
+      // useRemoteAttachmentsLifecycle polls `/api/workspaces` for, and without
+      // it the pane's agent is invisible to the sidebar roster and pane_list.
+      addRemoteSurface(targetPaneId, hostId, sessionId, undefined, undefined, workspace.id, true, remoteWorkspaceId);
       // splitPane seeded an inherited cwd for the fresh leaf so a terminal
       // funnel could start a shell there; a remote leaf never goes through
       // that funnel, so the seed would sit until the pane closes — and replay

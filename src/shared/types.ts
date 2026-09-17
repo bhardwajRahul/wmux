@@ -74,6 +74,23 @@ export interface Surface {
   remoteHostId?: string;
   remoteSessionId?: string;
   /**
+   * #1329 — which workspace on the remote host `remoteSessionId` belongs to.
+   *
+   * The remote daemon groups its live sessions into `/api/workspaces` rows by
+   * each session's `WMUX_WORKSPACE_ID`, and that listing is the ONLY channel
+   * carrying per-session agent metadata (`agentName`/`agentStatus`) to this
+   * desktop. Without the workspace id there is nothing to ask the host about,
+   * so a split-remote pane's agent stayed invisible to both the sidebar roster
+   * and `pane_list` no matter how long it ran (#1322).
+   *
+   * Persisted with the pane tree on purpose: a restored remote-terminal
+   * surface re-registers its own liveness feed on the next app start with no
+   * extra plumbing. Absent on surfaces minted before #1329 and on any future
+   * "attach to a session somebody else started" flow that does not know the
+   * host's workspace id — both simply get no agent metadata, never an error.
+   */
+  remoteWorkspaceId?: string;
+  /**
    * #1129 — did THIS desktop mint `remoteSessionId`, or is the tab merely a
    * view onto a session that already existed on the host?
    *
@@ -1227,6 +1244,10 @@ export function createRemoteSurface(
    *  false so a future attach-to-existing caller is non-destructive unless it
    *  says otherwise. */
   owned = false,
+  /** #1329 — the host-side workspace `sessionId` lives in, when the caller
+   *  knows it (the mint flows do: they chose the id). Omitted leaves the
+   *  surface without a liveness feed, exactly as before this field existed. */
+  remoteWorkspaceId?: string,
 ): Surface {
   return {
     id: generateId('surface'),
@@ -1237,6 +1258,7 @@ export function createRemoteSurface(
     surfaceType: 'remote-terminal',
     remoteHostId: hostId,
     remoteSessionId: sessionId,
+    ...(remoteWorkspaceId ? { remoteWorkspaceId } : {}),
     ...(owned ? { remoteOwned: true } : {}),
   };
 }
@@ -1321,6 +1343,10 @@ export function clonePaneTreeFresh(pane: Pane): Pane {
       // fresh on mount" contract a local terminal's reset ptyId gets).
       delete next.remoteHostId;
       delete next.remoteSessionId;
+      // #1329 — the host-side workspace id is part of that same session
+      // pointer: keeping it would make the clone register a liveness feed for
+      // a workspace it holds no session in.
+      delete next.remoteWorkspaceId;
       // …and with the session pointer gone, the ownership claim over it must
       // go too (#1129): a clone that kept `remoteOwned` would offer to
       // destroy a session it does not point at.

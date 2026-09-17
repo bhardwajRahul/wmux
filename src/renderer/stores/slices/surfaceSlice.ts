@@ -26,7 +26,10 @@ export interface SurfaceSlice {
    * splitPane, then calls this to populate it. ptyId stays '' (see
    * createRemoteSurface), so every ptyId-gated check already treats this
    * surface as non-local without further changes. */
-  addRemoteSurface: (paneId: string, hostId: string, sessionId: string, shell?: string, cwd?: string, workspaceId?: string, owned?: boolean) => void;
+  /** `workspaceId` is the LOCAL workspace the pane lives in; the trailing
+   *  `remoteWorkspaceId` (#1329) is the workspace on the REMOTE host that
+   *  `sessionId` belongs to, which is what the liveness poll asks about. */
+  addRemoteSurface: (paneId: string, hostId: string, sessionId: string, shell?: string, cwd?: string, workspaceId?: string, owned?: boolean, remoteWorkspaceId?: string) => void;
   addEditorSurface: (paneId: string, filePath: string) => void;
   /** J2 — diff 리뷰 서피스 추가. taskId만 영속(diff 내용은 파생 데이터).
    * 같은 taskId가 이미 열려 있으면 그 탭으로 전환. editor/browser처럼 ptyId 없음. */
@@ -160,13 +163,13 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     pane.activeSurfaceId = surface.id;
   }),
 
-  addRemoteSurface: (paneId, hostId, sessionId, shell, cwd, workspaceId, owned) => set((state: StoreState) => {
+  addRemoteSurface: (paneId, hostId, sessionId, shell, cwd, workspaceId, owned, remoteWorkspaceId) => set((state: StoreState) => {
     const targetWsId = workspaceId || state.activeWorkspaceId;
     const ws = state.workspaces.find((w: Workspace) => w.id === targetWsId);
     if (!ws) return;
     const pane = findLeafPane(ws.rootPane, paneId);
     if (!pane) return;
-    const surface = createRemoteSurface(hostId, sessionId, shell || '', cwd || '', owned === true);
+    const surface = createRemoteSurface(hostId, sessionId, shell || '', cwd || '', owned === true, remoteWorkspaceId);
     pane.surfaces.push(surface);
     pane.activeSurfaceId = surface.id;
   }),
