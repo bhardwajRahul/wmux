@@ -111,6 +111,11 @@ export interface ManagedSession {
  */
 const DEFERRED_UNMUTE_DELAY_MS = 100;
 
+// #1305: minimum gap between two restarts of a pending entry's retention
+// clock. The clock is measured in days, so a finer restamp buys nothing, and
+// each one costs a synchronous whole-file sessions.json write at the daemon.
+const TOUCH_MIN_INTERVAL_MS = 60_000;
+
 /**
  * Narrowest PTY geometry the daemon will ever apply, on create or resize.
  *
@@ -186,13 +191,54 @@ export class DaemonSessionManager extends EventEmitter {
     const pending: DaemonSession = { ...session, state: 'suspended' };
     // Older snapshots used this status text as an error even without a probe.
     // Clear that exact marker so existing placeholders can age out as well.
-    if (error !== undefined && error !== 'WSL session is waiting to reconnect.') pending.recoveryError = error;
-    else delete pending.recoveryError;
+    if (error !== undefined && error !== 'WSL session is waiting to reconnect.') {
+      pending.recoveryError = error;
+      // #1305: start the retention clock the first time this entry becomes
+      // pending, and NEVER restart it here. Both the per-boot re-seed in
+      // recoverSessions and a failed retry land in this method, so restamping
+      // here would renew every entry on every boot — exactly the immortality
+      // the pending-recovery TTL exists to end.
+      pending.recoveryPendingSince ??= new Date(Date.now()).toISOString();
+    } else {
+      delete pending.recoveryError;
+      // No longer pending: drop the clock so a later failure starts a fresh
+      // retention window instead of inheriting a stale one.
+      delete pending.recoveryPendingSince;
+    }
     this.pendingRecovery.set(session.id, pending);
   }
 
   getPendingRecovery(id: string): DaemonSession | undefined {
     return this.pendingRecovery.get(id);
+  }
+
+  /**
+   * #1305: restart a pending-recovery entry's retention clock
+   * (`recoveryPendingSince`), the timestamp StateWriter's pending-recovery TTL
+   * reads.
+   *
+   * Call this ONLY for client-initiated interest in the pane (the Retry
+   * button, an attach/reconnect). The boot background retry must not, or every
+   * boot would renew the entry and it could never age out.
+   *
+   * @returns true when the clock actually moved, so the caller knows whether
+   *   it has anything to persist. False for an id that is not pending, and for
+   *   a repeat inside TOUCH_MIN_INTERVAL_MS — a held-down Retry button would
+   *   otherwise force one synchronous whole-file state write per click for no
+   *   change in meaning.
+   */
+  touchPendingRecovery(id: string): boolean {
+    const pending = this.pendingRecovery.get(id);
+    // An unattempted placeholder (no recoveryError) is governed by the ordinary
+    // suspended TTL, so it has no clock to restart.
+    if (!pending?.recoveryError) return false;
+    // Date.now() rather than new Date() so the TTL's clock and this restamp
+    // are the same clock under test.
+    const now = Date.now();
+    const since = Date.parse(pending.recoveryPendingSince ?? '');
+    if (!Number.isNaN(since) && now - since < TOUCH_MIN_INTERVAL_MS) return false;
+    pending.recoveryPendingSince = new Date(now).toISOString();
+    return true;
   }
 
   /** Synchronous native-shell API. Production callers use createSessionAsync. */

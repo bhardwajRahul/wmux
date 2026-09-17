@@ -61,6 +61,18 @@ export interface DaemonSession {
   /** Recoverable WSL launch failure; preserve identity and scrollback until retry. */
   recoveryError?: string;
   /**
+   * #1305 — when this entry's pending-recovery retention clock started: the
+   * moment it first became pending, restarted whenever a client asks for the
+   * pane (Retry, attach). NOT `lastActivity`, which is the shell's last output
+   * and can already be months old when the pane goes pending — an exec or
+   * supervised WSL unit is allowed to sit silent, so clocking retention off it
+   * would discard the unit's conversation binding and scrollback on the boot
+   * after it first failed. Absent on records written before this field existed
+   * and on entries that are not pending; absent is treated as "clock not
+   * started yet", so such a record is kept until the boot re-seed stamps it.
+   */
+  recoveryPendingSince?: string;
+  /**
    * #1103 — validated WSL distro selection (`['-d', '<name>']`), persisted so
    * every replay path (recovery, supervised restart, suspended promote) re-
    * spawns the SAME distro instead of silently booting the system default.

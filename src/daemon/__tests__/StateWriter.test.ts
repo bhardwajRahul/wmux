@@ -793,9 +793,90 @@ describe('StateWriter', () => {
   });
 });
 
+// #1305 — a suspended entry carrying recoveryError (a WSL pane waiting for the
+// user's Retry) outlives the 7-day suspended TTL, but not forever: without a
+// bound, a pane whose surface disappeared kept sessions.json growing and cost a
+// cold WSL probe on every boot. The clock is recoveryPendingSince, stamped when
+// the entry became pending — NOT lastActivity, which is the shell's last output
+// and is already old for an exec unit that is allowed to sit silent.
+//
+//   recoveryPendingSince         7d                        30d
+//        |------------------------|--------------------------|----------->
+//        |   pending:   kept      |  pending: kept           | pending: pruned
+//        |   suspended: kept      |  suspended: pruned       |
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+function makePending(pendingForMs: number, overrides: Partial<DaemonSession> = {}): DaemonSession {
+  return makeSession({
+    state: 'suspended',
+    cmd: 'wsl.exe',
+    // Deliberately ancient: the shell went quiet long before the pane ever
+    // went pending, which is the case that must NOT be reaped early.
+    lastActivity: new Date(Date.now() - 400 * DAY_MS).toISOString(),
+    recoveryError: 'WSL distro unavailable',
+    recoveryPendingSince: new Date(Date.now() - pendingForMs).toISOString(),
+    bufferDumpPath: '/saved/pane.buf',
+    ...overrides,
+  });
+}
+
 it('keeps a failed WSL recovery past suspended TTL so retry cannot lose its snapshot', () => {
-  const pending = makeSession({ state: 'suspended', cmd: 'wsl.exe', lastActivity: '2000-01-01T00:00:00.000Z',
-    recoveryError: 'WSL distro unavailable', bufferDumpPath: '/saved/pane.buf' });
+  // 10 days pending: well past the 7-day suspended TTL, well inside the 30-day
+  // pending-recovery TTL.
+  const pending = makePending(10 * DAY_MS);
   writer.saveImmediate(makeState([pending]));
   expect(writer.load().sessions).toMatchObject([{ id: pending.id, recoveryError: pending.recoveryError, bufferDumpPath: pending.bufferDumpPath }]);
+});
+
+it('keeps a failed WSL recovery that is still inside the 30-day pending TTL', () => {
+  writer.saveImmediate(makeState([makePending(29 * DAY_MS)]));
+  expect(writer.load().sessions).toHaveLength(1);
+});
+
+it('prunes a failed WSL recovery nobody has asked for in 30 days', () => {
+  // The bug: this entry used to be exempt outright, so it lived forever and
+  // every boot scheduled a background promote retry for it (#1305).
+  writer.saveImmediate(makeState([makePending(31 * DAY_MS)]));
+  expect(writer.load().sessions).toEqual([]);
+});
+
+it('does not age a pending pane out on its shell activity', () => {
+  // The whole point of the separate clock: an exec/supervised WSL unit may sit
+  // silent for months and still be wanted. It went pending yesterday, so it
+  // keeps its full retention even though lastActivity is 400 days old.
+  writer.saveImmediate(makeState([makePending(1 * DAY_MS)]));
+  expect(writer.load().sessions).toHaveLength(1);
+});
+
+it('keeps a legacy pending record that has no retention clock yet', () => {
+  // Written by a wmux that predates recoveryPendingSince. Pruning it on
+  // lastActivity would delete the pane and its .buf on the first boot after the
+  // upgrade; the boot re-seed stamps the clock instead.
+  const legacy = makePending(0);
+  delete legacy.recoveryPendingSince;
+  writer.saveImmediate(makeState([legacy]));
+  expect(writer.load().sessions).toHaveLength(1);
+});
+
+it('never expires a pending recovery sooner than a plain suspended tombstone', () => {
+  // suspendedTtlHours raised to 60 days: the pending entry must not be the one
+  // that dies first.
+  const longWriter = new StateWriter(tmpDir, 60 * 24);
+  try {
+    longWriter.saveImmediate(makeState([makePending(40 * DAY_MS)]));
+    expect(longWriter.load().sessions).toHaveLength(1);
+  } finally {
+    longWriter.dispose();
+  }
+});
+
+it('heals a pending recovery with a corrupt lastActivity instead of pruning it', () => {
+  // The heal must keep running BEFORE the prune: a single bad timestamp must
+  // not silently discard a pane's conversation binding and buffer.
+  const pending = makePending(0, { lastActivity: 'not-a-timestamp' as unknown as string });
+  writer.saveImmediate(makeState([pending]));
+  const loaded = writer.load().sessions;
+  expect(loaded).toHaveLength(1);
+  expect(Number.isNaN(Date.parse(loaded[0].lastActivity))).toBe(false);
 });
