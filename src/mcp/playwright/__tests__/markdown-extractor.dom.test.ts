@@ -8,7 +8,7 @@
 // the function directly — exactly how Playwright runs it natively. This is the
 // regression coverage for the "every field gets the same row metadata" bug.
 import { describe, it, expect, beforeAll } from 'vitest';
-import { extractStructuredData } from '../markdown-extractor';
+import { extractStructuredData, extractStructuredDataWithNotes } from '../markdown-extractor';
 
 // jsdom does not expose the global CSS object, but real browsers (where the
 // in-page extraction code actually runs) do. The repeated-element strategy
@@ -159,5 +159,136 @@ describe('extractStructuredData — DOM field mapping (#110)', () => {
     expect(out.length).toBeGreaterThanOrEqual(2);
     expect(out[0]).toMatchObject({ name: 'Widget', url: 'https://shop.test/w' });
     expect(out[1].name).toBe('Gadget');
+  });
+});
+
+describe('extractStructuredData — header and fallback mapping (#1353)', () => {
+  it('maps an ARIA div grid to one field per column', async () => {
+    document.body.innerHTML = `
+      <div role="table" aria-label="requests">
+        <div role="row">
+          <div role="columnheader">Service</div>
+          <div role="columnheader">Requester</div>
+          <div role="columnheader">Status</div>
+        </div>
+        <div role="row">
+          <div role="cell">Mail</div><div role="cell">Ada</div><div role="cell">Open</div>
+        </div>
+        <div role="row">
+          <div role="cell">VPN</div><div role="cell">Grace</div><div role="cell">Closed</div>
+        </div>
+      </div>`;
+
+    const { records, notes } = await extractStructuredDataWithNotes(
+      directPage,
+      { workspaceId: 'ws-test' },
+      'requests',
+      { service: 'string', requester: 'string', status: 'string' },
+    );
+
+    expect(records).toEqual([
+      { service: 'Mail', requester: 'Ada', status: 'Open' },
+      { service: 'VPN', requester: 'Grace', status: 'Closed' },
+    ]);
+    expect(notes).toEqual([]);
+  });
+
+  it('matches a header against the field description when the key does not match', async () => {
+    // The header labels are the page's own words; the English field keys match
+    // nothing. The caller put the on-page label in the description, which is
+    // what the mapping now uses.
+    document.body.innerHTML = `
+      <table>
+        <tr><th>Anfrage</th><th>Antragsteller</th><th>Zustand</th></tr>
+        <tr><td>Mail</td><td>Ada</td><td>Offen</td></tr>
+        <tr><td>VPN</td><td>Grace</td><td>Erledigt</td></tr>
+      </table>`;
+
+    const { records, notes } = await extractStructuredDataWithNotes(
+      directPage,
+      { workspaceId: 'ws-test' },
+      'requests',
+      { service: 'Anfrage', requester: 'Antragsteller', status: 'Zustand' },
+    );
+
+    expect(records).toEqual([
+      { service: 'Mail', requester: 'Ada', status: 'Offen' },
+      { service: 'VPN', requester: 'Grace', status: 'Erledigt' },
+    ]);
+    // A real header match, so no positional guess is reported.
+    expect(notes).toEqual([]);
+  });
+
+  it('falls back to positional mapping and says so when no header matches', async () => {
+    document.body.innerHTML = `
+      <table>
+        <tr><th>Spalte A</th><th>Spalte B</th></tr>
+        <tr><td>Mail</td><td>Open</td></tr>
+        <tr><td>VPN</td><td>Closed</td></tr>
+      </table>`;
+
+    const { records, notes } = await extractStructuredDataWithNotes(
+      directPage,
+      { workspaceId: 'ws-test' },
+      'requests',
+      { service: 'the service', status: 'the state' },
+    );
+
+    expect(records).toEqual([
+      { service: 'Mail', status: 'Open' },
+      { service: 'VPN', status: 'Closed' },
+    ]);
+    expect(notes).toEqual(['fields mapped positionally; no header matched']);
+  });
+
+  it('leaves an unresolved repeated-element field null instead of the whole row text', async () => {
+    document.body.innerHTML = `
+      <div class="list">
+        <div class="row"><h3>Alpha</h3><span>extra one</span></div>
+        <div class="row"><h3>Beta</h3><span>extra two</span></div>
+        <div class="row"><h3>Gamma</h3><span>extra three</span></div>
+      </div>`;
+
+    const { records, notes } = await extractStructuredDataWithNotes(
+      directPage,
+      { workspaceId: 'ws-test' },
+      'rows',
+      { title: 'string', owner: 'string', status: 'string' },
+    );
+
+    expect(records.length).toBe(3);
+    for (const rec of records) {
+      expect(rec.owner).toBeNull();
+      expect(rec.status).toBeNull();
+      // The #1353 bug: every field held the item's full text.
+      expect(rec.title).not.toContain('extra');
+    }
+    expect(records[0].title).toBe('Alpha');
+    expect(notes).toEqual([
+      'only title could be mapped; pass a selector or use browser_extract_text',
+    ]);
+  });
+
+  it('uses goal as a container hint to pick the table under a matching heading', async () => {
+    document.body.innerHTML = `
+      <section>
+        <h2>Open incidents</h2>
+        <table>
+          <tr><th>Col 1</th><th>Col 2</th></tr>
+          <tr><td>INC-1</td><td>burning</td></tr>
+        </table>
+      </section>`;
+
+    // The heading matches the goal, so the table under it is preferred even
+    // though its headers match nothing (positional fallback).
+    const { records, notes } = await extractStructuredDataWithNotes(
+      directPage,
+      { workspaceId: 'ws-test' },
+      'open incidents',
+      { ticket: 'string', state: 'string' },
+    );
+
+    expect(records).toEqual([{ ticket: 'INC-1', state: 'burning' }]);
+    expect(notes).toEqual(['fields mapped positionally; no header matched']);
   });
 });

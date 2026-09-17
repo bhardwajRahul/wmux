@@ -568,8 +568,9 @@ export function treeToMarkdown(
  *
  * @param page      Playwright Page, or null to use the RPC fallback (issue #105)
  * @param scope     Required workspace and optional surface for the RPC path
- * @param goal      Human-readable description of what to extract (reserved;
- *                  not yet used to narrow scope)
+ * @param goal      Human-readable description of what to extract. When it
+ *                  matches a heading or caption on the page, the search is
+ *                  scoped to that heading's table/section (issue #1353).
  * @param fields    Mapping of field names to human descriptions, e.g.
  *                  `{ title: "product name", price: "price in USD" }`
  * @returns         Array of objects with keys matching `fields`
@@ -580,23 +581,59 @@ export async function extractStructuredData(
   goal: string,
   fields: Record<string, string>,
 ): Promise<Record<string, unknown>[]> {
-  void goal; // reserved for future scope-narrowing; not yet used
-  const fieldNames = Object.keys(fields);
-  if (fieldNames.length === 0) return [];
+  const { records } = await extractStructuredDataWithNotes(page, scope, goal, fields);
+  return records;
+}
 
-  // Strategy 1: Try to extract from <table> elements
-  const tableData = await extractFromTables(page, scope, fieldNames);
-  if (tableData.length > 0) return tableData;
+/** A record set plus any caveats the caller should show to the agent. */
+export interface StructuredDataResult {
+  records: Record<string, unknown>[];
+  /** Human-readable caveats, e.g. "fields mapped positionally; no header matched". */
+  notes: string[];
+}
+
+/** The in-page strategies return their records together with an optional note. */
+interface StrategyResult {
+  records: Record<string, unknown>[];
+  note: string | null;
+}
+
+/**
+ * Same extraction as {@link extractStructuredData}, but also reports why a
+ * mapping is weak — a positional column guess, or a record set where only one
+ * field could be resolved (issue #1353). `browser_extract_data` prints these
+ * after the JSON so the agent knows the shape is a guess.
+ */
+export async function extractStructuredDataWithNotes(
+  page: Page | null,
+  scope: BrowserTargetScope,
+  goal: string,
+  fields: Record<string, string>,
+): Promise<StructuredDataResult> {
+  const fieldNames = Object.keys(fields);
+  if (fieldNames.length === 0) return { records: [], notes: [] };
+  // Descriptions travel alongside the names as a parallel array: the caller
+  // often writes the page's own (possibly non-English) column label there,
+  // which is the only text a header row can be matched against.
+  const fieldDescriptions = fieldNames.map((name) => fields[name] ?? '');
+
+  // Strategy 1: <table> elements and ARIA grids
+  const tableData = await extractFromTables(page, scope, fieldNames, fieldDescriptions, goal);
+  if (tableData.records.length > 0) {
+    return { records: tableData.records, notes: tableData.note ? [tableData.note] : [] };
+  }
 
   // Strategy 2: Try to extract from repeated list items
   const listData = await extractFromLists(page, scope, fieldNames);
-  if (listData.length > 0) return listData;
+  if (listData.length > 0) return { records: listData, notes: [] };
 
   // Strategy 3: Try to find repeated element patterns (grids, cards, etc.)
   const repeatedData = await extractFromRepeatedElements(page, scope, fieldNames);
-  if (repeatedData.length > 0) return repeatedData;
+  if (repeatedData.records.length > 0) {
+    return { records: repeatedData.records, notes: repeatedData.note ? [repeatedData.note] : [] };
+  }
 
-  return [];
+  return { records: [], notes: [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -607,59 +644,178 @@ async function extractFromTables(
   page: Page | null,
   scope: BrowserTargetScope,
   fieldNames: string[],
-): Promise<Record<string, unknown>[]> {
+  fieldDescriptions: string[],
+  goal: string,
+): Promise<StrategyResult> {
   return await evalFunctionOrRpc(
     page,
-    ({ fieldNames: names }: { fieldNames: string[] }) => {
-      const tables = document.querySelectorAll('table');
-      if (tables.length === 0) return [];
+    ({
+      fieldNames: names,
+      fieldDescriptions: descriptions,
+      goal: goalText,
+    }: {
+      fieldNames: string[];
+      fieldDescriptions: string[];
+      goal: string;
+    }) => {
+      const empty: { records: Record<string, unknown>[]; note: string | null } = {
+        records: [],
+        note: null,
+      };
 
-      for (const table of tables) {
-        const rows = table.querySelectorAll('tr');
-        if (rows.length < 2) continue;
+      const norm = (s: string | null | undefined) =>
+        (s ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
 
-        // Extract headers from first row
-        const headerCells = rows[0].querySelectorAll('th, td');
-        const headers: string[] = [];
-        headerCells.forEach((cell) => {
-          headers.push((cell.textContent ?? '').trim().toLowerCase());
+      /**
+       * A candidate table: either a real <table> or an ARIA grid. Rows and
+       * cells are read through the same shape so the header mapping below is
+       * written once (issue #1353 — div/ARIA grids used to fall through to the
+       * repeated-element strategy and duplicate the row text into every field).
+       */
+      const candidates: { root: Element; rows: Element[][]; headerRow: string[] }[] = [];
+
+      const addHtmlTable = (table: Element) => {
+        const rows = [...table.querySelectorAll('tr')];
+        if (rows.length < 2) return;
+        const header = [...rows[0].querySelectorAll('th, td')].map((c) => norm(c.textContent));
+        if (header.length === 0) return;
+        candidates.push({
+          root: table,
+          rows: rows.slice(1).map((r) => [...r.querySelectorAll('td, th')]),
+          headerRow: header,
         });
+      };
 
-        if (headers.length === 0) continue;
+      const addAriaGrid = (grid: Element) => {
+        const rows = [...grid.querySelectorAll('[role="row"]')];
+        if (rows.length < 2) return;
+        const headerCells = [...rows[0].querySelectorAll('[role="columnheader"]')];
+        const header = (
+          headerCells.length > 0
+            ? headerCells
+            : [...rows[0].querySelectorAll('[role="cell"], [role="gridcell"]')]
+        ).map((c) => norm(c.textContent));
+        if (header.length === 0) return;
+        candidates.push({
+          root: grid,
+          rows: rows
+            .slice(1)
+            .map((r) => [...r.querySelectorAll('[role="cell"], [role="gridcell"]')])
+            .filter((cells) => cells.length > 0),
+          headerRow: header,
+        });
+      };
 
-        // Map requested field names to column indices
-        const fieldToCol = new Map<string, number>();
-        for (const name of names) {
-          const lower = name.toLowerCase();
-          // Exact match first
-          let idx = headers.indexOf(lower);
-          if (idx === -1) {
-            // Partial match. Guard against empty/one-char headers: an empty
-            // header makes `lower.includes(h)` always true (every string
-            // contains ''), which would collapse every field onto the first
-            // blank column. Layout tables (e.g. HN) have blank header cells, so
-            // this guard also makes them fail to match and fall through to the
-            // repeated-element strategy instead of returning duplicated columns.
-            idx = headers.findIndex(
-              (h) => h.length >= 2 && (h.includes(lower) || lower.includes(h)),
-            );
-          }
-          if (idx !== -1) {
-            fieldToCol.set(name, idx);
+      for (const table of document.querySelectorAll('table')) addHtmlTable(table);
+      for (const grid of document.querySelectorAll('[role="table"], [role="grid"]')) {
+        if (grid.tagName === 'TABLE') continue; // already handled as an HTML table
+        addAriaGrid(grid);
+      }
+
+      if (candidates.length === 0) return empty;
+
+      // `goal` as a container hint: when its text matches a heading or caption,
+      // the tables under/after that heading are tried first. Purely an ordering
+      // preference — if nothing matches, every candidate is still considered.
+      const goalNorm = norm(goalText);
+      let preferred: Element | null = null;
+      if (goalNorm.length >= 3) {
+        const headings = document.querySelectorAll(
+          'h1, h2, h3, h4, h5, h6, caption, legend, [role="heading"]',
+        );
+        for (const h of headings) {
+          const text = norm(h.textContent);
+          if (text.length < 3) continue;
+          if (text === goalNorm || text.includes(goalNorm) || goalNorm.includes(text)) {
+            preferred = h;
+            break;
           }
         }
+      }
+      if (preferred) {
+        const scoped = new Set<Element>();
+        // A <caption>/heading inside the table, the heading's own section, and
+        // the next table/grid that follows the heading.
+        const container = preferred.closest('table, [role="table"], [role="grid"], section, div');
+        if (container) {
+          if (container.matches('table, [role="table"], [role="grid"]')) scoped.add(container);
+          for (const t of container.querySelectorAll('table, [role="table"], [role="grid"]')) {
+            scoped.add(t);
+          }
+        }
+        for (let sib = preferred.nextElementSibling; sib; sib = sib.nextElementSibling) {
+          if (sib.matches('table, [role="table"], [role="grid"]')) {
+            scoped.add(sib);
+            break;
+          }
+          const inner = sib.querySelector('table, [role="table"], [role="grid"]');
+          if (inner) {
+            scoped.add(inner);
+            break;
+          }
+        }
+        if (scoped.size > 0) {
+          candidates.sort(
+            (a, b) => (scoped.has(b.root) ? 1 : 0) - (scoped.has(a.root) ? 1 : 0),
+          );
+        }
+      }
 
-        // If we matched at least one field, extract rows
-        if (fieldToCol.size === 0) continue;
+      let positionalFallback: {
+        records: Record<string, unknown>[];
+        note: string;
+      } | null = null;
 
-        const results: Record<string, unknown>[] = [];
-        for (let i = 1; i < rows.length; i++) {
-          const cells = rows[i].querySelectorAll('td, th');
+      for (const candidate of candidates) {
+        const headers = candidate.headerRow;
+
+        // Map fields to columns. A header is matched against the field key AND
+        // its description, exact first, then substring in either direction —
+        // the description is usually where the caller writes the page's own
+        // column label (issue #1353).
+        const fieldToCol = new Map<string, number>();
+        const takenCols = new Set<number>();
+        const matchTerms = names.map((name, i) =>
+          [norm(name), norm(descriptions[i])].filter((t) => t.length > 0),
+        );
+
+        // Pass 1: exact header match on any term.
+        names.forEach((name, i) => {
+          const idx = headers.findIndex(
+            (h) => h.length > 0 && matchTerms[i].some((t) => t === h),
+          );
+          if (idx !== -1 && !takenCols.has(idx)) {
+            fieldToCol.set(name, idx);
+            takenCols.add(idx);
+          }
+        });
+
+        // Pass 2: substring, both directions. Headers shorter than 2 chars are
+        // skipped: an empty header makes `term.includes(h)` always true, which
+        // would collapse every field onto the first blank column (layout tables
+        // have blank header cells).
+        names.forEach((name, i) => {
+          if (fieldToCol.has(name)) return;
+          const idx = headers.findIndex(
+            (h, c) =>
+              h.length >= 2 &&
+              !takenCols.has(c) &&
+              matchTerms[i].some((t) => t.length >= 2 && (h.includes(t) || t.includes(h))),
+          );
+          if (idx !== -1) {
+            fieldToCol.set(name, idx);
+            takenCols.add(idx);
+          }
+        });
+
+        const readCells = (
+          cells: Element[],
+          map: Map<string, number>,
+        ): { record: Record<string, unknown>; hasValue: boolean } => {
           const record: Record<string, unknown> = {};
           let hasValue = false;
-
           for (const name of names) {
-            const colIdx = fieldToCol.get(name);
+            const colIdx = map.get(name);
             if (colIdx !== undefined && colIdx < cells.length) {
               const cell = cells[colIdx];
               // For link/url fields, prefer the cell's anchor href over its
@@ -679,16 +835,50 @@ async function extractFromTables(
               record[name] = null;
             }
           }
+          return { record, hasValue };
+        };
 
-          if (hasValue) results.push(record);
+        const collect = (map: Map<string, number>) => {
+          const results: Record<string, unknown>[] = [];
+          for (const cells of candidate.rows) {
+            const { record, hasValue } = readCells(cells, map);
+            if (hasValue) results.push(record);
+          }
+          return results;
+        };
+
+        if (fieldToCol.size > 0) {
+          const results = collect(fieldToCol);
+          if (results.length > 0) return { records: results, note: null };
+          continue;
         }
 
-        if (results.length > 0) return results;
+        // Nothing matched. If the header row has as many columns as there are
+        // requested fields, map them in order — and say so, because it is a
+        // guess (issue #1353).
+        if (
+          !positionalFallback &&
+          headers.length === names.length &&
+          headers.some((h) => h.length > 0)
+        ) {
+          const map = new Map<string, number>();
+          names.forEach((name, i) => map.set(name, i));
+          const results = collect(map);
+          if (results.length > 0) {
+            positionalFallback = {
+              records: results,
+              note: 'fields mapped positionally; no header matched',
+            };
+          }
+        }
       }
 
-      return [];
+      if (positionalFallback) {
+        return { records: positionalFallback.records, note: positionalFallback.note };
+      }
+      return empty;
     },
-    { fieldNames },
+    { fieldNames, fieldDescriptions, goal },
     scope,
   );
 }
@@ -775,7 +965,7 @@ async function extractFromRepeatedElements(
   page: Page | null,
   scope: BrowserTargetScope,
   fieldNames: string[],
-): Promise<Record<string, unknown>[]> {
+): Promise<StrategyResult> {
   return await evalFunctionOrRpc(
     page,
     ({ fieldNames: names }: { fieldNames: string[] }) => {
@@ -913,8 +1103,11 @@ async function extractFromRepeatedElements(
               if (img) value = img.getAttribute('src');
             }
 
-            // Fallback: use full text for first unmatched field
-            if (!value) {
+            // Fallback: the item's whole text, but ONLY when a single field was
+            // requested. With several fields this fallback used to copy the same
+            // row text into every one of them (issue #1353) — an unresolved
+            // field is null instead, which is honest and machine-checkable.
+            if (!value && names.length === 1) {
               value = (el.textContent ?? '').trim().slice(0, 200);
             }
 
@@ -925,10 +1118,19 @@ async function extractFromRepeatedElements(
           if (hasValue) results.push(record);
         }
 
-        if (results.length > 0) return results;
+        if (results.length > 0) {
+          // Warn when the shape is barely usable: one field carried every
+          // record and the rest came back null.
+          const resolved = names.filter((n) => results.some((r) => r[n] !== null));
+          const note =
+            names.length > 1 && resolved.length === 1
+              ? `only ${resolved[0]} could be mapped; pass a selector or use browser_extract_text`
+              : null;
+          return { records: results, note };
+        }
       }
 
-      return [];
+      return { records: [] as Record<string, unknown>[], note: null as string | null };
     },
     { fieldNames },
     scope,

@@ -40,6 +40,7 @@ vi.mock('../dom-intelligence', () => ({
 vi.mock('../markdown-extractor', () => ({
   extractMarkdown: mockExtractMarkdown,
   extractStructuredData: vi.fn(async () => []),
+  extractStructuredDataWithNotes: vi.fn(async () => ({ records: [], notes: [] })),
 }));
 
 vi.mock('../page-eval', () => ({
