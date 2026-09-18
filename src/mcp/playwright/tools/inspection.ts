@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { PlaywrightEngine } from '../PlaywrightEngine';
 import { withAutomationLease } from '../automationLease';
 import {
+  DOM_LISTING_PROBE_HOVER_NOTE,
   DOM_LISTING_Q_NOTE,
   generateScopedSnapshot,
   generateSnapshot,
@@ -132,6 +133,12 @@ const BROWSER_SNAPSHOT_SHAPE = {
       'Text filter: keep only nodes matching this text (or /regex/), plus their ancestors. Literal text is searched in the page and costs about as little as a selector scope; a /regex/, or a page with iframes, still reads the whole tree first — prefer selector when you know where to look.',
     ),
   full: z.boolean().optional().describe('Force the complete tree instead of a diff.'),
+  probeHover: z
+    .boolean()
+    .optional()
+    .describe(
+      'Hover each "has-submenu" trigger and list what it reveals — costs up to ~5 s and moves the pointer.',
+    ),
   cursor: z
     .string()
     .optional()
@@ -485,9 +492,9 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
   // -----------------------------------------------------------------------
   server.tool(
     'browser_snapshot',
-    'Accessibility-tree snapshot of the page, with interactive elements annotated with ref numbers. A repeat snapshot of the same page returns a diff against the previous one when that is smaller — pass full:true for the complete tree. Line markers: "focused" on the focused node; while an overlay covers the page, a note names the layer, "overlay" marks it in the tree, and "clickable" marks the only controls still reachable behind it; an iframe line is a boundary — its contents are a separate document, not in this snapshot. Password field values read as "[redacted:password]" (the field is still listed and fillable); an empty field has no value at all, so a redacted one means it IS filled. "ai" drops the duplicate StaticText/InlineTextBox lines Chrome stacks under every piece of text; "aria" keeps them.',
+    'Accessibility-tree snapshot of the page, with interactive elements annotated with ref numbers. A repeat snapshot of the same page returns a diff against the previous one when that is smaller — pass full:true for the complete tree. Line markers: "focused" on the focused node; while an overlay covers the page, a note names the layer, "overlay" marks it in the tree, and "clickable" marks the only controls still reachable behind it; an iframe line is a boundary — its contents are a separate document, not in this snapshot. Password field values read as "[redacted:password]" (the field is still listed and fillable); an empty field has no value at all, so a redacted one means it IS filled. "ai" drops the duplicate StaticText/InlineTextBox lines Chrome stacks under every piece of text; "aria" keeps them. A nav item whose submenu only exists while the pointer is on it is marked "has-submenu"; pass probeHover:true to hover those and list their items.',
     BROWSER_SNAPSHOT_SHAPE,
-    async ({ format, selector, filter, q, full, cursor, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
+    async ({ format, selector, filter, q, full, cursor, probeHover, surfaceId }) => withAutomationLease(deps, surfaceId, async (scope) => {
       try {
         // Continuation: the next window of a capture this connection already
         // took. Returns before anything touches the page, which is the whole
@@ -537,6 +544,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
                 format: format ?? 'ai',
                 ...(filter && { filter }),
                 ...(q && { q }),
+                ...(probeHover && { probeHover }),
                 deferTruncation: true,
               }).catch(() => null)
             : null;
@@ -584,12 +592,17 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             // The DOM listing has no tree to prune, so `q` cannot be honored
             // here. Say so rather than return a full listing that looks filtered.
             if (q) text = `${DOM_LISTING_Q_NOTE}\n${text}`;
+            // Nor can the probe: it needs remote handles and a CDP Input lane.
+            // The triggers are still marked — the phase-1 scan is in the listing
+            // expression — so the note says which half of the flag was served.
+            if (probeHover) text = `${DOM_LISTING_PROBE_HOVER_NOTE}\n${text}`;
           }
         } else if (page) {
           text = await generateSnapshot(page, {
             format: format ?? 'ai',
             ...(filter && { filter }),
             ...(q && { q }),
+            ...(probeHover && { probeHover }),
             // The overflow becomes a continuation capture below rather than
             // being dropped at the 50 000-character budget.
             deferTruncation: true,
@@ -616,6 +629,7 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
             text = `(note: aria format unavailable — no live page, returning the DOM interactive listing)\n${text}`;
           }
           if (q) text = `${DOM_LISTING_Q_NOTE}\n${text}`;
+          if (probeHover) text = `${DOM_LISTING_PROBE_HOVER_NOTE}\n${text}`;
         }
 
         // What this surface's refs are, for the RPC lane's fail-closed guard.
@@ -658,7 +672,19 @@ export function registerInspectionTools(server: McpServer, deps: BrowserToolDeps
         // `a||b||c`. Two different renderings then share one baseline, which is
         // exactly the false "(no changes since previous snapshot)" this key
         // exists to prevent.
-        const attrs = JSON.stringify([format ?? 'ai', selector ?? '', filter ?? '', q ?? '', scopeRoute]);
+        //
+        // `probeHover` is in it because a probed snapshot carries the
+        // `[hover first: …]` items a plain one does not: diffing the two would
+        // report every menu's contents as an addition on the probed call, and
+        // as a removal on the next plain one.
+        const attrs = JSON.stringify([
+          format ?? 'ai',
+          selector ?? '',
+          filter ?? '',
+          q ?? '',
+          scopeRoute,
+          probeHover === true,
+        ]);
         const baseline = full ? null : getSnapshotBaseline(key, attrs, currentUrl);
         const rendered = formatSnapshotResult(baseline?.text ?? null, text);
         setSnapshotBaseline(key, attrs, text, currentUrl);
