@@ -58,6 +58,10 @@ export default function FleetView() {
   // X8 supervision mirror — subscribed here so the selector re-runs when a
   // supervised pane arms/stops or its restart count changes.
   const supervisionByPtyId = useStore((s) => s.supervisionByPtyId);
+  // #1343 — attached remote-host mirrors, so remote agents get a card here
+  // (the sidebar roster has shown them since #1163). Fleet View is a VIEW; the
+  // deck's commandable roster deliberately does not pass this.
+  const remoteWorkspaces = useStore((s) => s.remoteWorkspaces);
 
   // S-C2: tab lives in uiSlice (not FleetView-local) so the A2A / MCP approval
   // modals can suppress themselves while the inbox tab is open (AppLayout delta
@@ -90,8 +94,8 @@ export default function FleetView() {
   // trees or the per-pty attention map change (the two inputs the selector
   // reads), not on every unrelated store mutation.
   const panes = useMemo(
-    () => sortFleetPanes(selectFleetPanes({ workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId, surfaceAgent, surfacePendingQuestion }), fleetSortMode),
-    [workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId, surfaceAgent, surfacePendingQuestion, fleetSortMode],
+    () => sortFleetPanes(selectFleetPanes({ workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId, surfaceAgent, surfacePendingQuestion, remoteWorkspaces }), fleetSortMode),
+    [workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId, surfaceAgent, surfacePendingQuestion, remoteWorkspaces, fleetSortMode],
   );
   const needsCount = useMemo(() => countNeedsAttention(panes), [panes]);
   // Stable identity key of the terminal ptyIds to poll for RAM. `panes`
@@ -228,7 +232,12 @@ export default function FleetView() {
   // workspace+pane+surface directly via the shared activation core.
   const jump = useCallback((card: FleetPane) => {
     const getState = () => useStore.getState();
-    if (card.ptyId) {
+    // #1343 — `!card.remote` is load-bearing: a remote row's ptyId is the
+    // SYNTHETIC `remote:{host}:{session}` key, which no local surface carries,
+    // so focusPaneByPtyId would fail its lookup and the click would silently do
+    // nothing. Remote rows take the pane/surface path below, as they did when
+    // they still had an empty ptyId.
+    if (card.ptyId && !card.remote) {
       // focusPaneByPtyId unstashes on the way (#977).
       focusPaneByPtyId(getState, card.ptyId);
     } else if (card.surfaceId) {
