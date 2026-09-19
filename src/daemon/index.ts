@@ -85,6 +85,8 @@ import { checkTranscriptPath } from './hooks/transcriptPathGuard';
 import { TranscriptProjector } from './transcript/TranscriptProjector';
 import { TranscriptDiscovery, DISCOVERABLE_AGENT } from './transcript/TranscriptDiscovery';
 import { PushSender } from './push/PushSender';
+import { RelayTransport } from './push/RelayTransport';
+import { LiveActivityPusher, type LiveActivityCounts } from './push/LiveActivityPusher';
 import { approvalPushCollapseId, buildApprovalPushPayload } from './push/approvalPushPayload';
 import { WebhookSink } from './push/WebhookSink';
 import { buildApprovalNotifyPayload, buildAttentionNotifyPayload } from './push/notifyPayload';
@@ -217,6 +219,13 @@ function revokeAllWebDevices(
 // functions, one registry. Constructed in main() BEFORE any of them, because
 // both webTerminalServer construction paths need it available.
 let approvalRegistry: ApprovalRegistry | null = null;
+
+// The Live Activity pusher, module-scoped for the same reason the registry is —
+// but with an extra twist: both web servers are constructed BEFORE main() builds
+// the pusher, so `/api/config` cannot capture a reference. It captures a closure
+// over this binding instead and resolves whatever is here per request, which is
+// null (→ the key is omitted) until the pusher exists.
+let liveActivityPusher: LiveActivityPusher | null = null;
 
 // The press-scope fact table main pushes down (see approvals/workspaceFacts.ts).
 // Module-scoped for the same reason the registry is: the RPC handler writes it,
@@ -414,6 +423,13 @@ async function restoreWebServer(sessionManager: DaemonSessionManager): Promise<v
         // Read side of the same flag, so `/api/config` can answer "is the gate
         // armed?" instead of leaving a client's toggle to guess.
         gateEnabled: () => !gateRuntimeOff,
+        // Whether a Live Activity push can actually leave this machine. Lazy:
+        // the pusher is built later in main(), so this reads the module binding
+        // per request rather than capturing a null forever.
+        liveActivityPush: () => liveActivityPusher?.enabled === true,
+        // A token that lands after the numbers moved must catch the lock screen
+        // up now, not at the next approval event.
+        liveActivityRegistered: () => liveActivityPusher?.onApprovalsChanged(),
         setGateEnabled: (enabled) => {
           gateRuntimeOff = !enabled;
           log('info', `[gate] runtime escape: gate ${enabled ? 'on' : 'off'}`);
@@ -2612,6 +2628,10 @@ function registerRpcHandlers(
       gateConfig: () => coerceGate(loadConfig().gate),
       // See the restore path — the read side of the runtime escape hatch.
       gateEnabled: () => !gateRuntimeOff,
+      // See the restore path — lazy, because the pusher is built after this.
+      liveActivityPush: () => liveActivityPusher?.enabled === true,
+      // See the restore path.
+      liveActivityRegistered: () => liveActivityPusher?.onApprovalsChanged(),
       setGateEnabled: (enabled) => {
         gateRuntimeOff = !enabled;
         log('info', `[gate] runtime escape: gate ${enabled ? 'on' : 'off'}`);
@@ -5538,7 +5558,84 @@ async function main(): Promise<void> {
     staleAfterMs: () => presenceConfig().staleAfterMs,
     log: (level, msg) => log(level, msg),
   });
+  // What the lock screen shows, judged HERE rather than on the phone. The
+  // phone's own heuristics cannot see the approval registry, and the registry
+  // is the only authority on what is actually blocking somebody.
+  //
+  // The denominator matches the app's: `runningAgents` is every LIVE agent pane
+  // (a plain shell is not an agent, and an agent that finished or died is not
+  // running), and `working`/`idle` split the ones that are not blocked — so
+  //
+  //     runningAgents == workingAgents + idleAgents + awaiting_input panes
+  //
+  // which is the arithmetic the Fleet header already assumes.
+  //
+  // `blockedPanes` IS NOT THAT THIRD TERM. It is a different source: the
+  // approval registry, which is the only authority on what is blocking somebody
+  // right now. `awaiting_input` is the pane's own reading of its screen, and the
+  // two disagree routinely — a y/N prompt with no approval record raises
+  // awaiting_input and no blockedPane. Never fold one into the other.
+  const liveActivityCounts = (): LiveActivityCounts => {
+    const pending = approvalRegistry?.list().pending ?? [];
+    const blockedPanes = new Set(pending.map((r) => r.sessionId)).size;
+    const oldestCreatedAt = pending.length > 0 ? Math.min(...pending.map((r) => r.createdAt)) : null;
+    let runningAgents = 0;
+    let workingAgents = 0;
+    let awaitingInput = 0;
+    for (const session of sessionManager.listLiveSessions()) {
+      const state = readAgentStateForWeb?.(session.id);
+      // No agent name means a shell, and a shell is nobody's agent count.
+      if (!state?.agentName) continue;
+      // A finished or failed agent is not a running one. Counting it would make
+      // `runningAgents` a census of panes that once held an agent, and the
+      // number the lock screen shows is meant to be "how much is live here".
+      if (state.agentStatus === 'complete' || state.agentStatus === 'error') continue;
+      runningAgents += 1;
+      if (state.agentStatus === 'running') workingAgents += 1;
+      else if (state.agentStatus === 'awaiting_input') awaitingInput += 1;
+    }
+    const idleAgents = runningAgents - workingAgents - awaitingInput;
+    return {
+      pendingApprovals: pending.length,
+      runningAgents,
+      workingAgents,
+      idleAgents,
+      blockedPanes,
+      oldestBlockedMinutes:
+        oldestCreatedAt === null
+          ? null
+          : Math.max(0, Math.floor((Date.now() - oldestCreatedAt) / 60_000)),
+    };
+  };
+  // Live Activity. Same relay, same secret, a different route — and a strictly
+  // narrower payload: six integers, no sealed envelope, because a Live Activity
+  // push does not run the Notification Service Extension and has nowhere to
+  // decrypt one. Inert on the same terms push is.
+  liveActivityPusher = new LiveActivityPusher({
+    transport: new RelayTransport({
+      ...(process.env.WMUX_PUSH_RELAY_URL ? { relayUrl: process.env.WMUX_PUSH_RELAY_URL } : {}),
+      ...(process.env.WMUX_PUSH_RELAY_SECRET
+        ? { relaySecret: process.env.WMUX_PUSH_RELAY_SECRET }
+        : {}),
+      log: (level, msg) => log(level, msg),
+      tag: '[live-activity]',
+      noun: 'update',
+    }),
+    targets: () => getDeviceStore().liveActivityTargets(),
+    counts: () => liveActivityCounts(),
+    forgetLiveActivityToken: (deviceId, token) => {
+      getDeviceStore().forgetLiveActivityToken(deviceId, token);
+    },
+    forgetPushToStartToken: (deviceId, token) => {
+      getDeviceStore().forgetPushToStartToken(deviceId, token);
+    },
+    daemonName: () => os.hostname() || undefined,
+    log: (level, msg) => log(level, msg),
+  });
   approvalRegistry.onEvent((event) => {
+    // Every transition moves at least one of the three numbers the lock screen
+    // fires on, so this is subscribed to all of them, not just `create`.
+    liveActivityPusher?.onApprovalsChanged();
     // A resolve/expire/supersede is the thing the notification was asking for.
     // If one is still parked, it is now moot — drop it rather than buzzing a
     // phone about a question that has already been answered.

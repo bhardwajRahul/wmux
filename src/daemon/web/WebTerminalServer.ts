@@ -134,6 +134,7 @@ function decodeTurnCursor(
  *   GET  /api/pair?code=       the ONLY unauthenticated API route; mints this
  *                              device's own credential (refused over plaintext
  *                              off-machine transports — see mintRefusal)
+ *   POST /api/live-activity-registration  push-to-start / activity tokens (merges)
  *   GET  /api/config           allowInput + allowUpload flags, plus the phone
  *                              protocol handshake (see protocolVersion.ts)
  *   GET  /api/sessions         pane list
@@ -327,6 +328,16 @@ export interface WebDeviceResolver {
     deviceId: string,
     input: { apnsToken: string; publicKey: string; apnsEnvironment?: unknown },
   ): { ok: boolean; reason?: string };
+  /**
+   * Record where to reach this device's Live Activity. Optional for the same
+   * reason `registerPush` is, and MERGING rather than replacing — the two
+   * tokens are issued at different moments, so a replace would mean the daemon
+   * never holds both. `null` removes one; an omitted field is left alone.
+   */
+  registerLiveActivity?(
+    deviceId: string,
+    input: { pushToStartToken?: unknown; activityToken?: unknown; apnsEnvironment?: unknown },
+  ): { ok: boolean; reason?: string };
 }
 
 /**
@@ -478,6 +489,27 @@ interface WebTerminalServerDeps {
    * the same answer as "off".
    */
   gateEnabled?: () => boolean;
+  /**
+   * Whether this daemon can actually push a Live Activity — i.e. whether the
+   * relay transport behind the pusher is configured. A GETTER for the same
+   * reason `projector` is one: the server is built before the pusher, so the
+   * daemon wires a closure that resolves the live instance per request.
+   *
+   * Optional, and absent (or false) means `/api/config` OMITS the key rather
+   * than reporting `false`. A phone reads a missing key exactly as an older
+   * daemon's missing key — "start the activity locally" — so the two cases are
+   * the same answer and should be the same shape on the wire.
+   */
+  liveActivityPush?: () => boolean;
+  /**
+   * A device's Live Activity tokens just changed. The pusher sends only when
+   * the approval numbers move, so without this an activity token that lands
+   * AFTER the numbers moved (the start went out at 1, a second approval
+   * arrived while the token was in flight) would leave the lock screen on the
+   * old number until the next approval event. The daemon re-runs the decision
+   * against the numbers as they are now.
+   */
+  liveActivityRegistered?: () => void;
   /**
    * #1163 — the daemon's CANONICAL per-session agent state (the answer
    * daemon.getAgentName gives the desktop), for GET /api/workspaces. Resolved
@@ -1823,6 +1855,15 @@ export class WebTerminalServer {
         // worse off than one that never tried. A daemon predating the route
         // omits the key entirely, which a phone reads as false.
         ...(this.opts?.allowTranscript === true ? { turnImages: true } : {}),
+        // Whether this daemon can drive a Live Activity over APNs. A phone that
+        // sees it true registers a push-to-start token and lets the daemon
+        // start the activity; a phone talking to a daemon that omits the key
+        // keeps starting it locally, which is what every build did before this.
+        //
+        // OMITTED, not `false`, when the pusher is inert (no relay configured)
+        // or the getter was never wired — the same shape an older daemon
+        // serves, because it is the same instruction to the phone.
+        ...(this.deps.liveActivityPush?.() === true ? { liveActivityPush: true } : {}),
         // #783 — the gated-tools list so the phone can say "this Bash call is
         // waiting because Bash is in the gate list". Absent gateConfig → empty
         // array (a daemon that predates the gate or did not wire it).
@@ -1901,6 +1942,9 @@ export class WebTerminalServer {
     }
     if (req.method === 'POST' && p === '/api/push-registration') {
       return this.handlePushRegistration(req, res, principal);
+    }
+    if (req.method === 'POST' && p === '/api/live-activity-registration') {
+      return this.handleLiveActivityRegistration(req, res, principal);
     }
     if (req.method === 'POST' && p === '/api/input') {
       return this.handleInput(req, res, url, principal);
@@ -3557,6 +3601,84 @@ export class WebTerminalServer {
           ? 400
           : 409;
       return this.json(res, status, { error: result.reason ?? 'push-registration-failed' });
+    });
+  }
+
+  /**
+   * `POST /api/live-activity-registration` — where to reach this device's Live
+   * Activity, so the lock screen keeps following the daemon after iOS has
+   * stopped running the app.
+   *
+   * DEVICE ONLY, same as push registration: the operator token names no device.
+   *
+   * MERGES rather than replaces, which is the one thing a client has to know.
+   * iOS issues a push-to-start token at launch and an activity token only once
+   * an activity exists, so the two arrive in separate calls; a replace would
+   * mean each one erased the other. An omitted field is left alone. An explicit
+   * `null` removes that token — which is how the app says "the activity is
+   * over" rather than leaving the daemon pushing at a handle Apple will
+   * eventually 410.
+   *
+   * `apnsEnvironment` is registered HERE and not borrowed from the push
+   * registration: Live Activities are a separate permission, so a phone that
+   * refused notifications has no push registration to borrow from.
+   */
+  private handleLiveActivityRegistration(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    principal: WebPrincipal,
+  ): void {
+    if (principal.kind !== 'device') {
+      return this.json(res, 403, {
+        error: 'push-is-for-devices',
+        detail: 'register with the credential of the device whose activity this is',
+      });
+    }
+    const devices = this.deps.devices;
+    if (!devices?.registerLiveActivity) {
+      return this.json(res, 503, { error: 'push-unavailable' });
+    }
+    this.readJsonBody(req, res, (body) => {
+      const b = (body ?? {}) as {
+        pushToStartToken?: unknown;
+        activityToken?: unknown;
+        apnsEnvironment?: unknown;
+      };
+      // PRESENCE, not type — the same rule the push route follows and for a
+      // sharper reason here: `undefined` and `null` mean OPPOSITE things on this
+      // route ("leave it" vs "remove it"), so a field that is merely absent must
+      // never reach the store looking like an explicit null. Values are handed
+      // over raw; the store owns every allowlist.
+      let result: { ok: boolean; reason?: string };
+      try {
+        result = devices.registerLiveActivity!(principal.deviceId, {
+          ...(statesField(body, 'pushToStartToken')
+            ? { pushToStartToken: b.pushToStartToken }
+            : {}),
+          ...(statesField(body, 'activityToken') ? { activityToken: b.activityToken } : {}),
+          ...(statesField(body, 'apnsEnvironment')
+            ? { apnsEnvironment: b.apnsEnvironment }
+            : {}),
+        });
+      } catch (err) {
+        this.deps.log('warn', `[web] live activity registration threw: ${errMsg(err)}`);
+        return this.json(res, 500, { error: 'live-activity-registration-failed' });
+      }
+      if (result.ok) {
+        // Only a token that ADDS a way to reach the activity. A removal
+        // (`activityToken: null`) is the app saying the activity is over; re-running
+        // the decision then would start a fresh one the moment it was dismissed.
+        if (typeof b.activityToken === 'string') this.deps.liveActivityRegistered?.();
+        return this.json(res, 200, { ok: true });
+      }
+      // `bad-token` / `bad-apns-environment` are the caller's fault; the rest
+      // are ours or the operator's, and a device revoked mid-flight should hear
+      // that rather than a generic 400.
+      const status =
+        result.reason === 'bad-token' || result.reason === 'bad-apns-environment' ? 400 : 409;
+      return this.json(res, status, {
+        error: result.reason ?? 'live-activity-registration-failed',
+      });
     });
   }
 
