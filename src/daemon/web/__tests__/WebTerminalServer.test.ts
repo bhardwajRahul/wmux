@@ -5457,6 +5457,647 @@ describe('WebTerminalServer', () => {
     });
   });
 
+  describe('turn-view files (GET /api/sessions/:id/turns/file)', () => {
+    /** The smallest legal PNG: signature, IHDR for 1x1, one IDAT, IEND. */
+    const PNG_1X1 = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    /**
+     * An ISO BMFF header: the `ftyp` box's own length, the marker at byte 4,
+     * the major brand at byte 8, a minor version, one compatible brand. Enough
+     * bytes for the sniffer and nothing more — what is being pinned is the
+     * brand table, not a decoder.
+     */
+    const bmff = (brand: string): Buffer => {
+      const box = Buffer.alloc(24);
+      box.writeUInt32BE(24, 0);
+      box.write('ftyp', 4, 'latin1');
+      box.write(brand, 8, 'latin1');
+      box.writeUInt32BE(512, 12);
+      box.write(brand, 16, 'latin1');
+      box.write('mp41', 20, 'latin1');
+      return box;
+    };
+    let dirs: string[];
+    const tmpTree = (): string => {
+      const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-turn-file-')));
+      dirs.push(dir);
+      return dir;
+    };
+    const fileUrl = (id: string, p: string): string =>
+      `${base()}/api/sessions/${id}/turns/file?path=${encodeURIComponent(p)}`;
+    /**
+     * A file of `size` bytes whose head is `head`. `truncate` makes the tail
+     * SPARSE, so a 128 MB fixture costs no disk and no wall clock — writing
+     * real bytes for the cap cases would dominate the run.
+     */
+    const sparse = (dir: string, name: string, head: Buffer, size: number): string => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, head);
+      fs.truncateSync(file, size);
+      return file;
+    };
+
+    /**
+     * Wrap the FileHandle this route opens FOR ONE PATH. Scoping by path is not
+     * tidiness: `fs.promises.open` is global, the daemon opens files of its own
+     * (state, devices) while a test runs, and a `mockImplementationOnce` can be
+     * spent on one of those instead — the handler then gets a real handle and
+     * the case silently proves nothing, or worse, a stub that blocks parks a
+     * read the suite never finishes.
+     */
+    /**
+     * The paths every intercepted `open` was asked for, so a case that never
+     * fired says WHY in its failure rather than just asserting zero.
+     */
+    let openedPaths: string[] = [];
+    /**
+     * Wrap the FileHandle this route opens FOR ONE FILE. Scoping matters:
+     * `fs.promises.open` is global and the daemon opens files of its own while
+     * a case runs, so an unscoped `mockImplementationOnce` can be spent on one
+     * of those — the case then silently proves nothing, or parks the suite if
+     * the stub blocks.
+     *
+     * The file is identified by INODE, not by the path string. The handler
+     * opens whatever `realpath` returned, and a test that compares spellings is
+     * one `/tmp` symlink, one mount, one case difference away from matching
+     * nothing at all — silently, because "never intercepted" and "intercepted
+     * and the route behaved" look identical from the assertion side. The path
+     * is still accepted as a fallback for platforms that report no inode.
+     */
+    const interceptOpen = (
+      target: string,
+      wrap: (handle: fs.promises.FileHandle) => Promise<fs.promises.FileHandle>,
+    ) => {
+      const real = fs.promises.open;
+      const targetIno = fs.statSync(target).ino;
+      let used = false;
+      const spy = vi.spyOn(fs.promises, 'open');
+      spy.mockImplementation((async (...args: Parameters<typeof fs.promises.open>) => {
+        const handle = await real(...args);
+        openedPaths.push(String(args[0]));
+        if (used) return handle;
+        let mine = String(args[0]) === target;
+        if (!mine && targetIno !== 0) {
+          try {
+            mine = (await handle.stat()).ino === targetIno;
+          } catch {
+            mine = false;
+          }
+        }
+        if (!mine) return handle;
+        used = true;
+        return wrap(handle);
+      }) as never);
+      return spy;
+    };
+
+    beforeEach(() => { dirs = []; openedPaths = []; });
+    afterEach(() => {
+      for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('403 tagged transcript-disabled without --allow-transcript', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'a.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      managed.meta.spawnCwd = dir;
+      const info = await startRO();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(403);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      // The phone splits this refusal from every other 403 by the PREFIX.
+      expect((await res.json()).error.startsWith('transcript-disabled:')).toBe(true);
+    });
+
+    it('401 without a Bearer header', async () => {
+      await startWithTranscript();
+      const res = await fetch(fileUrl('s1', '/x/a.mp4'));
+      expect(res.status).toBe(401);
+    });
+
+    it('serves mp4, QuickTime and every type the image route already served', async () => {
+      const dir = tmpTree();
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      // The BRANDS decide, and `qt  ` must not be folded into video/mp4: the
+      // phone names its cache file from this header, and AVPlayer will not
+      // open a QuickTime movie called `.mp4`.
+      const cases: Array<[string, Buffer, string]> = [
+        ['clip.mp4', bmff('isom'), 'video/mp4'],
+        ['clip2.mp4', bmff('mp42'), 'video/mp4'],
+        ['clip3.mp4', bmff('avc1'), 'video/mp4'],
+        ['clip4.m4v', bmff('M4V '), 'video/mp4'],
+        ['clip.mov', bmff('qt  '), 'video/quicktime'],
+        ['shot.png', PNG_1X1, 'image/png'],
+      ];
+      for (const [name, bytes, type] of cases) {
+        const file = path.join(dir, name);
+        fs.writeFileSync(file, bytes);
+        const res = await fetch(fileUrl('s1', file), { headers: h });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe(type);
+        expect(res.headers.get('cache-control')).toBe('no-store');
+        expect(res.headers.get('content-length')).toBe(String(bytes.length));
+        // Streamed, but byte-identical — and never a Range advertisement the
+        // route cannot honour.
+        expect(Buffer.from(await res.arrayBuffer()).equals(bytes)).toBe(true);
+        expect(res.headers.get('accept-ranges')).toBe(null);
+      }
+    });
+
+    it('415 unsupported-type for a text file, whatever it is named', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'notes.mp4');
+      fs.writeFileSync(file, 'plain text wearing an .mp4 suffix');
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(415);
+      // A DIFFERENT tag from the image route's `not-an-image`, so the phone's
+      // two error maps never collapse into one.
+      expect((await res.json()).error).toBe('unsupported-type');
+    });
+
+    it('415, not 413, for an unsupported file over every cap', async () => {
+      // The cap depends on the type, so the sniff runs first. Saying
+      // "too large" about a file that would be refused at any size is a lie,
+      // and the phone renders the two differently (no retry vs. a limit).
+      const dir = tmpTree();
+      const file = sparse(dir, 'huge.txt', Buffer.from('not a media file'), 200 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(415);
+      expect((await res.json()).error).toBe('unsupported-type');
+    });
+
+    it('413 file-too-large over the 128 MiB video cap, without leaking the size', async () => {
+      const dir = tmpTree();
+      const file = sparse(dir, 'big.mp4', bmff('isom'), 128 * 1024 * 1024 + 1);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(413);
+      const body = await res.json();
+      expect(body.error).toBe('file-too-large');
+      // The cap is the only number a caller learns.
+      expect(body.detail).toBe(`the cap is ${128 * 1024 * 1024} bytes`);
+      expect(body.detail).not.toContain(String(128 * 1024 * 1024 + 1));
+    });
+
+    it('413 for an image over the 8 MiB image cap - the caps stay per kind', async () => {
+      const dir = tmpTree();
+      const file = sparse(dir, 'big.png', PNG_1X1, 8 * 1024 * 1024 + 1);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(413);
+      expect((await res.json()).detail).toBe(`the cap is ${8 * 1024 * 1024} bytes`);
+    });
+
+    it('streams a 100 MB video instead of reading it whole', async () => {
+      const dir = tmpTree();
+      const file = sparse(dir, 'long.mp4', bmff('isom'), 100 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      // RSS alone cannot answer this question: server and client share one
+      // process, so the client's own chunks and whatever the GC has not got to
+      // yet are counted too, and a buffered handler's 100 MB would be freed
+      // before a post-hoc reading anyway. So the handle itself is watched. A
+      // route that buffers asks it for `stat.size` bytes in one call; this one
+      // never asks for more than a stream chunk, whatever the file weighs.
+      const reads: number[] = [];
+      let streams = 0;
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realRead = handle.read.bind(handle);
+        const realStream = handle.createReadStream.bind(handle);
+        handle.read = ((...a: unknown[]) => {
+          reads.push(typeof a[2] === 'number' ? a[2] : 0);
+          return (realRead as (...x: unknown[]) => unknown)(...a);
+        }) as typeof handle.read;
+        handle.createReadStream = ((...a: Parameters<typeof handle.createReadStream>) => {
+          streams += 1;
+          return realStream(...a);
+        }) as typeof handle.createReadStream;
+        return handle;
+      });
+      try {
+        const before = process.memoryUsage().rss;
+        const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-length')).toBe(String(100 * 1024 * 1024));
+        // Counted, never accumulated: `arrayBuffer()` here would add 100 MB
+        // from the CLIENT side of the same process.
+        let seen = 0;
+        let peak = before;
+        for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+          seen += chunk.length;
+          const rss = process.memoryUsage().rss;
+          if (rss > peak) peak = rss;
+        }
+        expect(seen).toBe(100 * 1024 * 1024);
+        // Named with the evidence: a bare `toBe(1)` here reports "0 is not 1"
+        // and leaves the next reader guessing whether the route stopped
+        // streaming or the interception never landed.
+        expect({ streams, openedPaths }).toMatchObject({ streams: 1 });
+        // The largest single read is one stream chunk (64 KiB), not the 100 MB
+        // a `Buffer.allocUnsafe(stat.size)` route would have asked for. The
+        // count is left alone deliberately — it tracks the highWaterMark, and
+        // pinning it would break on a Node that changes the default.
+        expect(Math.max(...reads)).toBeLessThanOrEqual(64 * 1024);
+        expect(reads.length).toBeGreaterThan(100);
+        // Secondary, and loose on purpose: this number includes the client's
+        // uncollected chunks, so it is here to catch an order-of-magnitude
+        // regression, not to measure the handler.
+        expect(peak - before).toBeLessThan(100 * 1024 * 1024);
+      } finally {
+        openSpy.mockRestore();
+      }
+    });
+
+    it('cuts the response when the file shrank under the promised length', async () => {
+      // Content-Length is the size the gate approved. Fewer bytes than that
+      // leaves URLSession waiting for a remainder that is never coming, so the
+      // honest end - the header is already gone - is to cut the socket.
+      const dir = tmpTree();
+      const file = path.join(dir, 'shrink.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realStat = handle.stat.bind(handle);
+        // One byte MORE than there is: the same disagreement a file being
+        // truncated mid-flight produces.
+        handle.stat = (async () => {
+          const st = await realStat();
+          return Object.assign(st, { size: st.size + 1 });
+        }) as typeof handle.stat;
+        return handle;
+      });
+      try {
+        await expect(
+          fetch(fileUrl('s1', file), { headers: bearer(info.token as string) })
+            .then((r) => r.arrayBuffer()),
+        ).rejects.toThrow();
+      } finally {
+        openSpy.mockRestore();
+      }
+      // And the server is still serving: the cut released its handle.
+      const ok = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(ok.status).toBe(200);
+    });
+
+    it('finishes cleanly, with the approved prefix, when the file grows', async () => {
+      // The contract sketched a cut here. It cannot work: the stream is bounded
+      // by `end: stat.size - 1`, so the client already holds every byte the
+      // Content-Length announced and reads the message as complete. Destroying
+      // the socket at that point does not reach it as a failure — it lands on
+      // whatever is still in the userland buffer, so the SAME correct response
+      // arrives whole or truncated depending on timing. What this pins is the
+      // decision that replaced it: the approved prefix is delivered, intact,
+      // every time.
+      const dir = tmpTree();
+      const file = path.join(dir, 'grow.mp4');
+      const bytes = bmff('isom');
+      fs.writeFileSync(file, bytes);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      // The handler is told the file is one byte shorter than it is — the same
+      // disagreement a file being appended to mid-flight produces.
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realStat = handle.stat.bind(handle);
+        handle.stat = (async () => {
+          const st = await realStat();
+          return Object.assign(st, { size: st.size - 1 });
+        }) as typeof handle.stat;
+        return handle;
+      });
+      try {
+        const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-length')).toBe(String(bytes.length - 1));
+        const got = Buffer.from(await res.arrayBuffer());
+        // Exactly the approved prefix: not one byte of the growth, and not one
+        // byte short of what the header promised.
+        expect(got.length).toBe(bytes.length - 1);
+        expect(got.equals(bytes.subarray(0, bytes.length - 1))).toBe(true);
+      } finally {
+        openSpy.mockRestore();
+      }
+    });
+
+    it('survives a client that walks away mid-download', async () => {
+      // `pipe` unpipes on a closed response but never destroys its source, so
+      // this is the path that would leak the FileHandle for the life of the
+      // daemon. What it must NOT do is leave the process with a pending wait.
+      const dir = tmpTree();
+      const file = sparse(dir, 'walked.mp4', bmff('isom'), 32 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      let closed = false;
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realClose = handle.close.bind(handle);
+        handle.close = (async () => { closed = true; return realClose(); }) as typeof handle.close;
+        return handle;
+      });
+      try {
+        const ac = new AbortController();
+        const res = await fetch(fileUrl('s1', file), {
+          headers: bearer(info.token as string),
+          signal: ac.signal,
+        });
+        expect(res.status).toBe(200);
+        const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+        await reader.read();
+        ac.abort();
+        await reader.cancel().catch(() => { /* already aborted */ });
+        // THE assertion. A server leaking the descriptor still answers the next
+        // request happily, so "it answered again" proves nothing on its own.
+        await vi.waitFor(() => expect(closed).toBe(true));
+      } finally {
+        openSpy.mockRestore();
+      }
+      const after = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(after.status).toBe(200);
+      await after.body?.cancel();
+    });
+
+    it('releases the handle when the client leaves before the first byte', async () => {
+      // The window the abort test above cannot reach: every step of the gate is
+      // an await, so 'close' can fire BEFORE the handler subscribes to it. A
+      // listener registered after the event never runs, and writing to a
+      // destroyed response returns false rather than throwing — so a handler
+      // that only subscribed would park in `pipe` for ever holding this handle.
+      const dir = tmpTree();
+      const file = sparse(dir, 'early.mp4', bmff('isom'), 8 * 1024 * 1024);
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      let entered!: () => void;
+      const inTheGate = new Promise<void>((r) => { entered = r; });
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      let closed = false;
+      const openSpy = interceptOpen(file, async (handle) => {
+        const realClose = handle.close.bind(handle);
+        handle.close = (async () => { closed = true; return realClose(); }) as typeof handle.close;
+        entered();
+        await held;
+        return handle;
+      });
+      try {
+        const ac = new AbortController();
+        const pending = fetch(fileUrl('s1', file), {
+          headers: bearer(info.token as string),
+          signal: ac.signal,
+        });
+        const settled = pending.catch(() => 'aborted' as const);
+        await inTheGate;
+        ac.abort();
+        // Let the abort reach the server before the gate finishes.
+        await new Promise((r) => setImmediate(r));
+        release();
+        expect(await settled).toBe('aborted');
+        // The handler has to finish on its own — a leak would leave this
+        // pending for the life of the daemon.
+        await vi.waitFor(() => expect(closed).toBe(true));
+      } finally {
+        openSpy.mockRestore();
+      }
+      const ok = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(ok.status).toBe(200);
+      await ok.body?.cancel();
+    });
+
+    it('404s outside the boundary, through a symlink, and on a FIFO', async () => {
+      const root = tmpTree();
+      const cwd = path.join(root, 'cwd');
+      const outside = path.join(root, 'outside');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(outside);
+      const secret = path.join(outside, 'secret.mp4');
+      fs.writeFileSync(secret, bmff('isom'));
+      const link = path.join(cwd, 'looks-local.mp4');
+      fs.symlinkSync(secret, link);
+      const fifo = path.join(cwd, 'pipe.mp4');
+      execFileSync('mkfifo', [fifo]);
+      const sibling = path.join(root, 'cwd-next-door');
+      fs.mkdirSync(sibling);
+      const prefixed = path.join(sibling, 'a.mp4');
+      fs.writeFileSync(prefixed, bmff('isom'));
+      const sub = path.join(cwd, 'clips');
+      fs.mkdirSync(sub);
+      managed.meta.spawnCwd = cwd;
+      // OSC 7 moves `meta.cwd`, so it is never a boundary.
+      managed.meta.cwd = outside;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      // The escape hatch, the hang, the string-prefix sibling, the directory,
+      // the wandered cwd, and a path that is simply not there - one answer for
+      // all of them, or the difference maps the disk.
+      for (const p of [secret, link, fifo, prefixed, sub, path.join(cwd, 'nope.mp4')]) {
+        const res = await fetch(fileUrl('s1', p), { headers: h });
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('file not found');
+      }
+    });
+
+    it('400 bad-file-ref for a missing, empty, relative or NUL-bearing path', async () => {
+      managed.meta.spawnCwd = tmpTree();
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const refs = ['', '   ', 'relative/a.mp4', './a.mp4', `/x/a${String.fromCharCode(0)}.mp4`];
+      for (const ref of refs) {
+        const res = await fetch(fileUrl('s1', ref), { headers: h });
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toBe('bad-file-ref');
+      }
+      const bare = await fetch(`${base()}/api/sessions/s1/turns/file`, { headers: h });
+      expect(bare.status).toBe(400);
+      expect((await bare.json()).error).toBe('bad-file-ref');
+    });
+
+    it('404 for an unknown pane, and for the orchestrator brain', async () => {
+      const dir = tmpTree();
+      const file = path.join(dir, 'a.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      live.push({
+        id: 'brain-ws-1', cwd: dir, cols: 80, rows: 24, state: 'detached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: {}, cmd: '/usr/bin/claude',
+      });
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      for (const id of ['no-such-pane', 'brain-ws-1']) {
+        const res = await fetch(fileUrl(id, file), { headers: h });
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('session not found');
+      }
+    });
+
+    it('serves a video out of the uploads directory, session-independently', async () => {
+      managed.meta.spawnCwd = tmpTree();
+      const clip = path.join(uploadsDir, 'clip.mp4');
+      fs.writeFileSync(clip, bmff('isom'));
+      try {
+        const info = await startWithTranscript();
+        const res = await fetch(fileUrl('s1', clip), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('video/mp4');
+      } finally {
+        // uploadsDir is shared across describes; the tree cleanup misses it.
+        fs.rmSync(clip, { force: true });
+      }
+    });
+
+    it('serves fragmented mp4, whose major brand is not isom', async () => {
+      // `ffmpeg -movflags frag_keyframe+empty_moov` writes `iso5`. An agent
+      // rendering a clip for streaming is the use this route exists for, and a
+      // 415 there is permanent as far as a client is concerned.
+      const dir = tmpTree();
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      for (const brand of ['iso4', 'iso5', 'iso6', 'dash']) {
+        const file = path.join(dir, `frag-${brand.trim()}.mp4`);
+        fs.writeFileSync(file, bmff(brand));
+        const res = await fetch(fileUrl('s1', file), { headers: h });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('video/mp4');
+        await res.body?.cancel();
+      }
+    });
+
+    it('415s a text file that merely contains the ftyp marker', async () => {
+      // The marker is twelve bytes of ASCII a document can hold. What it cannot
+      // also hold in front of it is a plausible box length: a `ftyp` box is
+      // 16 bytes or more and a multiple of four, and `<!--` read as a
+      // big-endian length is neither.
+      const dir = tmpTree();
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      const decoys = [
+        Buffer.from('<!--ftypisom this is a comment, not a movie -->'),
+        // Length zero: legal in MP4 only for the LAST box, never for `ftyp`.
+        Buffer.concat([Buffer.alloc(4), Buffer.from('ftypisom'), Buffer.alloc(8)]),
+        // 18: not a multiple of four, so not a box that holds whole brands.
+        (() => {
+          const b = Buffer.alloc(24);
+          b.writeUInt32BE(18, 0);
+          b.write('ftypisom', 4, 'latin1');
+          return b;
+        })(),
+      ];
+      for (const [i, bytes] of decoys.entries()) {
+        const file = path.join(dir, `decoy-${i}.mp4`);
+        fs.writeFileSync(file, bytes);
+        const res = await fetch(fileUrl('s1', file), { headers: h });
+        expect(res.status).toBe(415);
+        expect((await res.json()).error).toBe('unsupported-type');
+      }
+    });
+
+    it('carries the security headers onto the 200', async () => {
+      // Nothing else in this describe would notice if the spread of
+      // `securityHeaders()` were dropped from the streamed response, and this
+      // route hands a browser bytes it sniffed itself.
+      const dir = tmpTree();
+      const file = path.join(dir, 'clip.mp4');
+      fs.writeFileSync(file, bmff('isom'));
+      managed.meta.spawnCwd = dir;
+      const info = await startWithTranscript();
+      const res = await fetch(fileUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      await res.body?.cancel();
+    });
+
+    it('404s when the last component became a symlink after the boundary check', async () => {
+      // O_NOFOLLOW is the whole answer to the window between `realpath` and
+      // `open`, and every other symlink case in this file is caught one step
+      // earlier - by realpath - so nothing reaches the flag. Handing the
+      // handler a path realpath did NOT resolve is what puts the swap in front
+      // of `open`, where ELOOP is the refusal.
+      const root = tmpTree();
+      const cwd = path.join(root, 'cwd');
+      const outside = path.join(root, 'outside');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(outside);
+      const secret = path.join(outside, 'secret.mp4');
+      fs.writeFileSync(secret, bmff('isom'));
+      const swapped = path.join(cwd, 'swapped.mp4');
+      fs.symlinkSync(secret, swapped);
+      managed.meta.spawnCwd = cwd;
+      const realRealpath = fs.promises.realpath;
+      const rpSpy = vi.spyOn(fs.promises, 'realpath');
+      rpSpy.mockImplementation((async (p: fs.PathLike, ...rest: unknown[]) => {
+        // The link resolves to itself: containment passes, and the file `open`
+        // then meets is the symlink the check never saw through.
+        if (String(p) === swapped) return swapped;
+        return (realRealpath as (...a: unknown[]) => Promise<string>)(p, ...rest);
+      }) as never);
+      try {
+        const info = await startWithTranscript();
+        const res = await fetch(fileUrl('s1', swapped), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('file not found');
+      } finally {
+        rpSpy.mockRestore();
+      }
+    });
+
+    it('serves a file under an uploads directory nested inside the pane cwd', async () => {
+      // The two roots are independent, and one containing the other must not
+      // turn into a rejection on whichever is checked second.
+      const cwd = tmpTree();
+      const nested = path.join(cwd, 'uploads');
+      fs.mkdirSync(nested);
+      const clip = path.join(nested, 'from-phone.mp4');
+      fs.writeFileSync(clip, bmff('isom'));
+      managed.meta.spawnCwd = cwd;
+      const nestedServer = new WebTerminalServer({
+        sessionManager,
+        projector: () => projectorMock as unknown as TranscriptProjector,
+        log: () => { /* silent in tests */ },
+        assetsDir: os.tmpdir(),
+        uploadsDir: nested,
+      });
+      const info = await nestedServer.start({
+        port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true, allowTranscript: true,
+      });
+      try {
+        const url = `http://127.0.0.1:${info.port}/api/sessions/s1/turns/file?path=${encodeURIComponent(clip)}`;
+        const res = await fetch(url, { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect(res.headers.get('content-type')).toBe('video/mp4');
+        await res.body?.cancel();
+      } finally {
+        await nestedServer.stop();
+      }
+    });
+
+    it('/api/config advertises turnFiles only alongside the transcript grant', async () => {
+      const off = await startRO();
+      const offBody = await (
+        await fetch(`${base()}/api/config`, { headers: bearer(off.token as string) })
+      ).json();
+      // ABSENT, not false - the shape a daemon predating the route serves.
+      expect(offBody).not.toHaveProperty('turnFiles');
+
+      await server.stop();
+      const on = await startWithTranscript();
+      const onBody = await (
+        await fetch(`${base()}/api/config`, { headers: bearer(on.token as string) })
+      ).json();
+      expect(onBody).toHaveProperty('turnFiles', true);
+      // The older key keeps its meaning; this one is additive.
+      expect(onBody).toHaveProperty('turnImages', true);
+    });
+  });
+
   describe('GET /api/workspaces', () => {
     it('groups live sessions by WMUX_WORKSPACE_ID and surfaces id+name+panes', async () => {
       // Fixture already covers the matrix: s1 → ws-1 named "Workspace 1", s2 →
