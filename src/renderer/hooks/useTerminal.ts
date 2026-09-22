@@ -19,6 +19,7 @@ import { pasteClipboardImage } from '../utils/imagePaste';
 import { openTerminalUrl } from '../utils/browserPaneActions';
 import { runCopyWithFeedback } from '../utils/copyWithFeedback';
 import { claimFit } from '../utils/fitGuard';
+import { installAltClickTrackingGuard } from '../utils/altClickUnderMouseTracking';
 import { createMouseOwnedHint } from '../utils/mouseOwnedHint';
 import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 import { createOsc52Handler } from '../utils/osc52Clipboard';
@@ -602,11 +603,13 @@ function showCopyErrorToast() {
 }
 
 // The pane's foreground app has mouse tracking on, so a plain left-drag never
-// reaches xterm's SelectionService and no highlight appears. Shift is the
-// override xterm already implements (`shouldForceSelection` → `event.shiftKey`
-// off macOS) and the one Windows Terminal / iTerm2 teach; wmux uses it for
-// Shift+right-click paste too. Longer-lived than the copy toasts because this
-// one is instructional, not an acknowledgement.
+// reaches xterm's SelectionService and no highlight appears. The override is
+// the one xterm already implements in `shouldForceSelection`: `event.shiftKey`
+// off macOS (what Windows Terminal / iTerm2 teach, and what wmux uses for
+// Shift+right-click paste), `event.altKey` on macOS — so the hint has to name
+// the key for THIS platform, or it sends the user to a modifier that does
+// nothing. Longer-lived than the copy toasts because this one is
+// instructional, not an acknowledgement.
 let mouseOwnedToastTimer: ReturnType<typeof setTimeout> | null = null;
 function showMouseOwnedHintToast() {
   let el = document.getElementById('wmux-mouse-owned-toast');
@@ -617,7 +620,11 @@ function showMouseOwnedHintToast() {
     document.body.appendChild(el);
   }
   const node = el;
-  node.textContent = t('terminal.mouseOwnedSelectHint');
+  node.textContent = t(
+    window.electronAPI?.platform === 'darwin'
+      ? 'terminal.mouseOwnedSelectHintMac'
+      : 'terminal.mouseOwnedSelectHint',
+  );
   node.style.opacity = '1';
   if (mouseOwnedToastTimer) clearTimeout(mouseOwnedToastTimer);
   mouseOwnedToastTimer = setTimeout(() => { node.style.opacity = '0'; }, 3200);
@@ -1126,6 +1133,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       theme: xtermTheme,
       minimumContrastRatio,
       allowProposedApi: true,
+      // #1437: when the foreground app enables mouse tracking (Claude Code
+      // does around its input box), a plain drag goes to the app and nothing
+      // gets selected. Off macOS, xterm forces a selection on Shift+drag; on
+      // macOS it only does so for Option+drag, and only with this flag on —
+      // without it a Mac user has no way to select in such a pane. Cost: on
+      // macOS, Option+drag no longer does column selection (iTerm2 makes the
+      // same trade). Option+click-to-move-cursor stays at shell prompts; see
+      // installAltClickTrackingGuard for why it is off under mouse tracking.
+      macOptionClickForcesSelection: true,
       // Enable xterm 6's Windows-aware ConPTY handling. ConPTY emits spurious
       // row-change events on resize; on a build where the reflow path is taken
       // that logic suppresses them, which in turn keeps SelectionService from
@@ -1324,6 +1340,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // 레이스할 두 번째 네이티브 writer가 없고(Electron paste role registerAccelerator:false),
     // Linux는 middle-click PRIMARY-selection paste 오검출 위험까지 있어 등록에서 제외한다.
     if (isMac) { container.addEventListener('paste', blockNativePaste, true); }
+    // #1437: Option+drag now forces a selection under mouse tracking, so a
+    // short Option+click would reach xterm's click-to-move-cursor and type
+    // arrow keys into the app. Keep that feature to shell prompts.
+    const detachAltClickGuard = installAltClickTrackingGuard(container, terminal);
 
     // Issue #167: keep the hidden IME textarea empty while idle. xterm only
     // clears it on blur, so IME-committed text accumulates there after it was
@@ -2726,7 +2746,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // `createMouseOwnedHint`; this only wires events and reads the live mode.
     // Nothing is preventDefault'ed or swallowed: the app keeps every event it
     // owns, we just say why the highlight did not appear.
+    // Which modifier escapes is platform-dependent — see the toast helper.
+    const forcesSelectionOnThisPlatform = window.electronAPI?.platform === 'darwin'
+      ? (e: { altKey?: boolean }) => e.altKey === true
+      : (e: { shiftKey: boolean }) => e.shiftKey;
     const mouseOwnedHint = createMouseOwnedHint({
+      forcesSelection: forcesSelectionOnThisPlatform,
       isMouseOwned: () => {
         const mode = (terminal as unknown as { modes?: { mouseTrackingMode?: string } })
           .modes?.mouseTrackingMode ?? 'none';
@@ -2807,6 +2832,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
       if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
       if (isMac) { container.removeEventListener('paste', blockNativePaste, true); }
+      detachAltClickGuard();
       detachAltScreenWheel();
       terminal.textarea?.removeEventListener('focus', onTextareaFocus);
       terminal.textarea?.removeEventListener('keydown', onWatchdogKeyDown);
