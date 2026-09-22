@@ -52,6 +52,8 @@ export const MAX_INBOX_SIZE = _MAX_INBOX_SIZE;
 
 // === Surface: a single terminal instance within a Pane ===
 export interface Surface {
+  /** Presentation only: both views share the same live PTY. */
+  viewMode?: 'terminal' | 'chat';
   id: string;
   ptyId: string;
   title: string;
@@ -813,6 +815,9 @@ export interface SessionData {
    *  terminal / split right / split down / new browser). Default true —
    *  hideable for minimal-chrome setups. */
   paneActionsVisible?: boolean;
+  /** Chat presentation for local Claude Code sessions. Default false while
+   *  experimental; persisted so an opt-in survives restarts. */
+  chatViewEnabled?: boolean;
   // Titlebar wall-clock (2026-09-05). Default off; persisted so the people who
   // turn it on keep it across restarts.
   titlebarClockVisible?: boolean;
