@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { useStore } from '../../stores';
+import { useShallow } from 'zustand/react/shallow';
 import { useT } from '../../hooks/useT';
 import {
   selectFleetPanes,
-  sortFleetPanes,
-  countNeedsAttention,
+  selectHookRunningByPtyId,
+  selectUnverifiablePaneMinutes,
+  groupFleetPanes,
+  fleetTargetPtyId,
   type FleetPane,
+  type FleetRow,
 } from '../../stores/selectors/fleet';
 import { selectApprovalInbox } from '../../stores/selectors/approvalInbox';
 import { selectRemoteInbox } from '../../stores/selectors/remoteInbox';
@@ -15,12 +19,25 @@ import {
   activatePaneTarget,
   focusNotificationTarget,
 } from '../../hooks/useNotificationListener';
-import type { FleetTab } from '../../stores/slices/uiSlice';
+import { fleetChangedSinceSeen, type FleetSeenEntry, type FleetTab } from '../../stores/slices/uiSlice';
 import { tailForPty } from '../../utils/terminalTail';
 import { onTerminalRegistered } from '../../hooks/useTerminal';
 import FleetCard from './FleetCard';
+import { FleetRowMenu, FleetRowEditor, fleetRowVerbsFromState, toggleFleetStash, type FleetEditorKind } from './FleetRowActions';
 import ApprovalInboxList from './ApprovalInboxList';
 import RemoteInboxList from './RemoteInboxList';
+import { fleetTitle, matchesFleetFilter, type FleetFilter } from './fleetPresentation';
+import { formatIdle, IDLE_SHOW_AFTER_MS, IDLE_TICK_MS } from '../../utils/idleTime';
+import { IconX, IconTerminal, IconChevron } from '../icons';
+
+/** True when a key event comes from a text-entry control. */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT';
+}
+
+/** Roving key of the collapsed "Idle N" row (pane ids never take this form). */
+const IDLE_TOGGLE_KEY = 'fleet:idle-toggle';
 
 /** Fleet is a non-modal overlay above the tools dock. AppLayout owns its
  * positioning, so opening it never resizes terminal panes. The covered dock
@@ -39,6 +56,19 @@ export default function FleetView() {
   // non-agent active pane never borrows the real agent's name/status.
   const surfaceAgent = useStore((s) => s.surfaceAgent);
   const surfacePendingQuestion = useStore((s) => s.surfacePendingQuestion);
+  const surfaceActivityAt = useStore((s) => s.surfaceActivityAt);
+  const surfaceTurnOpenAt = useStore((s) => s.surfaceTurnOpenAt);
+  const commandRunningByPtyId = useStore((s) => s.commandRunningByPtyId);
+  const agentAliveByPtyId = useStore((s) => s.agentAliveByPtyId);
+  const hookRunningByPtyId = useStore(useShallow(selectHookRunningByPtyId));
+  const unverifiableMinutes = useStore(useShallow(selectUnverifiablePaneMinutes));
+  const missions = useStore((s) => s.missionByPaneGroup);
+  const surfaceLastMessage = useStore((s) => s.surfaceLastMessage);
+  const fleetIdleExpanded = useStore((s) => s.fleetIdleExpanded);
+  // Baseline from the previous close; only written on unmount, so it stays
+  // fixed for the whole time the overlay is open.
+  const fleetLastSeen = useStore((s) => s.fleetLastSeen);
+  const setFleetIdleExpanded = useStore((s) => s.setFleetIdleExpanded);
   // X8 supervision mirror — subscribed here so the selector re-runs when a
   // supervised pane arms/stops or its restart count changes.
   const supervisionByPtyId = useStore((s) => s.supervisionByPtyId);
@@ -50,7 +80,7 @@ export default function FleetView() {
   // S-C2: tab lives in uiSlice (not FleetView-local) so the A2A / MCP approval
   // modals can suppress themselves while the inbox tab is open (AppLayout delta
   // 5). Reset to 'fleet' on unmount (mount-gated = close) so reopening the
-  // cockpit always lands on the agent grid.
+  // cockpit always lands on the agent list.
   const tab = useStore((s) => s.fleetActiveTab);
   const setTab = useStore((s) => s.setFleetActiveTab);
   useEffect(() => () => setTab('fleet'), [setTab]);
@@ -61,27 +91,121 @@ export default function FleetView() {
   const fleetSortMode = useStore((s) => s.fleetSortMode);
   const setFleetSortMode = useStore((s) => s.setFleetSortMode);
 
-  const [focusedIdx, setFocusedIdx] = useState(0);
+  const [focusedPaneId, setFocusedPaneId] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<FleetFilter>('all');
+  const [previewOpen, setPreviewOpen] = useState(false);
+  // The one inline row editor that is open (message / label / close confirm).
+  const [editor, setEditor] = useState<{ paneId: string; kind: FleetEditorKind } | null>(null);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), IDLE_TICK_MS);
+    return () => window.clearInterval(id);
+  }, []);
   const [inboxIdx, setInboxIdx] = useState(0);
   const [remoteIdx, setRemoteIdx] = useState(0);
-  // S-C2 Phase 2 — live output tail. {ptyId: last-3-lines}. Filled by ONE
-  // shared coarse poll below; passed down to terminal cards only.
+  // Selected terminal preview, populated only while its disclosure is open.
   const [tails, setTails] = useState<Record<string, string[]>>({});
   // TASK-6 — per-pane agent RAM. {ptyId: {rss bytes, image?}}. Filled by ONE
   // shared 4s poll below that only runs while this (mount-gated) cockpit is open.
   const [resources, setResources] = useState<Record<string, { rss: number; image?: string }>>({});
   const panelRef = useRef<HTMLDivElement>(null);
-  const gridRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
 
-  // Derive + sort outside the hot render path. Re-runs only when the workspace
-  // trees or the per-pty attention map change (the two inputs the selector
-  // reads), not on every unrelated store mutation.
-  const panes = useMemo(
-    () => sortFleetPanes(selectFleetPanes({ workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId, surfaceAgent, surfacePendingQuestion, remoteWorkspaces }), fleetSortMode),
-    [workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId, surfaceAgent, surfacePendingQuestion, remoteWorkspaces, fleetSortMode],
+  // Use the same turn/liveness inputs as the sidebar and Deck roster. Missing
+  // these optional inputs silently classified active hook-driven turns as idle.
+  const panes = useMemo(() => selectFleetPanes({
+      workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId,
+      surfaceAgent, surfacePendingQuestion, surfaceActivityAt, surfaceTurnOpenAt,
+      commandRunningByPtyId, agentAliveByPtyId, hookRunningByPtyId, remoteWorkspaces,
+    }).map((pane) => ({
+      ...pane,
+      agentName: surfaceAgent[pane.ptyId]?.name || pane.agentName,
+      unverifiable: !!unverifiableMinutes[pane.ptyId],
+    })), [workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId,
+    surfaceAgent, surfacePendingQuestion, surfaceActivityAt, surfaceTurnOpenAt,
+    commandRunningByPtyId, agentAliveByPtyId, hookRunningByPtyId, remoteWorkspaces, unverifiableMinutes]);
+  // The output stamp moves on every chunk, so it is read on the minute tick
+  // (`now`) rather than subscribed; elapsed time is minute-granular anyway.
+  // On close (unmount), remember what each pane's status was, so the next open
+  // can mark needs-you rows that changed while Fleet was not being looked at.
+  const panesRef = useRef(panes);
+  panesRef.current = panes;
+  useEffect(() => () => {
+    const questions = useStore.getState().surfacePendingQuestion;
+    const statuses: Record<string, FleetSeenEntry> = {};
+    for (const pane of panesRef.current) {
+      if (!pane.ptyId) continue;
+      const question = questions[fleetTargetPtyId(pane)];
+      statuses[pane.ptyId] = question ? { status: pane.agentStatus, question } : { status: pane.agentStatus };
+    }
+    useStore.getState().setFleetLastSeen(statuses);
+  }, []);
+  const groups = useMemo(
+    () => groupFleetPanes(panes, {
+      now,
+      surfaceActivityAt,
+      surfaceOutputAt: useStore.getState().surfaceOutputAt,
+      surfaceTurnOpenAt,
+      surfacePendingQuestion,
+      surfaceLastMessage,
+      sortMode: fleetSortMode,
+    }),
+    [panes, now, surfaceActivityAt, surfaceTurnOpenAt, surfacePendingQuestion, surfaceLastMessage, fleetSortMode],
   );
-  const needsCount = useMemo(() => countNeedsAttention(panes), [panes]);
+  // Search and status filters narrow each section; the sections themselves
+  // (and so the chip counts) come from the one groupFleetPanes pass.
+  const visibleGroups = useMemo(() => {
+    const term = query.trim().toLocaleLowerCase();
+    const keep = (row: FleetRow) => matchesFleetFilter(row, filter) && (!term || [
+      fleetTitle(row.pane, missions[row.pane.workspaceId]), row.pane.workspaceName, row.pane.agentName,
+      row.pane.title, row.pane.cwd, row.pane.activity, row.detail,
+    ].some((value) => value?.toLocaleLowerCase().includes(term)));
+    return { needsYou: groups.needsYou.filter(keep), running: groups.running.filter(keep), idle: groups.idle.filter(keep) };
+  }, [groups, filter, query, missions]);
+  // Idle stays collapsed to one summary row unless expanded, or unless the
+  // user is searching / filtering to idle (a hidden match would read as none).
+  const idleForced = filter === 'idle' || query.trim() !== '';
+  const idleShown = fleetIdleExpanded || idleForced;
+  // The collapsed "Idle N" row is itself a roving option (so an all-idle fleet
+  // still has a focus target); it is replaced by a plain header while a
+  // search or the idle filter forces the rows open.
+  const idleToggleShown = visibleGroups.idle.length > 0 && !idleForced;
+  const visibleRows = useMemo(
+    () => [...visibleGroups.needsYou, ...visibleGroups.running, ...(idleShown ? visibleGroups.idle : [])],
+    [visibleGroups, idleShown],
+  );
+  // Roving order = DOM order: needs-you rows, running rows, the idle toggle,
+  // then the idle rows when expanded. Keys are pane ids plus one sentinel.
+  const rovingKeys = useMemo(() => [
+    ...[...visibleGroups.needsYou, ...visibleGroups.running].map((row) => row.pane.paneId),
+    ...(idleToggleShown ? [IDLE_TOGGLE_KEY] : []),
+    ...(idleShown ? visibleGroups.idle.map((row) => row.pane.paneId) : []),
+  ], [visibleGroups, idleToggleShown, idleShown]);
+  const matchCount = visibleGroups.needsYou.length + visibleGroups.running.length + visibleGroups.idle.length;
+  const idleOldestMs = visibleGroups.idle.reduce<number | undefined>(
+    (max, row) => (row.idleForMs !== undefined && (max === undefined || row.idleForMs > max) ? row.idleForMs : max),
+    undefined,
+  );
+  // Preserve the selected pane when live status updates reorder the list.
+  const focusedIdx = Math.max(0, rovingKeys.indexOf(focusedPaneId ?? ''));
+  const focusedKey = rovingKeys[focusedIdx];
+  const setFocusedIdx = useCallback((next: number | ((index: number) => number)) => {
+    const index = typeof next === 'function' ? next(focusedIdx) : next;
+    setFocusedPaneId(rovingKeys[index] ?? null);
+  }, [focusedIdx, rovingKeys]);
+  const selectedPane = visibleRows.find((row) => row.pane.paneId === focusedKey)?.pane;
+  const previewPtyId = previewOpen && tab === 'fleet' && selectedPane?.surfaceType === 'terminal'
+    ? selectedPane.ptyId : '';
+  const allRows = [...groups.needsYou, ...groups.running, ...groups.idle];
+  const filters: { id: FleetFilter; label: string; count: number }[] = [
+    { id: 'all', label: t('fleet.filter.all'), count: panes.length },
+    { id: 'attention', label: t('fleet.filter.attention'), count: groups.needsYou.length },
+    { id: 'running', label: t('workspace.agentRunning'), count: groups.running.length },
+    { id: 'complete', label: t('fleet.status.turnComplete'), count: allRows.filter((r) => matchesFleetFilter(r, 'complete')).length },
+    { id: 'idle', label: t('workspace.agentIdle'), count: groups.idle.length },
+  ];
   // Stable identity key of the terminal ptyIds to poll for RAM. `panes`
   // recomputes on every streaming activity tick (surfaceActivity/agentStatus
   // are memo deps), so keying the resource-poll effect on `panes` directly
@@ -125,56 +249,24 @@ export default function FleetView() {
     [remoteItems, remoteItemOrder],
   );
 
-  // S-C2 Phase 2 — live output tail. ONE shared coarse interval (the whole
-  // component is mount-gated on cockpit-open, so the poll only runs while the
-  // overlay is visible). Each tick reads the last 3 plaintext lines of every
-  // terminal pane that has a ptyId via the shared `tailForPty` (same buffer-read
-  // path as `input.readScreen`) — read-only, no daemon round-trip. We rebuild a
-  // next map and shallow-compare it against the previous one so an unchanged
-  // tail does NOT mint a new object identity / re-render every 750ms.
-  //
-  // Bounds: terminals-with-a-ptyId only, last-3-rows window only, one timer for
-  // the whole fleet (never per-pane). An `onTerminalRegistered` subscription
-  // refreshes when a pane mounts late (e.g. a restored terminal finishing its
-  // async scrollback load after the first tick). NO offsetWidth guard — see
-  // terminalTail.ts; background panes are display:none yet must still show a tail.
+  // Raw terminal output is opt-in and only read for the selected pane. A closed
+  // preview does no buffer polling; chrome/prompts never masquerade as progress.
   useEffect(() => {
-    const terminalPtyIds = panes
-      .filter((p) => p.surfaceType === 'terminal' && p.ptyId)
-      .map((p) => p.ptyId);
-
+    setTails({});
+    if (!previewPtyId) return;
     const refresh = () => {
+      const tail = tailForPty(previewPtyId, 12);
       setTails((prev) => {
-        const next: Record<string, string[]> = {};
-        let changed = false;
-        for (const ptyId of terminalPtyIds) {
-          const tail = tailForPty(ptyId, 3);
-          next[ptyId] = tail;
-          const before = prev[ptyId];
-          if (
-            !before ||
-            before.length !== tail.length ||
-            tail.some((line, i) => line !== before[i])
-          ) {
-            changed = true;
-          }
-        }
-        // A pty dropping out of the fleet (closed pane) is also a change.
-        if (!changed && Object.keys(prev).length !== terminalPtyIds.length) {
-          changed = true;
-        }
-        return changed ? next : prev;
+        const before = prev[previewPtyId];
+        return before?.length === tail.length && tail.every((line, i) => before[i] === line)
+          ? prev : { [previewPtyId]: tail };
       });
     };
-
-    refresh(); // paint immediately; don't wait 750ms for the first tail.
+    refresh();
     const id = window.setInterval(refresh, 750);
-    const unsub = onTerminalRegistered(() => refresh());
-    return () => {
-      window.clearInterval(id);
-      unsub();
-    };
-  }, [panes]);
+    const unsub = onTerminalRegistered(refresh);
+    return () => { window.clearInterval(id); unsub(); };
+  }, [previewPtyId]);
 
   // TASK-6 — per-pane agent resource attribution. The whole component is
   // mount-gated on `fleetViewVisible`, so this interval exists ONLY while the
@@ -232,8 +324,9 @@ export default function FleetView() {
     // nothing. Remote rows take the pane/surface path below, as they did when
     // they still had an empty ptyId.
     if (card.ptyId && !card.remote) {
-      // focusPaneByPtyId unstashes on the way (#977).
-      focusPaneByPtyId(getState, card.ptyId);
+      // focusPaneByPtyId unstashes on the way (#977). A background tab that
+      // won the row's attention is the one the jump lands on.
+      focusPaneByPtyId(getState, fleetTargetPtyId(card));
     } else if (card.surfaceId) {
       // No ptyId — an unspawned surface, or a stashed pane whose session died.
       // activatePaneTarget only works on the visible tree, so put the pane back
@@ -251,11 +344,6 @@ export default function FleetView() {
     setVisible(false);
   }, [setVisible]);
 
-  // Keep focus index in range when the pane set shrinks / the tab changes.
-  useEffect(() => {
-    setFocusedIdx((i) => Math.min(i, Math.max(panes.length - 1, 0)));
-  }, [panes.length]);
-
   // Same clamp for the inbox: a row resolving (or the A2A 30s auto-deny)
   // shrinks the list, so the focused index must never dangle past the end.
   useEffect(() => {
@@ -272,8 +360,8 @@ export default function FleetView() {
   // 선택을 announce하고 (2) 탭에 카드가 하나뿐이어도 로빙 인덱스 클램프에 갇히지
   // 않는다. 마운트 효과와 로빙 효과가 공유하는 단일 포커스 경로.
   const focusActiveItem = useCallback(() => {
-    if (tab === 'fleet' && panes.length > 0) {
-      const cards = gridRef.current?.querySelectorAll<HTMLElement>('[data-fleet-card]');
+    if (tab === 'fleet' && rovingKeys.length > 0) {
+      const cards = listRef.current?.querySelectorAll<HTMLElement>('[data-fleet-card], [data-fleet-idle-toggle]');
       const el = cards && cards[focusedIdx];
       if (el) { el.focus(); return true; }
     } else if (tab === 'approvals' && inbox.length > 0) {
@@ -286,12 +374,41 @@ export default function FleetView() {
       if (el) { el.focus(); return true; }
     }
     return false;
-  }, [tab, focusedIdx, inboxIdx, remoteIdx, panes.length, inbox.length, remoteInbox.length]);
+  }, [tab, focusedIdx, inboxIdx, remoteIdx, rovingKeys.length, inbox.length, remoteInbox.length]);
 
   // 마운트 효과([] deps)가 매 포커스 변경마다 재실행되지 않으면서도 최신 상태를
   // 읽도록, 최신 focusActiveItem 클로저를 ref에 보관한다.
   const focusActiveItemRef = useRef(focusActiveItem);
   focusActiveItemRef.current = focusActiveItem;
+
+  // Close the inline editor and hand focus back to the roving row (the row
+  // may be gone after a close; then the next row takes the slot).
+  const closeEditor = useCallback(() => {
+    setEditor(null);
+    requestAnimationFrame(() => { focusActiveItemRef.current(); });
+  }, []);
+  // An editor whose pane left the visible rows (closed elsewhere, filtered
+  // out, collapsed into Idle) has nothing to act on: drop it.
+  useEffect(() => {
+    if (editor && !visibleRows.some((row) => row.pane.paneId === editor.paneId)) setEditor(null);
+  }, [editor, visibleRows]);
+
+  // The ⋮ menu that is open, if any (its close function), so Escape closes the
+  // menu rather than the overlay.
+  const closeRowMenuRef = useRef<(() => void) | null>(null);
+  const onRowMenuOpenChange = useCallback((close: (() => void) | null) => {
+    closeRowMenuRef.current = close;
+  }, []);
+  // Verb availability needs live signals the row itself does not carry.
+  // The listed maps are dependencies so verbs re-derive when they change.
+  const verbsFor = useCallback(
+    (pane: FleetPane) => fleetRowVerbsFromState(pane, useStore.getState()),
+    [workspaces, surfacePendingQuestion, hookRunningByPtyId, commandRunningByPtyId, surfaceAgent],
+  );
+  const openEditor = useCallback((pane: FleetPane, kind: FleetEditorKind) => {
+    setFocusedPaneId(pane.paneId);
+    setEditor({ paneId: pane.paneId, kind });
+  }, []);
 
   // 닫힐 때 포커스를 되돌릴 대상(열기 트리거 시점의 activeElement)을 담아두는 ref.
   const restoreFocusRef = useRef<HTMLElement | null>(null);
@@ -329,7 +446,10 @@ export default function FleetView() {
   // 안 된다(모달 트랩과의 결정적 차이). 포커스가 밖이면 아무것도 하지 않는다.
   useEffect(() => {
     const panel = panelRef.current;
-    if (!panel || !panel.contains(document.activeElement)) return;
+    const active = document.activeElement;
+    if (!panel || !panel.contains(active)) return;
+    // Search, filters and tabs retain focus while the results change.
+    if (active !== panel && (!(active instanceof HTMLElement) || active.getAttribute('role') !== 'option')) return;
     const raf = requestAnimationFrame(() => { focusActiveItem(); });
     return () => cancelAnimationFrame(raf);
   }, [focusActiveItem]);
@@ -345,7 +465,10 @@ export default function FleetView() {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
-        setVisible(false);
+        // Innermost first: an open ⋮ menu, then an open row editor, then Fleet.
+        if (closeRowMenuRef.current) closeRowMenuRef.current();
+        else if (editor) closeEditor();
+        else setVisible(false);
         return;
       }
       // Approvals tab: Enter approves the focused row (guard #5 — non-critical
@@ -403,22 +526,45 @@ export default function FleetView() {
         }
       }
 
+      // Fleet row verbs on the focused row: m message, s stash, l label,
+      // Backspace close. Only when the row itself holds focus — never while
+      // typing in an input, textarea or contenteditable.
+      if (tab === 'fleet' && onOptionRow && !e.ctrlKey && !e.metaKey && !e.altKey && !isEditableTarget(e.target)) {
+        const row = visibleRows.find((r) => r.pane.paneId === focusedKey);
+        const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+        if (row && !row.pane.remote && (key === 'm' || key === 's' || key === 'l' || key === 'Backspace')) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (key === 's') toggleFleetStash(row.pane);
+          else if (key === 'l') setEditor({ paneId: row.pane.paneId, kind: 'label' });
+          else if (key === 'Backspace') {
+            if (verbsFor(row.pane).closeEnabled) setEditor({ paneId: row.pane.paneId, kind: 'close' });
+          } else if (verbsFor(row.pane).messageEnabled) setEditor({ paneId: row.pane.paneId, kind: 'message' });
+          return;
+        }
+      }
+
       const isArrow =
         e.key === 'ArrowDown' || e.key === 'ArrowUp' ||
         e.key === 'ArrowLeft' || e.key === 'ArrowRight';
-      if (!isArrow || e.ctrlKey || e.metaKey || e.altKey) return;
+      const isBoundary = e.key === 'Home' || e.key === 'End';
+      if ((!isArrow && !isBoundary) || !onOptionRow || e.ctrlKey || e.metaKey || e.altKey) return;
       e.preventDefault();
       e.stopPropagation();
-      if (tab === 'fleet' && panes.length > 0) {
-        if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
-          setFocusedIdx((i) => Math.min(i + 1, panes.length - 1));
+      if (tab === 'fleet' && rovingKeys.length > 0) {
+        if (isBoundary) {
+          setFocusedIdx(e.key === 'Home' ? 0 : rovingKeys.length - 1);
+        } else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+          setFocusedIdx((i) => Math.min(i + 1, rovingKeys.length - 1));
         } else {
           setFocusedIdx((i) => Math.max(i - 1, 0));
         }
         return;
       }
       if (tab === 'approvals' && inbox.length > 0) {
-        if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+        if (isBoundary) {
+          setInboxIdx(e.key === 'Home' ? 0 : inbox.length - 1);
+        } else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
           setInboxIdx((i) => Math.min(i + 1, inbox.length - 1));
         } else {
           setInboxIdx((i) => Math.max(i - 1, 0));
@@ -426,13 +572,39 @@ export default function FleetView() {
         return;
       }
       if (tab === 'remote' && remoteInbox.length > 0) {
-        if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+        if (isBoundary) {
+          setRemoteIdx(e.key === 'Home' ? 0 : remoteInbox.length - 1);
+        } else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
           setRemoteIdx((i) => Math.min(i + 1, remoteInbox.length - 1));
         } else {
           setRemoteIdx((i) => Math.max(i - 1, 0));
         }
       }
-    }, [tab, panes.length, inbox, inboxIdx, remoteInbox, remoteIdx, dismissRemoteItem, setVisible]);
+    }, [tab, rovingKeys.length, inbox, inboxIdx, remoteInbox, remoteIdx, dismissRemoteItem, setVisible, setFocusedIdx,
+      editor, closeEditor, visibleRows, focusedKey, verbsFor]);
+
+  const idleSummary = idleOldestMs !== undefined && idleOldestMs >= IDLE_SHOW_AFTER_MS
+    ? t('fleet.section.idleOldest', { count: visibleGroups.idle.length, age: formatIdle(idleOldestMs) })
+    : t('fleet.section.idle', { count: visibleGroups.idle.length });
+  const renderRow = (row: FleetRow) => {
+    const card = row.pane;
+    return (
+      <div key={`${card.workspaceId}:${card.paneId}:${card.surfaceId}`} role="presentation" className="wmux-fleet-row">
+      <FleetCard
+        card={card}
+        row={row}
+        changed={row.section === 'needsYou' && fleetChangedSinceSeen(fleetLastSeen, card.ptyId, card.agentStatus, surfacePendingQuestion[fleetTargetPtyId(card)])}
+        focused={card.paneId === focusedKey}
+        onJump={jump}
+        onFocus={() => setFocusedPaneId(card.paneId)}
+        resource={card.ptyId ? resources[card.ptyId] : undefined}
+      />
+      <FleetRowMenu pane={card} verbs={verbsFor(card)} focused={card.paneId === focusedKey} onJump={jump}
+        onEdit={openEditor} onMenuOpenChange={onRowMenuOpenChange} />
+      {editor?.paneId === card.paneId && <FleetRowEditor pane={card} kind={editor.kind} onDone={closeEditor} />}
+      </div>
+    );
+  };
 
   return (
     // Layout-neutral container positioned by AppLayout.
@@ -450,83 +622,66 @@ export default function FleetView() {
         borderColor: 'var(--bg-surface)',
       }}
     >
-        {/* Header: title + "N need you" chip */}
-        <div
-          className="wmux-fleet-header"
-          style={{ borderBottom: '1px solid var(--bg-surface)' }}
-        >
+        <div className="wmux-fleet-header">
           <div className="min-w-0">
             <h2 className="wmux-fleet-title">{t('fleet.title')}</h2>
-            <p className="wmux-fleet-summary">{t('fleet.overview', { count: panes.length, running: panes.filter((pane) => pane.agentStatus === 'running').length })}</p>
+            <p className="wmux-fleet-summary">{t('fleet.scope', { count: panes.length, projects: new Set(panes.map((p) => p.workspaceId)).size })}</p>
           </div>
-          {needsCount > 0 && (
-            <span
-              className="text-[11px] font-medium px-2 py-0.5 rounded-full"
-              style={{
-                backgroundColor: 'color-mix(in srgb, var(--accent-yellow) 22%, transparent)',
-                color: 'var(--accent-yellow)',
-              }}
-            >
-              {t('fleet.needsAttention', { count: needsCount })}
-            </span>
-          )}
-          <div className="flex-1" />
-          {/* Situational sort toggle (fleet tab only). Cycles attention-first
-              ↔ pure workspace (sidebar) order. */}
-          {tab === 'fleet' && (
-            <button
-              type="button"
-              onClick={() => setFleetSortMode(fleetSortMode === 'attention' ? 'workspace' : 'attention')}
-              className="text-[11px] px-2 py-0.5 rounded transition-colors hover:text-[var(--text-main)]"
-              style={{ border: '1px solid var(--bg-overlay)', color: 'var(--text-muted)' }}
-              title={t('fleet.sort.tooltip')}
-              aria-label={t('fleet.sort.tooltip')}
-            >
-              {t('fleet.sort.label')}: {t(fleetSortMode === 'attention' ? 'fleet.sort.attention' : 'fleet.sort.workspace')}
-            </button>
-          )}
-          {/* 상시 크롬: 백드롭 클릭-닫힘이 사라졌으므로 명시적 닫기 버튼이 필수.
-              Ctrl+Shift+A / Esc(포커스 내부)와 함께 닫기 경로를 제공한다. */}
-          <button
-            type="button"
-            onClick={() => setVisible(false)}
-            className="text-sm leading-none text-[var(--text-muted)] px-1.5 py-0.5 rounded transition-colors hover:text-[var(--text-main)]"
-            style={{ border: '1px solid var(--bg-overlay)' }}
-            title={t('fleet.close')}
-            aria-label={t('fleet.close')}
-          >
-            ✕
-          </button>
+          <button type="button" onClick={() => setVisible(false)} className="wmux-fleet-close"
+            title={t('fleet.close')} aria-label={t('fleet.close')}><IconX size={16} /></button>
         </div>
 
-        {/* Tabs: Fleet (v1) + Approvals (v2 stub) */}
-        <div
-          className="wmux-fleet-tabs"
-          role="tablist"
-          style={{ borderBottom: '1px solid var(--bg-surface)' }}
-        >
-          {(['fleet', 'approvals', 'remote'] as FleetTab[]).map((id) => (
-            <button
-              key={id}
-              type="button"
-              role="tab"
-              aria-selected={tab === id}
-              onClick={() => setTab(id)}
-              className="wmux-fleet-tab"
-              style={{
-                color: tab === id ? 'var(--text-main)' : 'var(--text-muted)',
-                backgroundColor: tab === id ? 'var(--bg-surface)' : 'transparent',
-              }}
-            >
-              {/* Explicit per-tab key (NOT a `fleet.tab.${id}` template) so a missing
-                  key is a tsc error, not a raw-string render to the user. */}
-              {t(id === 'fleet' ? 'fleet.tab.fleet' : id === 'approvals' ? 'fleet.tab.approvals' : 'fleet.tab.remote')}
-            </button>
-          ))}
+        <div className="wmux-fleet-tabs" role="tablist" aria-label={t('fleet.title')}>
+          {(['fleet', 'approvals', 'remote'] as FleetTab[]).map((id, index, tabs) => {
+            const count = id === 'approvals' ? inbox.length : id === 'remote' ? remoteInbox.length : 0;
+            return (
+              <button key={id} id={`fleet-tab-${id}`} type="button" role="tab"
+                aria-selected={tab === id} aria-controls="fleet-tab-panel" tabIndex={tab === id ? 0 : -1}
+                onClick={() => setTab(id)}
+                onKeyDown={(event) => {
+                  if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
+                  event.preventDefault();
+                  const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+                    : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+                  setTab(tabs[next]);
+                  document.getElementById(`fleet-tab-${tabs[next]}`)?.focus();
+                }}
+                className="wmux-fleet-tab">
+                {t(id === 'fleet' ? 'fleet.tab.fleet' : id === 'approvals' ? 'fleet.tab.approvals' : 'fleet.tab.remote')}
+                {count > 0 && <span className="wmux-fleet-tab-count">{count}</span>}
+              </button>
+            );
+          })}
         </div>
+
+        {tab === 'fleet' && panes.length > 0 && (
+          <div className="wmux-fleet-controls">
+            <div className="wmux-fleet-filters" role="group" aria-label={t('fleet.filter.label')}>
+              {filters.filter((item) => item.id === 'all' || item.count > 0 || item.id === filter).map((item) => (
+                <button key={item.id} type="button" aria-pressed={filter === item.id} data-filter={item.id}
+                  onClick={() => setFilter(item.id)}>{item.label}<span>{item.count}</span></button>
+              ))}
+            </div>
+            <div className="wmux-fleet-toolbar">
+              <input type="search" value={query} onChange={(event) => setQuery(event.target.value)}
+                placeholder={t('fleet.search')} aria-label={t('fleet.search')}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowDown' && rovingKeys.length > 0) {
+                    event.preventDefault();
+                    focusActiveItem();
+                  }
+                }} />
+              <button type="button" className="wmux-fleet-sort"
+                onClick={() => setFleetSortMode(fleetSortMode === 'attention' ? 'workspace' : 'attention')}
+                title={t('fleet.sort.tooltip')} aria-label={t('fleet.sort.tooltip')}>
+                {t(fleetSortMode === 'attention' ? 'fleet.sort.attention' : 'fleet.sort.workspace')}
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Body */}
-        <div ref={bodyRef} className="overflow-y-auto flex-1 p-4">
+        <div ref={bodyRef} id="fleet-tab-panel" role="tabpanel" aria-labelledby={`fleet-tab-${tab}`} className="wmux-fleet-body">
           {tab === 'approvals' ? (
             inbox.length > 0 ? (
               <ApprovalInboxList items={inbox} focusedIdx={inboxIdx} onResolve={resolveInboxItem} />
@@ -543,35 +698,74 @@ export default function FleetView() {
                 {t('fleet.remote.empty')}
               </div>
             )
-          ) : panes.length === 0 ? (
+          ) : matchCount === 0 ? (
             <div className="flex items-center justify-center h-[200px] text-sm text-[var(--text-muted)]">
-              {t('fleet.empty')}
+              {panes.length === 0 ? t('fleet.empty') : (
+                <div className="wmux-fleet-empty">
+                  <p>{t('fleet.noMatches')}</p>
+                  <button type="button" onClick={() => { setQuery(''); setFilter('all'); }}>{t('fleet.resetFilters')}</button>
+                </div>
+              )}
             </div>
           ) : (
-            <div
-              ref={gridRef}
-              role="listbox"
-              aria-label={t('fleet.title')}
-              className="wmux-fleet-grid"
-
-            >
-              {panes.map((card, idx) => (
-                <FleetCard
-                  key={`${card.workspaceId}:${card.paneId}:${card.surfaceId}`}
-                  card={card}
-                  focused={idx === focusedIdx}
-                  onJump={jump}
-                  tail={card.ptyId ? tails[card.ptyId] : undefined}
-                  resource={card.ptyId ? resources[card.ptyId] : undefined}
-                />
-              ))}
-            </div>
+            <>
+              {visibleGroups.needsYou.length === 0 && visibleGroups.running.length === 0 && (
+                <p className="wmux-fleet-quiet" aria-hidden="true" data-fleet-all-quiet>{t('fleet.allQuiet')}</p>
+              )}
+              <div ref={listRef} role="listbox" aria-label={t('fleet.title')} className="wmux-fleet-list">
+                {/* One flat keyed sibling array (headers interleaved), so a row
+                    that changes section keeps its DOM node — and its focus. */}
+                {[
+                  ...([
+                    ['needsYou', visibleGroups.needsYou, t('fleet.section.needsYou')],
+                    ['running', visibleGroups.running, t('fleet.section.running')],
+                  ] as const).flatMap(([id, rows, label]) => rows.length === 0 ? [] : [
+                    <div key={`section:${id}`} role="presentation" className="wmux-fleet-section-header" data-fleet-section={id}>{label}</div>,
+                    ...rows.map(renderRow),
+                  ]),
+                  ...(visibleGroups.idle.length === 0 ? [] : [idleToggleShown ? (
+                    <button
+                      key="section:idle"
+                      type="button"
+                      role="option"
+                      aria-selected={focusedKey === IDLE_TOGGLE_KEY}
+                      aria-expanded={idleShown}
+                      tabIndex={focusedKey === IDLE_TOGGLE_KEY ? 0 : -1}
+                      className="wmux-fleet-idle-toggle"
+                      data-fleet-section="idle"
+                      data-fleet-idle-toggle
+                      onFocus={() => setFocusedPaneId(IDLE_TOGGLE_KEY)}
+                      onClick={() => setFleetIdleExpanded(!fleetIdleExpanded)}
+                    >
+                      <span className="wmux-fleet-idle-chevron" aria-hidden="true"><IconChevron size={12} /></span>
+                      <span>{idleSummary}</span>
+                    </button>
+                  ) : (
+                    <div key="section:idle" role="presentation" className="wmux-fleet-section-header" data-fleet-section="idle">{idleSummary}</div>
+                  )]),
+                  ...(idleShown ? visibleGroups.idle.map(renderRow) : []),
+                ]}
+              </div>
+            </>
           )}
         </div>
 
+        {tab === 'fleet' && selectedPane?.surfaceType === 'terminal' && (
+          <div className="wmux-fleet-preview">
+            <button type="button" aria-expanded={previewOpen} aria-controls="fleet-output-preview"
+              onClick={() => setPreviewOpen((open) => !open)}>
+              <IconTerminal size={14} />
+              <span>{t('fleet.preview')}</span>
+              <span className="wmux-fleet-preview-name">{fleetTitle(selectedPane, missions[selectedPane.workspaceId])}</span>
+              <span aria-hidden="true">{previewOpen ? '−' : '+'}</span>
+            </button>
+            {previewOpen && <pre id="fleet-output-preview" tabIndex={0}>{tails[previewPtyId]?.join('\n') || t('fleet.previewEmpty')}</pre>}
+          </div>
+        )}
+
         {/* Footer hint — approve/deny on the Approvals tab, jump on Fleet. */}
         <div
-          className="flex items-center gap-3 px-4 py-2"
+          className="wmux-fleet-footer flex items-center gap-3 px-4 py-2"
           style={{ borderTop: '1px solid var(--bg-surface)', backgroundColor: 'var(--bg-mantle)' }}
         >
           <span className="text-xs text-[var(--text-muted)]">

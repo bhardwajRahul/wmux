@@ -16,7 +16,8 @@
 // 버튼인지 검증한다. 카드가 하나뿐인 케이스(레이스가 영구화되던 조건)를 픽스처로
 // 고정한다. 겸사겸사 닫힘 시 포커스 복원(INFO 4번)도 검증한다.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as terminalTail from '../../../utils/terminalTail';
 import * as React from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import FleetView from '../FleetView';
@@ -69,6 +70,7 @@ async function flushRaf(): Promise<void> {
 beforeEach(() => {
   act(() => {
     useStore.setState({
+      ...useStore.getInitialState(),
       locale: 'en',
       sidebarPosition: 'left',
       fleetActiveTab: 'fleet',
@@ -79,6 +81,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   try {
     unmount();
   } catch {
@@ -89,12 +92,14 @@ afterEach(() => {
 
 describe('FleetView — mount focus race (NB2 wave2)', () => {
   it('lands real DOM focus on the single fleet card, not the panel container', async () => {
+    // The fixture's only pane is idle, so the row sits behind the collapsed
+    // "Idle N" option — which is where real DOM focus must land.
     mount();
     await flushRaf();
 
     const active = document.activeElement as HTMLElement | null;
     // 레이스가 있으면 여기서 active는 role=region 패널(또는 body)이라 실패한다.
-    expect(active?.hasAttribute('data-fleet-card')).toBe(true);
+    expect(active?.hasAttribute('data-fleet-idle-toggle')).toBe(true);
     expect(active?.getAttribute('role')).toBe('option');
   });
 
@@ -114,5 +119,252 @@ describe('FleetView — mount focus race (NB2 wave2)', () => {
     // 닫히면 열기 시점 요소로 복원(브라우저가 body로 떨구지 않는다).
     expect(document.activeElement).toBe(opener);
     opener.remove();
+  });
+});
+
+function seedFleet(): void {
+  act(() => useStore.setState({
+    workspaces: [
+      workspace('ws-1', 'wmux', leaf('p1', [surface('s1', 'pty-1', { surfaceType: 'terminal', title: 'Codex CLI' })]), 'p1'),
+      workspace('ws-2', 'marketing', leaf('p2', [surface('s2', 'pty-2', { surfaceType: 'terminal', title: '✳ Launch video' })]), 'p2'),
+      workspace('ws-3', 'ios', leaf('p3', [surface('s3', 'pty-3', { surfaceType: 'terminal', title: 'Claude Code' })]), 'p3'),
+    ],
+    surfaceAgent: { 'pty-1': { name: 'Codex CLI', status: 'running' }, 'pty-2': { name: 'Claude Code', status: 'idle' }, 'pty-3': { name: 'Claude Code', status: 'idle' } },
+    surfaceAgentStatus: { 'pty-2': 'complete' },
+    surfacePendingQuestion: { 'pty-3': 'Which deployment target?' },
+    surfaceTurnOpenAt: { 'pty-1': Date.now() },
+    agentClockMs: Date.now(),
+  }));
+}
+
+function rows(): HTMLButtonElement[] {
+  return Array.from(container.querySelectorAll<HTMLButtonElement>('[data-fleet-card]'));
+}
+
+function click(selector: string): void {
+  const button = container.querySelector<HTMLButtonElement>(selector)!;
+  act(() => { button.focus(); button.click(); });
+}
+
+function key(element: Element, name: string): void {
+  act(() => element.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true })));
+}
+
+function search(value: string): HTMLInputElement {
+  const input = container.querySelector<HTMLInputElement>('input[type=search]')!;
+  act(() => {
+    input.focus();
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  return input;
+}
+
+describe('FleetView — task triage', () => {
+  it('derives running from the open turn and puts pending questions first', async () => {
+    seedFleet();
+    mount();
+    await flushRaf();
+    expect(rows().map((row) => row.dataset.status)).toEqual(['awaiting_input', 'complete', 'running']);
+    expect(rows()[0].textContent).toContain('Which deployment target?');
+    expect(rows()[2].textContent).toContain('wmux');
+  });
+
+  it('filters by task/project without stealing search focus, then navigates the results', async () => {
+    seedFleet();
+    mount();
+    await flushRaf();
+    const input = search('launch');
+    await flushRaf();
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0].textContent).toContain('Launch video');
+    expect(document.activeElement).toBe(input);
+    key(input, 'ArrowLeft');
+    expect(document.activeElement).toBe(input);
+    key(input, 'ArrowDown');
+    expect(document.activeElement).toBe(rows()[0]);
+    search('not-a-project');
+    await flushRaf();
+    expect(rows()).toHaveLength(0);
+    expect(container.textContent).toContain('No panes match this view');
+    click('.wmux-fleet-empty button');
+    expect(rows()).toHaveLength(3);
+  });
+
+  it('keeps the selected pane across live reordering and scopes keyboard navigation to the filter', async () => {
+    seedFleet();
+    mount();
+    await flushRaf();
+    act(() => rows().find((row) => row.dataset.ptyId === 'pty-1')!.focus());
+    act(() => useStore.setState({ surfaceAgentStatus: { 'pty-1': 'error', 'pty-2': 'complete' }, surfacePendingQuestion: {} }));
+    await flushRaf();
+    expect(document.activeElement?.getAttribute('data-pty-id')).toBe('pty-1');
+    expect(rows()[0].dataset.ptyId).toBe('pty-1');
+    click('[data-filter=complete]');
+    await flushRaf();
+    expect(rows()).toHaveLength(1);
+    expect(document.activeElement?.getAttribute('data-filter')).toBe('complete');
+    act(() => rows()[0].focus());
+    key(rows()[0], 'End');
+    await flushRaf();
+    expect(document.activeElement).toBe(rows()[0]);
+  });
+
+  it('only reads terminal output when the selected preview is expanded', async () => {
+    const read = vi.spyOn(terminalTail, 'tailForPty').mockReturnValue(['real terminal output']);
+    seedFleet();
+    mount();
+    await flushRaf();
+    expect(read).not.toHaveBeenCalled();
+    click('.wmux-fleet-preview > button');
+    expect(read).toHaveBeenCalledWith('pty-3', 12);
+    expect(container.querySelector('pre')?.textContent).toBe('real terminal output');
+    click('.wmux-fleet-preview > button');
+    expect(container.querySelector('pre')).toBeNull();
+  });
+
+  it('keeps tab keyboard navigation separate from row navigation', async () => {
+    seedFleet();
+    mount();
+    await flushRaf();
+    const tab = container.querySelector<HTMLButtonElement>('#fleet-tab-fleet')!;
+    act(() => tab.focus());
+    key(tab, 'ArrowRight');
+    await flushRaf();
+    expect(document.activeElement?.id).toBe('fleet-tab-approvals');
+    expect(container.textContent).toContain('No pending approvals');
+  });
+});
+
+describe('FleetView — attention board sections', () => {
+  function seedIdleFleet(): void {
+    const now = Date.now();
+    act(() => useStore.setState({
+      workspaces: [
+        workspace('ws-1', 'alpha', leaf('p1', [surface('s1', 'pty-1', { surfaceType: 'terminal', title: 'alpha task' })]), 'p1'),
+        workspace('ws-2', 'beta', leaf('p2', [surface('s2', 'pty-2', { surfaceType: 'terminal', title: 'beta task' })]), 'p2'),
+      ],
+      surfaceOutputAt: { 'pty-1': now - 2 * 86_400_000, 'pty-2': now - 5 * 60_000 },
+    }));
+  }
+
+  it('shows the all-quiet line and focuses the collapsed idle row when everything is idle', async () => {
+    seedIdleFleet();
+    mount();
+    await flushRaf();
+    const quiet = container.querySelector('[data-fleet-all-quiet]');
+    expect(quiet?.textContent).toBe('Nothing needs you right now');
+    expect(quiet?.getAttribute('aria-hidden')).toBe('true');
+    expect(quiet?.hasAttribute('tabindex')).toBe(false);
+    const toggle = container.querySelector<HTMLButtonElement>('[data-fleet-idle-toggle]')!;
+    expect(toggle.textContent).toContain('Idle 2 · oldest 2d');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(toggle);
+    expect(rows()).toHaveLength(0);
+    // Empty sections draw no header at all.
+    expect(container.querySelector('[data-fleet-section=needsYou]')).toBeNull();
+    expect(container.querySelector('[data-fleet-section=running]')).toBeNull();
+  });
+
+  it('expanding and collapsing idle keeps roving focus on a valid row', async () => {
+    seedIdleFleet();
+    mount();
+    await flushRaf();
+    const toggle = container.querySelector<HTMLButtonElement>('[data-fleet-idle-toggle]')!;
+    click('[data-fleet-idle-toggle]');
+    expect(useStore.getState().fleetIdleExpanded).toBe(true);
+    expect(rows().map((row) => row.dataset.ptyId)).toEqual(['pty-2', 'pty-1']);
+    key(toggle, 'ArrowDown');
+    await flushRaf();
+    expect(document.activeElement).toBe(rows()[0]);
+    key(rows()[0], 'ArrowDown');
+    await flushRaf();
+    expect(document.activeElement).toBe(rows()[1]);
+    // Collapse while an idle row holds the roving slot: exactly one option
+    // stays tabbable and it is a rendered one.
+    act(() => useStore.getState().setFleetIdleExpanded(false));
+    await flushRaf();
+    expect(rows()).toHaveLength(0);
+    const tabbable = container.querySelectorAll('[role=option][tabindex="0"]');
+    expect(tabbable).toHaveLength(1);
+    expect(tabbable[0]).toBe(container.querySelector('[data-fleet-idle-toggle]'));
+  });
+
+  it('uses the stored last message as the detail of a finished turn', async () => {
+    seedIdleFleet();
+    act(() => useStore.setState({
+      surfaceAgentStatus: { 'pty-1': 'complete' },
+      surfaceLastMessage: { 'pty-1': 'Refactor done; 12 tests pass.' },
+    }));
+    mount();
+    await flushRaf();
+    expect(rows()[0].dataset.ptyId).toBe('pty-1');
+    expect(rows()[0].querySelector('.wmux-fleet-detail')?.textContent).toBe('Refactor done; 12 tests pass.');
+  });
+
+  it('shows a row\'s elapsed time since its newest activity stamp', async () => {
+    seedIdleFleet();
+    act(() => useStore.setState({ fleetIdleExpanded: true }));
+    mount();
+    await flushRaf();
+    expect(rows()[0].querySelector('[data-fleet-elapsed]')?.textContent).toBe('5m');
+    expect(rows()[1].querySelector('[data-fleet-elapsed]')?.textContent).toBe('2d');
+  });
+});
+
+describe('FleetView — changed since you last looked', () => {
+  it('marks a needs-you row whose status changed after the last close, and only then', async () => {
+    seedFleet();
+    mount();
+    await flushRaf();
+    // First open: no snapshot, no dots.
+    expect(container.querySelectorAll('[data-fleet-changed]')).toHaveLength(0);
+    unmount();
+    expect(useStore.getState().fleetLastSeen?.statuses).toMatchObject({
+      'pty-1': { status: 'running' },
+      'pty-2': { status: 'complete' },
+      'pty-3': { status: 'awaiting_input', question: 'Which deployment target?' },
+    });
+
+    // While closed, pty-1 errors; pty-2 / pty-3 stay as they were.
+    act(() => useStore.setState({ surfaceAgentStatus: { 'pty-1': 'error', 'pty-2': 'complete' } }));
+    mount();
+    await flushRaf();
+    const changed = rows().filter((row) => row.querySelector('[data-fleet-changed]'));
+    expect(changed.map((row) => row.dataset.ptyId)).toEqual(['pty-1']);
+    expect(changed[0].getAttribute('aria-label')).toContain('changed since you last looked');
+    expect(rows().find((row) => row.dataset.ptyId === 'pty-3')?.getAttribute('aria-label')).not.toContain('changed since');
+  });
+});
+
+describe('FleetView — remote rows and browser help stay wired', () => {
+  it('passes remoteWorkspaces to the selector: a remote agent renders with the origin glyph', async () => {
+    act(() => useStore.setState({
+      workspaces: [workspace('ws-r', 'remote proj', leaf('pr', [surface('rs-1', '', {
+        surfaceType: 'remote-terminal', remoteHostId: 'host-1', remoteSessionId: 'rsession-9',
+      })]), 'pr')],
+      remoteWorkspaces: [{
+        key: 'host-1:rw-1', hostId: 'host-1', hostLabel: 'office-mac', workspaceId: 'rw-1', name: 'proj',
+        panes: [{ sessionId: 'rsession-9', shell: 'zsh', agentName: 'Codex', agentStatus: 'awaiting_input' }],
+      }] as unknown as ReturnType<typeof useStore.getState>['remoteWorkspaces'],
+    }));
+    mount();
+    await flushRaf();
+    const row = rows()[0];
+    expect(row.dataset.status).toBe('awaiting_input');
+    expect(row.querySelector('[data-fleet-remote]')?.getAttribute('title')).toBe('@office-mac');
+    expect(row.getAttribute('aria-label')).toContain('office-mac');
+  });
+
+  it('renders a browser help request on the approvals tab', async () => {
+    act(() => useStore.setState({
+      fleetActiveTab: 'approvals',
+      browserHelpRequests: { r1: { requestId: 'r1', workspaceId: 'ws-1', surfaceId: 's1', prompt: 'Sign in, then press Done.', deadlineAt: Date.now() + 60_000 } },
+      browserHelpOrder: ['r1'],
+    }));
+    mount();
+    await flushRaf();
+    expect(container.textContent).toContain('Browser needs you');
+    expect(container.textContent).toContain('Sign in, then press Done.');
   });
 });
