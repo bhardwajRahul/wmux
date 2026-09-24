@@ -2,8 +2,7 @@ import { Fragment, useState, useCallback, useMemo, useRef, useEffect } from 'rea
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../../stores';
 import { selectWorkspaceIdName } from '../../stores/selectors/workspaceProjections';
-import { selectAllWorkspaceAgentStatus, selectAllWorkspaceLastActivityMinute } from '../../stores/selectors/fleet';
-import { orderWorkspaces } from './attentionOrder';
+import { useGlanceBoardOrder } from './useGlanceBoardOrder';
 import { buildSidebarTree, ORPHAN_GROUP_KEY } from './sidebarTree';
 import SidebarTaskGroup from './SidebarTaskGroup';
 import SidebarResizeHandle from './SidebarResizeHandle';
@@ -13,7 +12,7 @@ import RemoteWorkspaceItem from './RemoteWorkspaceItem';
 import OrphanSessions from './OrphanSessions';
 import ArchivedWorkspaces from './ArchivedWorkspaces';
 import MissionsSection from './MissionsSection';
-import type { AgentStatus, Workspace } from '../../../shared/types';
+import type { Workspace } from '../../../shared/types';
 import { getWorkspacePtyIds } from '../../../shared/paneUtils';
 import { destroyWorkspaceRemoteSessions } from '../../utils/remoteSessionTeardown';
 import { selectAttachedRemoteWorkspaces } from '../../stores/slices/remoteWorkspacesSlice';
@@ -30,11 +29,6 @@ import SidebarNavigation from './SidebarNavigation';
 import PresetPicker from './PresetPicker';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
 
-// Frozen stand-in the attention selector returns while the setting is off, so
-// useShallow sees the same empty map every time and nothing re-renders.
-const NO_AGENT_STATUS: Record<string, AgentStatus> = {};
-/** The same frozen stand-in for the recent-activity map (#1481). */
-const NO_ACTIVITY: Record<string, number> = {};
 
 // 워크스페이스가 소유한 모든 PTY를 dispose
 // (traversal is the shared canonical walk; the dispose policy stays local)
@@ -64,27 +58,7 @@ export default function Sidebar() {
     const q = wsSearch.toLowerCase();
     return workspaces.filter((ws) => ws.name.toLowerCase().includes(q));
   }, [workspaces, wsSearch]);
-  // Display-only ordering (attentionOrder.ts): manual, needs-you-first, or
-  // recent activity (#1481). Subscribing to the status or activity roll-up
-  // unconditionally would re-couple this component to the per-pane churn the
-  // A1 refactor above decoupled it from, so each selector short-circuits to a
-  // frozen empty map unless its mode is on. Activity is minute-floored.
-  const sidebarSortMode = useStore((s) => s.sidebarSortMode);
-  const agentStatusById = useStore(
-    useShallow((s) => (s.sidebarSortMode === 'attention' ? selectAllWorkspaceAgentStatus(s) : NO_AGENT_STATUS)),
-  );
-  const lastActivityById = useStore(
-    useShallow((s) => (s.sidebarSortMode === 'recent' ? selectAllWorkspaceLastActivityMinute(s) : NO_ACTIVITY)),
-  );
-  const orderedWorkspaces = useMemo(
-    () => orderWorkspaces(
-      filteredWorkspaces,
-      sidebarSortMode,
-      (id) => agentStatusById[id] ?? 'idle',
-      (id) => lastActivityById[id] ?? 0,
-    ),
-    [filteredWorkspaces, agentStatusById, lastActivityById, sidebarSortMode],
-  );
+
   // #1481 — fan-out nesting. Both maps change only when a fan-out lands, a
   // task closes or detaches, or the audit log is re-read — not on output.
   const missionByPaneGroup = useStore((s) => s.missionByPaneGroup);
@@ -92,6 +66,41 @@ export default function Sidebar() {
   const fanoutSpawnOwner = useStore((s) => s.fanoutSpawnOwner);
   const fanoutSettled = useStore((s) => s.fanoutRefreshSettled);
   const sidebarWidth = useStore((s) => s.sidebarWidth);
+  // One-time notice when this load moved a Manual list to Attention: sessions
+  // saved before the choice was recorded cannot prove Manual was chosen, so
+  // they are told once and can take it back.
+  const sortMigrated = useStore((s) => s.sidebarSortMigrated);
+  useEffect(() => {
+    if (!sortMigrated) return;
+    const st = useStore.getState();
+    st.clearSidebarSortMigrated();
+    st.pushToast({
+      level: 'info',
+      message: t('sidebar.sortMigrated'),
+      durationMs: 15_000,
+      action: { label: t('sidebar.sortMigratedUndo'), onClick: () => useStore.getState().setSidebarSortMode('manual') },
+    });
+  }, [sortMigrated, t]);
+  // Glance board (2026-09-25): Attention by default, applied only after a
+  // settle, or when the pointer / focus leaves the list (useSettledOrder).
+  // Nested fan-out tasks lift their owner: the owner scores as its most urgent
+  // task (see useGlanceBoardOrder).
+  const nestedOwnerOf = useCallback((id: string) => {
+    const liveIds = new Set(workspaces.map((w) => w.id));
+    const link = resolveTaskLink(missionByPaneGroup[id], fanoutLineage[id], fanoutSpawnOwner[id]);
+    if (!link || link.detached) return undefined;
+    // A task whose owner is gone renders in the "From closed workspace"
+    // group, so it takes no top-level slot either (it lifts no owner).
+    if (!link.ownerId || link.ownerId === id || !liveIds.has(link.ownerId)) return ORPHAN_GROUP_KEY;
+    return link.ownerId;
+  }, [workspaces, missionByPaneGroup, fanoutLineage, fanoutSpawnOwner]);
+  const {
+    ordered: orderedWorkspaces,
+    onPointerEnter: onListPointerEnter,
+    onPointerLeave: onListPointerLeave,
+    onFocusCapture: onListFocus,
+    onBlurCapture: onListBlur,
+  } = useGlanceBoardOrder(filteredWorkspaces, nestedOwnerOf);
   const tree = useMemo(() => {
     const byId = new Map(workspaces.map((w) => [w.id, w]));
     return buildSidebarTree(
@@ -270,6 +279,10 @@ export default function Sidebar() {
           drags hover-through the container untouched. */
       <div
         className="flex-1 min-h-0 overflow-y-auto px-2 pb-2 space-y-1"
+        onPointerEnter={onListPointerEnter}
+        onPointerLeave={onListPointerLeave}
+        onFocusCapture={onListFocus}
+        onBlurCapture={onListBlur}
         onDragOver={(e) => {
           if (useStore.getState().draggedWorkspaceIndex !== null) {
             e.preventDefault();

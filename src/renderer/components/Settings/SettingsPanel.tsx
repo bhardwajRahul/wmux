@@ -3844,8 +3844,8 @@ function TabAppearance() {
             value={sidebarSortMode}
             onValueChange={setSidebarSortMode}
             options={[
-              { value: 'manual', label: t('settings.sidebarSortManual') },
               { value: 'attention', label: t('settings.sidebarSortAttention') },
+              { value: 'manual', label: t('settings.sidebarSortManual') },
               { value: 'recent', label: t('settings.sidebarSortRecent') },
             ]}
           />

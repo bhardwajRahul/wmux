@@ -19,7 +19,7 @@ import { retentionMigrationDone, markRetentionMigrationDone } from '../retention
 import { decUnread } from './notificationSlice';
 import { mergeDeadPaneRecovery, type DeadPaneRecovery } from '../../../shared/ptyRecovery';
 import { stashedPaneLiveness } from '../../../shared/paneStash';
-import { clampSidebarWidth, pruneTaskGroupExpanded, resolveSidebarSortMode } from '../../utils/sidebarLayout';
+import { clampSidebarWidth, pruneTaskGroupExpanded, resolveSidebarSortMode, sortModeMigratedToAttention } from '../../utils/sidebarLayout';
 import {
   collectLeafIds,
   getLeafPanes,
@@ -389,6 +389,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
       state.nextWorkspaceOrdinal = wsOrdinal + 1;
       state.workspaces.push(ws);
+      // Glance board: a new workspace holds the top slot for a few minutes.
+      if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
       activateLocalWorkspace(state, ws.id);
     }),
 
@@ -425,6 +427,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       };
       state.nextWorkspaceOrdinal = wsOrdinal + 1;
       state.workspaces.push(ws);
+      // Glance board: a new workspace holds the top slot for a few minutes.
+      if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
       activateLocalWorkspace(state, ws.id);
     }),
 
@@ -488,6 +492,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         }
         state.nextWorkspaceOrdinal = highWater + 1;
         state.workspaces.push(ws);
+        // Glance board: a new workspace holds the top slot for a few minutes.
+        if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
         // A restore while a remote mirror is showing must actually land on the
         // restored workspace — activateLocalWorkspace is the single site that
         // guarantees it (see its doc comment).
@@ -544,6 +550,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       state.nextWorkspaceOrdinal = wsOrdinal + 1;
       // Insert right after the source for intuitive placement, then activate.
       state.workspaces.splice(idx + 1, 0, ws);
+      // Glance board: a new workspace holds the top slot for a few minutes.
+      if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
       activateLocalWorkspace(state, ws.id);
     }),
 
@@ -701,6 +709,13 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         get().pruneFanoutFor?.(id);
         if (get().sidebarTaskGroupExpanded?.[id] !== undefined) {
           set((s: StoreState) => { delete s.sidebarTaskGroupExpanded[id]; });
+        }
+        // Glance board: a removed workspace keeps no pin or new-workspace hold.
+        if (get().sidebarPinnedIds?.includes(id) || get().sidebarNewAt?.[id] !== undefined) {
+          set((s: StoreState) => {
+            s.sidebarPinnedIds = s.sidebarPinnedIds.filter((p) => p !== id);
+            delete s.sidebarNewAt[id];
+          });
         }
         // NOTE: deliberately NOT `clearMissionsFor(id)`. That bucket is keyed by
         // the fan-out PARENT, and its tasks' child workspaces routinely outlive
@@ -1338,6 +1353,14 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       // #1481 — the sort mode supersedes the attention flag; a session that
       // predates it carries only the flag, which maps onto 'attention'.
       state.sidebarSortMode = resolveSidebarSortMode(data);
+      state.sidebarSortModeChosen = data.sidebarSortModeChosen === true;
+      state.sidebarSortMigrated = sortModeMigratedToAttention(data);
+      {
+        const liveIds = new Set((data.workspaces ?? []).map((w) => w.id));
+        state.sidebarPinnedIds = Array.isArray(data.sidebarPinnedIds)
+          ? data.sidebarPinnedIds.filter((id): id is string => typeof id === 'string' && liveIds.has(id))
+          : [];
+      }
       state.sidebarAttentionFirst = state.sidebarSortMode === 'attention';
       if (data.sidebarWidth !== undefined) state.sidebarWidth = clampSidebarWidth(data.sidebarWidth);
       state.sidebarTaskGroupExpanded = pruneTaskGroupExpanded(
