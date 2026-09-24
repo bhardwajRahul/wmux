@@ -229,6 +229,10 @@ export interface FanOutResult {
    *  privileged/inverted bounds, or wider than the cap), so no task got a
    *  WMUX_TASK_PORT. Distinct from "no range declared", which reports nothing. */
   portRangeInvalid?: true;
+  /** T3 — conditions that did not stop the fan-out but the caller should know,
+   *  e.g. the tasks branched from the local HEAD because origin's default
+   *  branch could not be fetched. */
+  warnings?: string[];
 }
 
 export interface FanOutServiceOptions {
@@ -399,6 +403,7 @@ export class FanOutService {
     // 전체를 선검증한다 — 부적격이 하나라도 있으면 mission.start 전에 N개 전부 거부해
     // "부적격이면 태스크 생성 0" 계약을 이행한다. 실 taskId는 아직 없으므로 인덱스별
     // 자리표시자로 slug/경로/branch를 파생·검증한다.
+    let repoRoot = '';
     for (const [k, preflightTitle] of titles.entries()) {
       const placeholder = `wtask-preflight-${String(k).padStart(8, '0')}`;
       const pf = await this.worktrees.preflight(req.repoPath, preflightTitle, placeholder, {
@@ -407,6 +412,16 @@ export class FanOutService {
       if (!pf.ok) {
         return { ok: false, error: `fanout preflight failed (task ${k + 1}): ${pf.error}`, tasks: [] };
       }
+      repoRoot = pf.plan.repoRoot;
+    }
+
+    // ── T3 base: origin's default branch, fetched once for the whole fan-out ──
+    // Every task branches from the same freshly fetched ref, not from whatever
+    // the owner happens to have checked out. A failure is a warning, not a
+    // refusal: the tasks then branch from HEAD, as they did before.
+    const base = await this.worktrees.resolveBase(repoRoot);
+    if (base.error) {
+      return { ok: false, error: `fanout preflight failed: ${base.error}`, tasks: [] };
     }
 
     // ── T2 per-repo fan-out environment(포트 창·setup 훅) ──
@@ -430,6 +445,8 @@ export class FanOutService {
         missionIdemKey,
         port: env.ports[k],
         setupCommand: env.setupCommand,
+        baseOid: base.oid,
+        baseWarning: base.warning,
         ...(entries[k].role ? { role: entries[k].role } : {}),
       });
       tasks.push(r);
@@ -444,6 +461,7 @@ export class FanOutService {
       tasks,
       ...(env.setupSkipped ? { setupSkipped: env.setupSkipped } : {}),
       ...(env.portRangeInvalid ? { portRangeInvalid: true as const } : {}),
+      ...(base.warning ? { warnings: [base.warning] } : {}),
     };
   }
 
@@ -516,6 +534,10 @@ export class FanOutService {
     setupCommand?: string;
     /** Orchestrator role for this task's pane (absent = unroled). */
     role?: string;
+    /** T3 — commit the task branch starts from (absent = HEAD). */
+    baseOid?: string;
+    /** T3 — why the base is not a fresh origin commit; posted to the mission channel. */
+    baseWarning?: string;
   }): Promise<FanOutTaskResult> {
     const base: FanOutTaskResult = { index: ctx.index, title: ctx.title, ok: false };
 
@@ -548,7 +570,7 @@ export class FanOutService {
       return { ...base, error: `worktree preflight failed: ${pf.error}` };
     }
     const plan: TaskWorktreePlan = pf.plan;
-    const created = await this.worktrees.createWorktree(plan);
+    const created = await this.worktrees.createWorktree(plan, ctx.baseOid);
     if (!created.ok) {
       await this.compensate(taskId, ctx.verifiedWorkspaceId);
       return { ...base, error: `worktree create failed: ${created.error}` };
@@ -570,7 +592,12 @@ export class FanOutService {
         // 파일 자체가 없으므로 계약문도 붙지 않는다 — 사람이 직접 입력한다.
         fs.writeFileSync(promptPath, ctx.prompt + WORKER_DELIVERY_PREAMBLE, 'utf8');
       }
-      const stamp: WorkTaskMetaStamp = { taskId, title: ctx.title, createdAt: Date.now() };
+      const stamp: WorkTaskMetaStamp = {
+        taskId,
+        title: ctx.title,
+        createdAt: Date.now(),
+        ...(ctx.baseOid ? { baseOid: ctx.baseOid } : {}),
+      };
       fs.writeFileSync(path.join(plan.metaDir, WORKTASK_META_FILENAME), JSON.stringify(stamp), 'utf8');
     } catch (err) {
       await this.compensate(taskId, ctx.verifiedWorkspaceId, plan);
@@ -699,6 +726,22 @@ export class FanOutService {
       if (!invited?.ok) channelDisconnected = true;
     } catch {
       channelDisconnected = true;
+    }
+
+    // T3 — the worker should know its base is not a fresh origin commit. Posted
+    // as the owner, after the invite so the worker is a member; best-effort.
+    if (ctx.baseWarning) {
+      try {
+        await this.daemon.rpc('a2a.channel.post', {
+          channelId,
+          sender: { workspaceId: ctx.verifiedWorkspaceId, memberId: ctx.verifiedWorkspaceId },
+          text: `[fan-out] base warning: ${ctx.baseWarning}`,
+          verifiedWorkspaceId: ctx.verifiedWorkspaceId,
+          clientMsgId: `${ctx.missionIdemKey}-base-warning`,
+        });
+      } catch {
+        // best-effort — the fan-out result carries the same warning.
+      }
     }
 
     // A-1 — the worker is up; make sure it is not sitting on a first-run screen.
