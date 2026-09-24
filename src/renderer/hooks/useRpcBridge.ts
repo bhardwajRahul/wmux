@@ -16,7 +16,7 @@ import { reattachModelEnvMarker, splitModelEnvMarker } from '../../shared/worker
 import { handleCompanyRpc } from '../../company/renderer/rpcHandlers';
 import { formatA2aMessage, formatA2aBroadcast, sanitizeA2aName } from '../utils/a2aFormat';
 import type { A2aPriority } from '../utils/a2aFormat';
-import { requestExecuteApproval, requestFanOutApproval, requestTaskApproval } from '../utils/executeApprovalGate';
+import { findPendingExecuteRequest, requestExecuteApproval, requestFanOutApproval, requestTaskApproval } from '../utils/executeApprovalGate';
 import { openUrlInBrowserPane } from '../utils/browserPaneActions';
 import {
   closeBrowserTabInWorkspace,
@@ -2619,12 +2619,45 @@ async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcRe
 
     if (executeRequested) {
       const cwd = typeof params.cwd === 'string' ? params.cwd : null;
+      // #1462 — a caller that resends while its first request is still on the
+      // approval prompt joins that prompt instead of raising a second one, and
+      // gets its verdict. The first request creates the task and main spawns
+      // its worker; the retry reports that task and must not spawn another,
+      // so it never claims executeApproved.
+      const identity = {
+        senderWorkspaceId: workspaceId,
+        senderPtyId,
+        receiverWorkspaceId: target.id,
+        targetPtyId: toAnchor?.ptyId ?? '',
+        cwd,
+        message,
+      };
+      const pending = findPendingExecuteRequest(identity);
+      if (pending) {
+        const joinedApproved = await pending.verdict;
+        if (!joinedApproved) {
+          return {
+            ok: false,
+            error: `a2a.task.send: execute approval denied (this resend joined the pending request for task ${pending.taskId})`,
+          };
+        }
+        return {
+          ok: true,
+          taskId: pending.taskId,
+          toWorkspaceId: target.id,
+          joinedPendingRequest: true,
+          hint:
+            'An identical execute request was already waiting for approval; this send joined it. ' +
+            `Task ${pending.taskId} was approved and started once, by that request.`,
+        };
+      }
       const approved = await requestExecuteApproval({
         taskId: newTaskId,
         senderWorkspaceId: workspaceId,
         receiverWorkspaceId: target.id,
         messagePreview: message.slice(0, 500),
         cwd,
+        identity,
       });
       if (!approved) {
         return { ok: false, error: 'a2a.task.send: execute approval denied' };

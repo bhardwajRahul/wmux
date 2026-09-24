@@ -5,6 +5,7 @@ import { sendRpc, setClientIdentity, setCommanderRole, setWorkspaceToken } from 
 import { COMMANDER_TOOL_SURFACE, COMMANDER_ONLY_TOOLS } from '../shared/commanderSurface';
 import { CORE_TOOL_SURFACE } from '../shared/coreSurface';
 import type { RpcMethod } from '../shared/rpc';
+import { EXECUTE_SEND_CLIENT_TIMEOUT_MS } from '../shared/executeApprovalBounds';
 import {
   claimPinnedRoute,
   clearPinnedRoute,
@@ -1616,7 +1617,11 @@ const sendMessageHandler = async ({ to, pane_id, surface_id, title, task_id, mes
     params.data = data;
     params.dataMimeType = data_mime_type || 'application/json';
   }
-  return callRpc('a2a.task.send', params);
+  // A new execute send waits on a person (#1462): outwait main, so the agent
+  // reads the verdict instead of timing out and retrying into a second prompt.
+  return execute && !task_id
+    ? callRpc('a2a.task.send', params, EXECUTE_SEND_CLIENT_TIMEOUT_MS)
+    : callRpc('a2a.task.send', params);
 };
 
 server.tool(
