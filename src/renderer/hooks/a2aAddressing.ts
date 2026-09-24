@@ -6,7 +6,8 @@
 import type { PaneLeaf } from '../../shared/types';
 import { getLeafPanes } from '../../shared/paneUtils';
 import { isBrainPtyId } from '../../shared/constants';
-import { submitProfileForAgent, type SubmitAssurance } from '../../shared/ptyMessageDelivery';
+import type { AgentSlug } from '../../shared/agentIdentity';
+import { resolveAgentSlug, submitProfileForAgent, type SubmitAssurance } from '../../shared/ptyMessageDelivery';
 
 export type PaneAddress = { ptyId: string; paneId: string; surfaceId: string };
 
@@ -480,6 +481,37 @@ export type PaneLivenessMaps = {
   agentAlive?: Record<string, boolean>;
   commandRunning?: Record<string, boolean>;
 };
+
+/**
+ * The canonical agent slug of the TUI running in `ptyId`, or undefined when
+ * the pane is not a detected, still-live agent. Decides whether an A2A
+ * envelope may keep its body's real newlines (see `A2aFormatOptions`).
+ *
+ * Only a known slug counts: DECSET 2004 (bracketed paste) is NOT a signal,
+ * because shells turn it on too, and a shell runs each pasted line as its own
+ * command once the paste is submitted. A brain pty is not a TUI at all.
+ *
+ * Liveness must be POSITIVELY confirmed. A surfaceAgent entry outlives its
+ * agent until a liveness snapshot clears it (#1210), and both maps are often
+ * empty (no process attribution, no shell integration), so "not known gone"
+ * would hand a multi-line body to a shell that just got its prompt back. The
+ * entry's status is not used either: it is as stale as the entry. Unknown
+ * means fold.
+ */
+export function detectedAgentTuiSlug(
+  ptyId: string,
+  surfaceAgent: Record<string, { name: string; slug?: string } | undefined>,
+  liveness: PaneLivenessMaps = {},
+): AgentSlug | undefined {
+  if (!ptyId || isBrainPtyId(ptyId)) return undefined;
+  const alive = liveness.agentAlive?.[ptyId];
+  const running = liveness.commandRunning?.[ptyId];
+  if (alive === false || running === false) return undefined;
+  if (alive !== true && running !== true) return undefined;
+  const agent = surfaceAgent[ptyId];
+  if (!agent) return undefined;
+  return resolveAgentSlug(agent.slug) ?? resolveAgentSlug(agent.name);
+}
 
 export type AgentPaneCandidate = {
   paneId: string;
