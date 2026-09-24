@@ -23,12 +23,19 @@ import type { ProjectConfigState } from '../../../shared/wmuxProjectConfig';
 import { clearFanoutPortReservationsForTest } from '../fanoutEnvironment';
 import { TaskLedger } from '../../../daemon/ledger/TaskLedger';
 import { setTaskLedgerForTests } from '../../deck/taskLedgerHost';
+import { FanOutGuards, setFanOutGuardsForTests } from '../fanoutGuards';
 
 let metaRoot: string;
+let lineage: FanOutGuards;
 beforeEach(() => {
   metaRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-fanout-'));
+  // The service stamps each task workspace's lineage; keep that out of the
+  // real wmux dir.
+  lineage = new FanOutGuards({ dir: metaRoot, countLiveTasks: () => 0, ledgerTaskOwner: () => null });
+  setFanOutGuardsForTests(lineage);
 });
 afterEach(() => {
+  setFanOutGuardsForTests(null);
   fs.rmSync(metaRoot, { recursive: true, force: true });
 });
 
@@ -415,6 +422,65 @@ describe('T3 worktree base — one fetch per fan-out, OID pinned, warning surfac
     const res = await svc.start(baseReq());
     expect(res.ok).toBe(false);
     expect(worktrees.resolveBase).not.toHaveBeenCalled();
+  });
+});
+
+describe('depth-1 lineage stamp', () => {
+  it('asks the renderer to stamp each task workspace with its owner before launch, and confirms it main-side', async () => {
+    const daemon = makeDaemonFake();
+    const renderer = makeRendererFake();
+    const svc = new FanOutService({ daemon: daemon.port, renderer: renderer.port, worktrees: makeWorktreesFake() });
+    const res = await svc.start(baseReq());
+    expect(res.ok).toBe(true);
+    for (const p of renderer.spawned) expect((p as { fanoutTaskOf?: string }).fanoutTaskOf).toBe('ws-ceo');
+    for (const t of res.tasks) expect(lineage.fanoutOwnerOf(t.workspaceId!)).toBe('ws-ceo');
+  });
+
+  it('hands the renderer the operator\'s worker permission mode for every task', async () => {
+    const renderer = makeRendererFake();
+    const svc = new FanOutService({
+      daemon: makeDaemonFake().port,
+      renderer: renderer.port,
+      worktrees: makeWorktreesFake(),
+      workerPermissionMode: () => 'acceptEdits',
+    });
+    await svc.start(baseReq());
+    expect(renderer.spawned.map((p) => (p as { workerPermissionMode?: string }).workerPermissionMode)).toEqual([
+      'acceptEdits',
+      'acceptEdits',
+    ]);
+  });
+
+  it('uses the mode the caller read (the one it audited), reading the store at most once per run', async () => {
+    const renderer = makeRendererFake();
+    const read = vi.fn(() => 'acceptEdits' as const);
+    const svc = new FanOutService({
+      daemon: makeDaemonFake().port,
+      renderer: renderer.port,
+      worktrees: makeWorktreesFake(),
+      workerPermissionMode: read,
+    });
+    await svc.start(baseReq({ workerPermissionMode: 'bypassPermissions' }));
+    expect(read).not.toHaveBeenCalled();
+    expect(renderer.spawned.map((p) => (p as { workerPermissionMode?: string }).workerPermissionMode)).toEqual([
+      'bypassPermissions',
+      'bypassPermissions',
+    ]);
+    await svc.start(baseReq({ idempotencyKey: 'fo-key-2' }));
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases its in-flight live-cap booking one task at a time', async () => {
+    const settled = vi.spyOn(lineage, 'taskSettled');
+    const svc = new FanOutService({
+      daemon: makeDaemonFake().port,
+      renderer: makeRendererFake({ spawnFailOn: (name) => name.includes('Task B') }).port,
+      worktrees: makeWorktreesFake(),
+    });
+    await svc.start(baseReq());
+    // Once per task, the failed one included.
+    expect(settled).toHaveBeenCalledTimes(2);
+    expect(settled).toHaveBeenCalledWith('fo-key-1');
   });
 });
 

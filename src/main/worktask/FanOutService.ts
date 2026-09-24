@@ -47,6 +47,8 @@ import {
   type FanoutSetupSkipReason,
 } from './fanoutEnvironment';
 import { inheritTaskAutonomy } from './taskAutonomy';
+import { getFanOutGuards, type FanOutGuards } from './fanoutGuards';
+import { loadFanoutWorkerPermissionMode } from './fanoutWorkerPolicy';
 import { commandChoosesModel } from '../../shared/orchestratorRole';
 import {
   MODEL_ENV_MARKER,
@@ -54,6 +56,7 @@ import {
   WORKER_MODEL_ENV,
   isSimpleLaunchCommand,
   splitModelEnvMarker,
+  type FanoutWorkerPermissionMode,
 } from '../../shared/workerLaunch';
 import {
   clearFirstRunPrompts,
@@ -122,6 +125,14 @@ export interface FanOutRendererPort {
      *  renderer rewrites the launch command through the same applyRoleBinding
      *  path a human-opened pane uses. Absent = launch the command as given. */
     role?: string;
+    /** Depth-1 lineage: the workspace that fanned this task out. The renderer
+     *  hands it to pty.create, whose main-side handler stamps it BEFORE the
+     *  PTY (and the agent) exists; a failed stamp fails the spawn. */
+    fanoutTaskOf?: string;
+    /** The operator's worker permission mode (main-side setting). The renderer
+     *  appends the matching flag and the worker allow-list AFTER the role
+     *  rewrite, and only when the final launcher is claude. */
+    workerPermissionMode?: FanoutWorkerPermissionMode;
   }): Promise<
     | {
         workspaceId: string;
@@ -176,6 +187,9 @@ export interface FanOutRequest {
   verifiedWorkspaceId: string;
   /** 미션 채널 멤버 좌표(생성자 memberId — 기본 verifiedWorkspaceId). */
   memberId?: string;
+  /** Worker permission mode, read once by the caller so the audit record and
+   *  every task agree. Absent → read once from the Settings store per run. */
+  workerPermissionMode?: FanoutWorkerPermissionMode;
 }
 
 /** 태스크 단위 결과(리포트 — 상태 구분). */
@@ -252,6 +266,12 @@ export interface FanOutServiceOptions {
   /** F15 — how long after a clean watch to look once more for the model error.
    *  Negative disables the re-check entirely. */
   firstRunRecheckMs?: number;
+  /** Depth-1 lineage + live-cap store. Injected in tests; defaults to the
+   *  hosted one. */
+  lineage?: Pick<FanOutGuards, 'markTask' | 'taskSettled'>;
+  /** Worker permission mode reader. Injected in tests; defaults to the
+   *  main-side Settings store. */
+  workerPermissionMode?: () => FanoutWorkerPermissionMode;
 }
 
 /**
@@ -282,6 +302,9 @@ export class FanOutService {
   private readonly firstRunRecheckMs: number;
   /** F15 — deferred re-checks still in flight (tests await them). */
   private pendingRechecks: Promise<void>[] = [];
+  /** Depth-1 lineage + live-cap store (absent = the hosted one). */
+  private readonly lineage?: Pick<FanOutGuards, 'markTask' | 'taskSettled'>;
+  private readonly workerPermissionMode: () => FanoutWorkerPermissionMode;
 
   /** §2 G1 멱등: 키 → 완료 결과 LRU. 동일 키 재호출은 직전 결과 반환. */
   private readonly results = new Map<string, FanOutResult>();
@@ -297,6 +320,8 @@ export class FanOutService {
     this.autonomy = opts.autonomy;
     this.firstRunOptions = opts.firstRunOptions;
     this.firstRunRecheckMs = opts.firstRunRecheckMs ?? FIRST_RUN_MODEL_RECHECK_MS;
+    this.lineage = opts.lineage;
+    this.workerPermissionMode = opts.workerPermissionMode ?? (() => loadFanoutWorkerPermissionMode());
   }
 
   /**
@@ -429,6 +454,7 @@ export class FanOutService {
     // 전에 전부 확정한다 — 태스크 k가 뜬 뒤 k+1이 같은 창을 다시 스캔하면 아직
     // 바인드되지 않은 포트를 중복 배정할 수 있기 때문이다.
     const env = await this.resolveEnvironment(req.repoPath, n);
+    const workerMode = req.workerPermissionMode ?? this.workerPermissionMode();
 
     // ── 태스크 순차 처리(직렬 큐가 이미 강제하지만, 스폰 부하도 직렬로) ──
     const tasks: FanOutTaskResult[] = [];
@@ -448,8 +474,12 @@ export class FanOutService {
         baseOid: base.oid,
         baseWarning: base.warning,
         ...(entries[k].role ? { role: entries[k].role } : {}),
+        workerMode,
       });
       tasks.push(r);
+      // This task is through its spawn: from here its stamped workspace (if
+      // it got one) is what the live cap counts, not the in-flight booking.
+      (this.lineage ?? getFanOutGuards()).taskSettled(req.idempotencyKey);
     }
 
     // 배정됐지만 태스크가 뜨지 못한 포트는 창에 돌려준다(예약 TTL을 기다리지 않게).
@@ -538,6 +568,7 @@ export class FanOutService {
     baseOid?: string;
     /** T3 — why the base is not a fresh origin commit; posted to the mission channel. */
     baseWarning?: string;
+    workerMode: FanoutWorkerPermissionMode;
   }): Promise<FanOutTaskResult> {
     const base: FanOutTaskResult = { index: ctx.index, title: ctx.title, ok: false };
 
@@ -655,6 +686,8 @@ export class FanOutService {
         initialCommand,
         ...(Object.keys(paneEnv).length > 0 ? { env: paneEnv } : {}),
         ...(ctx.role ? { role: ctx.role } : {}),
+        fanoutTaskOf: ctx.verifiedWorkspaceId,
+        workerPermissionMode: ctx.workerMode,
       });
       if ('error' in spawned) {
         await this.compensate(taskId, ctx.verifiedWorkspaceId, plan);
@@ -671,6 +704,13 @@ export class FanOutService {
       return { ...base, error: `renderer spawn threw: ${(err as Error).message}`, preservedWorktree: plan.worktreePath };
     }
     base.workspaceId = workspaceId;
+    // The renderer already stamped the lineage before the agent launched; this
+    // second write is idempotent and covers a renderer that did not.
+    try {
+      (this.lineage ?? getFanOutGuards()).markTask(workspaceId, ctx.verifiedWorkspaceId);
+    } catch (err) {
+      console.warn(`[fanout] could not confirm the lineage stamp for ${workspaceId}: ${String(err)}`);
+    }
 
     // ④ task.update — 물질화 커밋({branch, worktreePath, paneGroupId=workspaceId}).
     // 이 RPC는 MCP 도구 표면은 없지만 파이프 라우터 등록으로 first-party 클라이언트에

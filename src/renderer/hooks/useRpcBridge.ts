@@ -12,8 +12,14 @@ import { generateId } from '../../shared/types';
 import { getLeafPanes, getWorkspaceLeafPanes, getWorkspacePtyIds } from '../../shared/paneUtils';
 import { findStashedEntry, paneStashedError, stashedPaneLiveness } from '../../shared/paneStash';
 import { applyRoleAgent, bindingEnforcesModel, normalizeRoleBinding, sanitizeOrchRole } from '../../shared/orchestratorRole';
-import { reattachModelEnvMarker, splitModelEnvMarker } from '../../shared/workerLaunch';
+import {
+  applyWorkerPermissionFlags,
+  isFanoutWorkerPermissionMode,
+  reattachModelEnvMarker,
+  splitModelEnvMarker,
+} from '../../shared/workerLaunch';
 import { handleCompanyRpc } from '../../company/renderer/rpcHandlers';
+import { t } from '../i18n';
 import { formatA2aMessage, formatA2aBroadcast, sanitizeA2aName, type A2aFormatOptions } from '../utils/a2aFormat';
 import type { A2aPriority } from '../utils/a2aFormat';
 import { findPendingExecuteRequest, requestExecuteApproval, requestFanOutApproval, requestTaskApproval } from '../utils/executeApprovalGate';
@@ -63,26 +69,33 @@ import { buildFleetTriage, fleetTriageScopeError } from '../utils/fleetTriage';
  * Saying "codex --model o3" when o3 will not be passed is the exact failure the
  * enforcement predicate exists to prevent elsewhere.
  *
- * Returns '' when no task carries a role, so the ordinary preview is unchanged.
+ * Returns [] when no task carries a role. The same lines go into the fan-out
+ * audit record, so what was shown and what was logged cannot differ.
  */
-function describeFanOutRoles(raw: unknown): string {
-  if (!Array.isArray(raw)) return '';
+function fanOutRoleLines(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
   const seen: string[] = [];
   for (const entry of raw) {
     const role = typeof entry === 'string' ? entry.trim() : '';
     if (role && !seen.includes(role)) seen.push(role);
   }
-  if (seen.length === 0) return '';
+  if (seen.length === 0) return [];
   const bindings = useStore.getState().orchestratorRoleBindings;
-  const lines = seen.map((role) => {
+  return seen.map((role) => {
     const b = bindings[role];
-    if (!b || (!b.agent && !b.model && !b.args)) return `  ${role} → the default agent (no binding)`;
+    if (!b || (!b.agent && !b.model && !b.args)) return `${role} → the default agent (no binding)`;
     const parts: string[] = [b.agent || 'the default agent'];
     if (b.model) parts.push(bindingEnforcesModel(b) ? `--model ${b.model}` : `(model "${b.model}" is configured but will NOT be applied)`);
     if (b.args) parts.push(b.args);
-    return `  ${role} → ${parts.join(' ')}`;
+    return `${role} → ${parts.join(' ')}`;
   });
-  return `\n\nRoles resolve to:\n${lines.join('\n')}`;
+}
+
+/** The role lines as the approval dialog shows them; '' when no task has a
+ *  role, so the ordinary preview is unchanged. */
+function describeFanOutRoles(lines: string[]): string {
+  if (lines.length === 0) return '';
+  return `\n\nRoles resolve to:\n${lines.map((l) => `  ${l}`).join('\n')}`;
 }
 
 interface DaemonTextRow { text: string; wrapped: boolean }
@@ -799,11 +812,12 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
   }
 
   if (method === 'fanout.requestApproval') {
-    // 파이프/MCP fan-out의 승인 게이트. 큐·다이얼로그·30s 타이머는 A2A execute
-    // 게이트와 공유하지만 전역 auto-approve 토글(a2aAutoApproveExecute)은 타지
-    // 않는다 — 그 토글은 백그라운드 에이전트 스폰에 대한 동의지 worktree N개
-    // 생성에 대한 동의가 아니다(requestFanOutApproval). 렌더러 다이얼로그가
-    // 시작하는 fan-out(FanOutDialog)은 사람 클릭이 곧 승인이라 이 경로를 타지 않는다.
+    // The pipe/MCP fan-out approval gate. Main decides whether to ask
+    // (`requireApproval`; off by default): off, the fan-out runs unattended
+    // (outcome 'auto') behind main's depth-1, caps and audit log, and gets one
+    // toast so it is never invisible. Anything but a literal `false` asks. On, it shares the A2A execute queue, dialog and 30s timer, but never the
+    // a2aAutoApproveExecute toggle (requestFanOutApproval). A fan-out the GUI
+    // FanOutDialog starts is a human click and does not come through here.
     //
     // outcome을 그대로 돌려준다: main은 이미 호출자에게 accepted를 반환한 뒤라,
     // 자동 거부가 "조용히 사라지는" 대신 폴 응답에 이유로 실려야 한다.
@@ -817,14 +831,22 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     // binding silently adds a different CLI, another model, or extra flags
     // would make the approved text and the executed command two different
     // things — the one property this gate exists to hold.
-    const previewWithRoles = promptPreview + describeFanOutRoles(params.roles);
+    const roleCommands = fanOutRoleLines(params.roles);
+    const previewWithRoles = promptPreview + describeFanOutRoles(roleCommands);
     const verdict = await requestFanOutApproval({
       workspaceId: callerWsId,
       repoPath,
       taskCount,
       messagePreview: previewWithRoles,
+      requireApproval: params.requireApproval !== false,
     });
-    return { approved: verdict.approved, outcome: verdict.outcome };
+    if (verdict.outcome === 'auto') {
+      useStore.getState().pushToast({
+        message: t('fanout.autoRunToast', { count: taskCount, repo: repoPath }),
+        level: 'info',
+      });
+    }
+    return { approved: verdict.approved, outcome: verdict.outcome, roleCommands };
   }
 
   if (method === 'task.requestApproval') {
@@ -906,6 +928,13 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     const newWsId = newWs.id;
     const paneId = newWs.activePaneId;
 
+    // Depth-1 lineage: main stamps this workspace as a task of its owner
+    // INSIDE pty.create, before the PTY (and the agent) exists; a failed stamp
+    // fails the create and the rollback below runs. No separate round-trip
+    // here: an await between addWorkspace and pty.create would let the
+    // empty-leaf funnel spawn a plain shell into this pane first.
+    const fanoutTaskOf = typeof params.fanoutTaskOf === 'string' ? params.fanoutTaskOf : '';
+
     // Unnested so the FINAL command is readable: withDefaultShell first (there
     // has to be a command to rewrite), then the role binding, then the marker
     // goes back on, and withWorkspaceProfile stays outermost so the profile's
@@ -919,7 +948,18 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       },
       useStore.getState().defaultShell,
     );
-    const bound = withRoleBinding(seeded, roleBinding, role);
+    const roleBound = withRoleBinding(seeded, roleBinding, role);
+    // Worker permission mode + allow-list, AFTER the role rewrite: only then is
+    // the final launcher known (a binding may have swapped claude for codex,
+    // which rejects these flags), and only then can a permission flag the
+    // binding's args added be replaced rather than doubled.
+    const workerMode = isFanoutWorkerPermissionMode(params.workerPermissionMode)
+      ? params.workerPermissionMode
+      : undefined;
+    const bound =
+      workerMode && roleBound.initialCommand
+        ? { ...roleBound, initialCommand: applyWorkerPermissionFlags(roleBound.initialCommand, workerMode) }
+        : roleBound;
     // `bound.initialCommand` stays undefined for the "environment only" launch,
     // and it has to: withWorkspaceProfile fills a MISSING command from the
     // profile's defaultPaneCommand, and an empty string is not missing.
@@ -943,7 +983,9 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
 
     let ptyId: string;
     try {
-      const created = await window.electronAPI.pty.create(createOptions);
+      const created = await window.electronAPI.pty.create(
+        fanoutTaskOf ? { ...createOptions, fanoutTaskOf } : createOptions,
+      );
       ptyId = created.id;
     } catch (err) {
       const rollback = useStore.getState();
