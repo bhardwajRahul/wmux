@@ -131,7 +131,14 @@ const KIRO_PROMPT_LINE = /^[▸>❯]?\s*ask\s*a\s*question\s*or\s*describe\s*a\s
 // could never match a live pane, so the compound gate never closed its second
 // half and the whole Claude pattern block — waiting AND the approval
 // awaiting_input regexes — was dead code against the real product.
-const CLAUDE_PROMPT_RE = /bypass\s*permissions\s*on|shift\+tab\s*to\s*cycle/;
+//
+// `⏸ manual mode on`: the footer Claude Code 2.1.281 draws in the default
+// permission mode (`⏸ manual mode on · ← for agents`). It carries neither
+// fragment above, and a `claude "<prompt>"` launch — how a fan-out worker
+// starts — draws no splash either, so such a pane's gate never opened and its
+// first permission prompts were read by nobody. Gate evidence only: it is on
+// screen mid-turn too, so it never stands in for a `waiting` status.
+const CLAUDE_PROMPT_RE = /bypass\s*permissions\s*on|shift\+tab\s*to\s*cycle|⏸\s*manual\s*mode\s*on/;
 // Cheap `ap.gate` hint only — checkGates does not use this on the 4 KB
 // probe. Line-level `isClaudeBannerChrome` is the real banner signal.
 const CLAUDE_BANNER_RE = /(?<!Open)(?<!Open\s)Claude\s*Code|claude-code/;
@@ -209,8 +216,14 @@ const AGENT_PATTERNS: AgentPattern[] = [
       //     (`mcp__context7__get-library-docs`). Round-5 P2: the prior
       //     `mcp__[A-Za-z0-9_]+` rejected hyphens and accepted
       //     non-canonical single-`__` names like `mcp__github_create_issue`.
-      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Do you want to proceed\?[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/,                                                                                  status: 'awaiting_input',   message: 'Approval requested' },
-      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Allow tool use for (?:[A-Z][A-Za-z]+|mcp__[A-Za-z0-9-]+__[A-Za-z0-9_-]+)\??[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/, status: 'awaiting_input',   message: 'Tool approval requested' },
+      //
+      // `\s*` between words: Claude Code 2.1.281 draws this row with cursor
+      // moves on some frames (`Do ESC[5G you ESC[9G want ESC[14G to ESC[17G
+      // proceed?`), which strips to `Doyouwanttoproceed?`. In a replay of 33
+      // real Bash permission prompts, 15 had lost some or all spaces, so the
+      // literal-space form never marked those panes as needing the user.
+      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Do\s*you\s*want\s*to\s*proceed\?[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/,                                                                                  status: 'awaiting_input',   message: 'Approval requested' },
+      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Allow\s*tool\s*use\s*for\s*(?:[A-Z][A-Za-z]+|mcp__[A-Za-z0-9-]+__[A-Za-z0-9_-]+)\??[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/, status: 'awaiting_input',   message: 'Tool approval requested' },
       // File-edit approval prompts (`Do you want to create/overwrite/make this
       // edit to <file>?`). Live incident 2026-07-17: a worker pane sat on
       // `Do you want to overwrite calculator.html?` for 100 minutes because
@@ -253,8 +266,8 @@ const AGENT_PATTERNS: AgentPattern[] = [
       // Waiting — the bare ">" prompt after trim, optionally followed by a
       // spinner character (○) when the TUI is waiting for input.
       { regex: /^>[\s○◌●]*$/,                                                                               status: 'waiting',          message: 'Ready for input' },
-      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Do you want to proceed\?[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/,                                                              status: 'awaiting_input',   message: 'Approval requested' },
-      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Allow tool use for (?:[A-Z][A-Za-z]+|mcp__[A-Za-z0-9-]+__[A-Za-z0-9_-]+)\??[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/, status: 'awaiting_input',   message: 'Tool approval requested' },
+      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Do\s*you\s*want\s*to\s*proceed\?[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/,                                                              status: 'awaiting_input',   message: 'Approval requested' },
+      { regex: /^[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Allow\s*tool\s*use\s*for\s*(?:[A-Z][A-Za-z]+|mcp__[A-Za-z0-9-]+__[A-Za-z0-9_-]+)\??[\s│║┃═━─┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/, status: 'awaiting_input',   message: 'Tool approval requested' },
       { regex: /^[\s│║┃═━─╌╍┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Do\s*you\s*want\s*to\s*(?:create|overwrite|make\s*this\s*edit\s*to)\s*\S[^?]*\?[\s│║┃═━─╌╍┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/, status: 'awaiting_input',   message: 'Edit approval requested' },
       { regex: /^[\s│║┃═━─╌╍┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*Do\s*you\s*want\s*to\s*(?:create|overwrite|make\s*this\s*edit\s*to)[\s│║┃═━─╌╍┄┅┆┇┈┉╭╮╯╰╔╗╝╚┌┐┘└·]*$/,             status: 'awaiting_input',   message: 'Edit approval requested' },
     ],
@@ -280,7 +293,15 @@ const AGENT_PATTERNS: AgentPattern[] = [
     // — with the banner-only gate the trust pattern below could never fire.
     // checkGates runs before pattern matching on the same line, so the one
     // line both opens the gate and emits awaiting_input.
-    gate: /codex |OpenAI Codex|Do you trust the contents of this directory/,
+    //
+    // Cheap hint only — checkGates opens this gate through isCodexChrome, a
+    // line-level check. A substring gate (`codex `, then `OpenAI Codex`)
+    // opened on any line that merely named Codex — `command -v codex` in a
+    // review panel, a `git log -S"…OpenAI Codex"` echo — made Codex the
+    // lastAgent of a Claude pane and silenced every Claude pattern for the
+    // rest of the session. The PermissionRequest hook (#1107) is Codex's
+    // primary approval signal anyway.
+    gate: /OpenAI\s*Codex|Do you trust the contents of this directory/,
     patterns: [
       { regex: /^codex>\s*$/,                    status: 'waiting',   message: 'Waiting for input' },
       // Approval prompts — clean-room transcribed from a live Codex CLI
@@ -470,6 +491,20 @@ function isClaudePromptChrome(line: string): boolean {
   return !SOURCE_LINE_RE.test(stripped);
 }
 
+/**
+ * The Codex TUI's own chrome: the banner row (`│ >_ OpenAI Codex (v0.149.1) │`,
+ * measured on 0.149.1) or the first-boot trust prompt, which Codex draws
+ * before the banner. Both must START the row's visible text, so a shell
+ * command, a log line or prose that quotes either phrase does not count.
+ */
+function isCodexChrome(line: string): boolean {
+  const stripped = stripAnsi(line);
+  if (SOURCE_LINE_RE.test(stripped)) return false;
+  const v = visibleChrome(stripped);
+  return /^>_\s*OpenAI\s*Codex\b/.test(v)
+    || /^Do\s*you\s*trust\s*the\s*contents\s*of\s*this\s*directory\?/.test(v);
+}
+
 function isGrokChrome(line: string): boolean {
   const stripped = stripAnsi(line);
   const v = visibleChrome(stripped);
@@ -519,6 +554,11 @@ export class AgentDetector {
   private claudeBannerSeen = false;
   private claudePromptSeen = false;
   private claudePromptEvidence: { text: string; status: AgentEventStatus; message: string } | null = null;
+  // An OSC 133 prompt/command mark arrived since lastAgent took the pane: the
+  // shell is drawing its prompt again, so the owning agent has exited. Agent
+  // TUIs do not emit these mid-session (none in any replayed Claude buffer
+  // after launch), which is what lets a substring gate switch the pane.
+  private shellPromptSinceOwner = false;
 
   /**
    * Register a callback for agent status events.
@@ -575,6 +615,8 @@ export class AgentDetector {
   }
 
   feed(data: string): void {
+    // eslint-disable-next-line no-control-regex
+    if (this.lastAgent !== null && /\u001b\]133;[AD]/.test(data)) this.shellPromptSinceOwner = true;
     this.lineBuffer += data;
     if (this.lineBuffer.length > MAX_BUFFER) {
       this.lineBuffer = this.lineBuffer.slice(-MAX_BUFFER);
@@ -682,6 +724,7 @@ export class AgentDetector {
         // `bypasspermissionson` after the strip (see CLAUDE_PROMPT_RE), and
         // this prefilter runs on the stripped probe as well as the raw one.
         probe.includes('bypass permissions') || probe.includes('bypasspermissions') || probe.includes('shift+tab')
+        || probe.includes('⏸')
       );
       // #1392 — the versioned splash satisfies both signals (see
       // isClaudeSplashLine). Its own prefilter, because the banner one is
@@ -711,9 +754,12 @@ export class AgentDetector {
             // order. On a footer carrying both fragments with "shift+tab to
             // cycle" first, the two disagree and the same prompt emits two
             // 'waiting' events, because the dedup key is keyed on match text.
+            // A footer no waiting pattern reads (the manual-mode one) opens the
+            // gate without replaying a status.
             const replayText = CLAUDE_WAITING_PATTERNS
               .map((re) => stripped.match(re)?.[0])
-              .find((t): t is string => t !== undefined) ?? m[0];
+              .find((t): t is string => t !== undefined);
+            if (replayText === undefined) continue;
             this.claudePromptEvidence = {
               text: replayText,
               status: 'waiting',
@@ -729,17 +775,32 @@ export class AgentDetector {
       // already-active agent; this keeps full-screen repaint traffic O(inactive
       // agents) and makes the Kiro additions cheaper than the previous loop.
       if (!ap.gate || this.activeAgents.has(ap.agent)) continue;
+      // Opening a gate makes its agent the lastAgent, and processLine then
+      // skips every other agent's patterns for the rest of the session. The
+      // compound gates (Claude, Kiro) and Grok's chrome may take a pane at any
+      // time. Every other gate may take a pane another agent owns only after
+      // the shell prompt has come back (OSC 133), i.e. the owner exited:
+      // mid-session, an echoed command or a sentence naming an agent
+      // ("Claude/OpenClaude", "opencode-sync-render") silenced a live Claude
+      // pane's permission prompts. Codex is included — its banner row can be
+      // reproduced by a Claude reply that wraps with `>_ OpenAI Codex` at the
+      // start of a row (seen live when a Claude pane printed that line).
+      const blockedTakeover = this.lastAgent !== null && this.lastAgent !== ap.agent
+        && !this.shellPromptSinceOwner;
       const gateMatched = ap.slug === 'kiro'
         ? this.kiroChromeSeen && this.kiroPromptSeen
         : ap.slug === 'claude'
           ? this.claudeBannerSeen && this.claudePromptSeen
           : ap.slug === 'grok'
             ? candidateLines(clean).some(isGrokChrome)
-            : ap.gate.test(clean);
+            : ap.slug === 'codex'
+              ? !blockedTakeover && ap.gate.test(clean) && candidateLines(clean).some(isCodexChrome)
+              : !blockedTakeover && ap.gate.test(clean);
       if (!gateMatched) continue;
 
       this.activeAgents.add(ap.agent);
       this.lastAgent = ap.agent;
+      this.shellPromptSinceOwner = false;
       for (const cb of this.callbacks) {
         cb({ agent: ap.agent, status: 'running', message: 'Agent started' });
       }

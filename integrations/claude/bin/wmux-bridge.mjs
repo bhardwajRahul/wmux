@@ -92,6 +92,12 @@ const HOOK_TO_KIND = {
   // turn dies that way, so without it a hook-governed pane keeps the amber dot
   // its UserPromptSubmit lit until the agent process exits.
   StopFailure: 'agent.stop_failure',
+  // Claude Code's own permission dialog ("Do you want to proceed?"). Fires once
+  // per dialog, measured on 2.1.281 at +54 ms after the prompt row is drawn —
+  // so the pane reads "needs you" even when the screen detector misses the
+  // row. Exit 0 with empty stdout is "no decision": the dialog stays up and the
+  // human answers it. Nothing on this path may ever write stdout.
+  PermissionRequest: 'agent.awaiting_input',
 };
 
 // Determine the signal kind for a PostToolUse hook. AskUserQuestion completing
@@ -954,6 +960,19 @@ async function main() {
         reason: 'headless-or-outside-wmux',
         entrypoint: entrypoint ?? null,
       });
+      return;
+    }
+  }
+
+  // PermissionRequest fires under `claude -p` as well — measured on 2.1.281
+  // with entrypoint `sdk-cli` — where no dialog is shown and nobody is being
+  // waited on. A headless run nested in a pane inherits WMUX_PTY_ID, so it
+  // would mark the HOST pane "needs you". Only an interactive session can be
+  // blocked on a human.
+  if (hookName === 'PermissionRequest') {
+    const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+    if (!entrypoint || !INTERACTIVE_ENTRYPOINTS.has(entrypoint)) {
+      logEvent('permission-request-skipped', { reason: 'headless', entrypoint: entrypoint ?? null });
       return;
     }
   }
