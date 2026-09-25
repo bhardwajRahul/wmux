@@ -5,7 +5,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { DesktopPhoneBridge } from '../../phone/DesktopPhoneBridge';
+import { DesktopPhoneBridge, DesktopPhoneError } from '../../phone/DesktopPhoneBridge';
 import { RunHistoryStore } from '../../history/RunHistoryStore';
 import { InputReceiptStore } from '../InputReceiptStore';
 import { EventEmitter } from 'node:events';
@@ -472,6 +472,8 @@ describe('WebTerminalServer', () => {
   /** Whether the daemon's Live Activity pusher reports itself enabled. */
   let liveActivityPushEnabled: boolean;
   let desktopBridge: DesktopPhoneBridge | null;
+  /** Added to the server's clock: the sidebar-cache tests age snapshots with it instead of sleeping. */
+  let clockOffsetMs: number;
   let agentLaunchEnv: NodeJS.ProcessEnv | undefined;
   let settingsCalls: Array<{id:string;choice:unknown}>;
   let settingsHook: ((authorized:()=>Promise<boolean>)=>Promise<void>) | undefined;
@@ -484,6 +486,7 @@ describe('WebTerminalServer', () => {
 
   beforeEach(() => {
     desktopBridge = null;
+    clockOffsetMs = 0;
     agentLaunchEnv = undefined;
     settingsCalls = []; settingsHook = undefined;
     gateArmed = true;
@@ -542,6 +545,9 @@ describe('WebTerminalServer', () => {
       setGateEnabled: (enabled) => { gateArmed = enabled; },
       agentState: (id) => agentStates[id],
       resumeState: (id) => resumeStates[id],
+      // The first-paint wait, short so a "desktop does not answer" case costs little.
+      desktopSidebarFirstPaintMs: 150,
+      now: () => Date.now() + clockOffsetMs,
       log: () => { /* silent in tests */ },
       assetsDir: os.tmpdir(), // no terminal.html needed for the /api/* tests
     });
@@ -705,7 +711,11 @@ describe('WebTerminalServer', () => {
     expect(wire).not.toContain('sk-secret');
     expect(wire).not.toContain('ANTHROPIC_API_KEY');
     expect(wire).not.toContain('/usr/bin');
-    expect(wire).not.toContain('ws-legacy');
+    // The workspace id is an ADDRESS, carried as `workspaceId` (the same id
+    // `/api/workspaces` already serves to this bearer) — never as the label.
+    expect(sessions[1].workspaceId).toBe('ws-legacy');
+    expect(sessions[0].workspaceId).toBe('ws-1');
+    expect('workspaceId' in sessions[2]).toBe(false);
   });
 
   it('★ #1319 a pane row names the detected agent and the cwd leaf, or carries neither key', async () => {
@@ -3793,13 +3803,16 @@ describe('WebTerminalServer', () => {
     const headers = bearer(rw.token as string);
     const legacy = await (await fetch(`${base()}/api/workspaces`,{headers})).json();
     expect(legacy.workspaces[0]).toHaveProperty('panes');
-    expect(calls).toEqual([]);
+    // The live roster asks the desktop only for its optional sidebar fields; a
+    // desktop-only workspace never becomes a roster row.
+    expect(legacy.workspaces.map((w: {id:string}) => w.id)).not.toContain('empty');
+    expect(calls).toEqual(['workspaces.list']);
     const registry = await (await fetch(`${base()}/api/desktop-workspaces`,{headers})).json();
     expect(registry.workspaces).toEqual([
       {id:'ws-1',name:'Workspace 1',sessionId:'s1'},
       {id:'empty',name:'Empty workspace',sessionId:null},
     ]);
-    expect(calls).toEqual(['workspaces.list']);
+    expect(calls).toEqual(['workspaces.list','workspaces.list']);
   });
 
   it('returns a named conflict when a phone-created workspace was already closed', async () => {
@@ -7183,6 +7196,469 @@ describe('WebTerminalServer', () => {
         expect(body.workspaces.map((w) => w.id)).not.toContain('ws-brain');
       } finally {
         live.length = 3;
+      }
+    });
+  });
+
+  describe('phone Fleet sidebar fields on /api/sessions and /api/workspaces', () => {
+    const brainRow = {
+      id: 'brain-abc', cwd: '/b', cols: 80, rows: 24, state: 'attached',
+      agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+      env: { WMUX_BRAIN_PTY: '1', WMUX_WORKSPACE_ID: 'ws-brain', WMUX_WORKSPACE_NAME: 'Brain' },
+      cmd: '/usr/local/bin/claude',
+    };
+    const sidebar = (activeWorkspaceId: string | null = 'ws-1') => ({
+      activeWorkspaceId,
+      workspaces: [
+        {
+          id: 'ws-1', order: 0, pinned: true, color: 'teal', gitBranch: 'main', gitIsWorktree: false,
+          gitSync: { ahead: 2, behind: 0, hasUpstream: true },
+        },
+        { id: 'ws-legacy', order: 1, pinned: false, task: { ownerWorkspaceId: 'ws-1', detached: false, createdAt: 1_700_000_000_000, nested: true, state: { needYou: false, toReview: true, finished: true } } },
+        { id: 'ws-desktop-only', order: 2, pinned: false },
+        // Nested under ws-1 on the desktop but has no live pane: never a row, never counted.
+        { id: 'ws-unlisted-task', order: 4, pinned: false, task: { ownerWorkspaceId: 'ws-1', detached: false, nested: true, state: { needYou: true, toReview: true, finished: true } } },
+        // Nested on the desktop under an owner the phone does not list.
+        { id: 'ws-task-2', order: 5, pinned: false, task: { ownerWorkspaceId: 'ws-desktop-only', detached: false, nested: true, state: { needYou: true, toReview: false, finished: false } } },
+        { id: 'ws-brain', order: 3, pinned: true, gitBranch: 'brain-branch' },
+      ],
+      panes: [
+        { ptyId: 's1', workspaceId: 'ws-1', surfaceTitle: '✳ app review', paneName: 'w123-5' },
+        { ptyId: 'brain-abc', workspaceId: 'ws-brain', surfaceTitle: 'orchestrator title', paneName: 'w9-1' },
+        { ptyId: 'ghost', workspaceId: 'ws-1', surfaceTitle: 'ghost title', paneName: 'w1-9' },
+      ],
+    });
+    /** A desktop that answers `workspaces.list` with `reply`, counting calls. */
+    const attachDesktop = (reply: () => unknown, opts: { answer?: boolean; timeoutMs?: number } = {}) => {
+      const calls: string[] = [];
+      desktopBridge = new DesktopPhoneBridge((_owner, raw) => {
+        const data = (raw as { data: { requestId: string; command: string } }).data;
+        calls.push(data.command);
+        if (opts.answer !== false) {
+          const result = reply();
+          if (result instanceof Error) desktopBridge!.complete('main', { requestId: data.requestId, ok: false, error: result.message });
+          else desktopBridge!.complete('main', { requestId: data.requestId, ok: true, result });
+        }
+        return true;
+      }, opts.timeoutMs);
+      desktopBridge.register('main');
+      return calls;
+    };
+    const getJson = async (token: string, route: string) => {
+      const res = await fetch(`${base()}${route}`, { headers: bearer(token) });
+      expect(res.status).toBe(200);
+      return res.json() as Promise<Record<string, unknown>>;
+    };
+    type Row = Record<string, unknown>;
+
+    it('merges the desktop fields by id, never adding rows and never leaking a brain entry', async () => {
+      live.push({ ...brainRow }, {
+        id: 's-task-2', cwd: '/t2', cols: 80, rows: 24, state: 'detached',
+        agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+        env: { WMUX_WORKSPACE_ID: 'ws-task-2', WMUX_WORKSPACE_NAME: 'wtask: two' }, cmd: '/bin/zsh',
+      });
+      try {
+        const calls = attachDesktop(() => ({ workspaces: [], sidebar: sidebar() }));
+        const info = await startRO();
+        const token = info.token as string;
+        // Three concurrent polls across both routes share ONE desktop fetch.
+        const [sessionsBody, workspacesBody] = await Promise.all([
+          getJson(token, '/api/sessions'),
+          getJson(token, '/api/workspaces'),
+          getJson(token, '/api/sessions'),
+        ]);
+        expect(calls).toEqual(['workspaces.list']);
+
+        const sessions = sessionsBody.sessions as Row[];
+        expect(sessions.map((r) => r.id)).toEqual(['s1', 's2', 's3', 's-task-2']);
+        expect(sessions[0]).toMatchObject({ id: 's1', workspaceId: 'ws-1', surfaceTitle: '✳ app review', paneName: 'w123-5' });
+        expect(sessions[1]).toMatchObject({ id: 's2', workspaceId: 'ws-legacy' });
+        for (const key of ['surfaceTitle', 'paneName']) {
+          expect(key in sessions[1]).toBe(false);
+          expect(key in sessions[2]).toBe(false);
+        }
+
+        const workspaces = workspacesBody.workspaces as Row[];
+        expect(workspaces.map((w) => w.id)).toEqual(['ws-1', 'ws-task-2', 'ws-legacy']);
+        expect(workspaces[0]).toMatchObject({
+          id: 'ws-1', name: 'Workspace 1', order: 0, pinned: true, color: 'teal', gitBranch: 'main', gitIsWorktree: false,
+          gitSync: { ahead: 2, behind: 0, hasUpstream: true },
+          taskSummary: { tasks: 1, needYou: 0, toReview: 1, finished: 1 },
+        });
+        expect(workspaces[0]).not.toHaveProperty('ownerWorkspaceId');
+        const legacy = workspaces.find((w) => w.id === 'ws-legacy')!;
+        expect(legacy).toMatchObject({ order: 1, pinned: false, ownerWorkspaceId: 'ws-1', detached: false, createdAt: 1_700_000_000_000, nested: true });
+        expect(legacy).not.toHaveProperty('task');
+        expect(legacy).not.toHaveProperty('state');
+        // The desktop nests ws-task-2 under a workspace the phone does not list:
+        // on the phone it is not nested, and nobody's summary counts it.
+        const task2 = workspaces.find((w) => w.id === 'ws-task-2')!;
+        expect(task2).toMatchObject({ ownerWorkspaceId: 'ws-desktop-only', nested: false });
+        expect(workspaces.filter((w) => 'taskSummary' in w).map((w) => w.id)).toEqual(['ws-1']);
+        expect(workspacesBody.activeWorkspaceId).toBe('ws-1');
+
+        const wire = JSON.stringify([sessionsBody, workspacesBody]);
+        expect(JSON.stringify(workspacesBody)).not.toContain('"state"');
+        for (const leaked of ['brain-abc', 'ws-brain', 'orchestrator title', 'brain-branch', 'ghost', 'ws-unlisted-task']) {
+          expect(wire).not.toContain(leaked);
+        }
+        expect((workspacesBody.workspaces as Row[]).map((w) => w.id)).not.toContain('ws-desktop-only');
+      } finally {
+        live.length = 3;
+      }
+    });
+
+    it('omits activeWorkspaceId when the active workspace is not a listed one', async () => {
+      live.push({ ...brainRow });
+      try {
+        attachDesktop(() => ({ workspaces: [], sidebar: sidebar('ws-brain') }));
+        const info = await startRO();
+        const body = await getJson(info.token as string, '/api/workspaces');
+        expect('activeWorkspaceId' in body).toBe(false);
+        expect(JSON.stringify(body)).not.toContain('ws-brain');
+      } finally {
+        live.length = 3;
+      }
+    });
+
+    it('omits every desktop key without a desktop, keeping the daemon-side workspaceId', async () => {
+      desktopBridge = null;
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(sessions[0].workspaceId).toBe('ws-1');
+      expect(sessions.some((r) => 'surfaceTitle' in r || 'paneName' in r)).toBe(false);
+      const body = await getJson(info.token as string, '/api/workspaces');
+      expect('activeWorkspaceId' in body).toBe(false);
+      for (const w of body.workspaces as Row[]) expect(Object.keys(w).sort()).toEqual(['id', 'name', 'panes']);
+    });
+
+    /**
+     * A desktop whose every `workspaces.list` the test answers by hand, in
+     * order: `answer(i, value)` resolves request i, `fail(i, tag)` rejects it
+     * with a bridge error. While `autoReply` is set, a request is answered
+     * with it on arrival instead. `available` can be flipped to model a
+     * disconnect.
+     */
+    const manualDesktop = () => {
+      const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
+      const stub = {
+        available: true,
+        autoReply: undefined as unknown,
+        request: vi.fn((_command: string) => new Promise<unknown>((resolve, reject) => {
+          pending.push({ resolve, reject });
+          if (stub.autoReply !== undefined) resolve(stub.autoReply);
+        })),
+      };
+      desktopBridge = stub as unknown as DesktopPhoneBridge;
+      return {
+        stub,
+        answer: (i: number, value: unknown) => pending[i].resolve(value),
+        fail: (i: number, tag: string) => pending[i].reject(new DesktopPhoneError(tag)),
+      };
+    };
+    /** Let a settled desktop answer run its handlers (they are promise callbacks). */
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const snapshotTitled = (title: string) => ({ workspaces: [], sidebar: {
+      activeWorkspaceId: 'ws-1',
+      workspaces: [{ id: 'ws-1', order: 0, pinned: false }],
+      panes: [{ ptyId: 's1', workspaceId: 'ws-1', surfaceTitle: title, paneName: 'w1-1' }],
+    } });
+    const titleOf = async (token: string) => {
+      const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+      return sessions.find((r) => r.id === 's1')?.surfaceTitle;
+    };
+
+    it('serves the current snapshot at once and refreshes it once in the background', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      // First paint: a healthy desktop's first answer is in the first reply.
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      expect(desktop.stub.request).toHaveBeenCalledTimes(1);
+      // Fresh: no new request.
+      clockOffsetMs += 500;
+      expect(await titleOf(token)).toBe('A');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(1);
+      // Stale: answered from the snapshot immediately while ONE refresh runs.
+      clockOffsetMs += 1000;
+      expect(await titleOf(token)).toBe('A');
+      expect(await titleOf(token)).toBe('A');
+      expect((await getJson(token, '/api/workspaces')).activeWorkspaceId).toBe('ws-1');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      desktop.answer(1, snapshotTitled('B'));
+      await flush();
+      expect(await titleOf(token)).toBe('B');
+    });
+
+    it('never waits on a slow desktop past the shared first-paint deadline, and asks it once', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      // The first poll waits out the (short, injected) first-paint window.
+      expect(await titleOf(token)).toBeUndefined();
+      // Past the deadline every poll answers at once, without the fields, and
+      // the single in-flight request is not duplicated.
+      clockOffsetMs += 5000;
+      expect(await titleOf(token)).toBeUndefined();
+      const body = await getJson(token, '/api/workspaces');
+      for (const w of body.workspaces as Row[]) expect(w).not.toHaveProperty('order');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(1);
+      // When it finally answers, the next poll has the fields.
+      desktop.answer(0, snapshotTitled('late'));
+      await flush();
+      expect(await titleOf(token)).toBe('late');
+    });
+
+    it('keeps a good snapshot through transient failures for a bounded time, then omits it', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      // Refresh hits a full bridge: the snapshot keeps serving.
+      clockOffsetMs += 1500;
+      expect(await titleOf(token)).toBe('A');
+      desktop.fail(1, 'desktop-busy');
+      await flush();
+      expect(await titleOf(token)).toBe('A');
+      // Retried after the back-off, times out: still served, still bounded.
+      clockOffsetMs += 2500;
+      expect(await titleOf(token)).toBe('A');
+      expect(desktop.stub.request).toHaveBeenCalledTimes(3);
+      desktop.fail(2, 'desktop-timeout');
+      await flush();
+      expect(await titleOf(token)).toBe('A');
+      // Past the staleness bound (10 s after the snapshot) the fields go.
+      clockOffsetMs = 10_500;
+      expect(await titleOf(token)).toBeUndefined();
+    });
+
+    it('drops the fields at once when the desktop is gone', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      // The refresh learns the desktop disconnected: no stale serving.
+      clockOffsetMs += 1500;
+      expect(await titleOf(token)).toBe('A');
+      desktop.fail(1, 'desktop-disconnected');
+      await flush();
+      expect(await titleOf(token)).toBeUndefined();
+      // And a bridge that reports no desktop drops them without asking.
+      desktop.stub.available = false;
+      clockOffsetMs += 5000;
+      expect(await titleOf(token)).toBeUndefined();
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+    });
+
+    // Captured from a live fan-out (owner + "finish quickly" + "ask the user"):
+    // the renderer's projection, verbatim, as it crossed into the daemon.
+    const OWNER = 'ws-phone-e9b00e1b-60c6-46e4-9ae8-9b54e0b2cd77';
+    const TASK_DONE = 'ws-208c08e3-96bb-4b07-a9b4-e5bdad9728b6';
+    const TASK_ASK = 'ws-706df135-6033-47b7-bd3e-d0de474ea35a';
+    const PLAIN = 'ws-edaf3c5f-4aa1-420c-8c7c-12f4f7fdf5a4';
+    const liveFanoutSnapshot = {
+      activeWorkspaceId: OWNER,
+      workspaces: [
+        { id: PLAIN, order: 0, pinned: false, gitIsWorktree: false },
+        { id: OWNER, order: 1, pinned: false, gitBranch: 'main', gitIsWorktree: false, gitSync: { ahead: 0, behind: 0, hasUpstream: false } },
+        {
+          id: TASK_DONE, order: 2, pinned: false, gitBranch: 'wtask/finish-quickly-63gs0w4a', gitIsWorktree: true,
+          gitSync: { ahead: 0, behind: 0, hasUpstream: false },
+          task: { ownerWorkspaceId: OWNER, detached: false, createdAt: 1790368163922, nested: true, state: { needYou: false, toReview: true, finished: true } },
+        },
+        {
+          id: TASK_ASK, order: 3, pinned: false, gitBranch: 'wtask/ask-the-user-n9znqi5b', gitIsWorktree: true,
+          gitSync: { ahead: 0, behind: 0, hasUpstream: false },
+          task: { ownerWorkspaceId: OWNER, detached: false, createdAt: 1790368170163, nested: true, state: { needYou: true, toReview: false, finished: false } },
+        },
+      ],
+      panes: [
+        { ptyId: 'daemon-0567273e', workspaceId: PLAIN, surfaceTitle: 'Zsh', paneName: 'w1-1' },
+        { ptyId: 'daemon-41e038ce', workspaceId: OWNER, surfaceTitle: 'Zsh', paneName: 'w2-1' },
+        { ptyId: 'daemon-5b9aa7c3', workspaceId: TASK_DONE, surfaceTitle: '✳ Wmux task protocol and ledger', paneName: 'w3-1' },
+        { ptyId: 'daemon-4b1edf50', workspaceId: TASK_ASK, surfaceTitle: '✳ Tabs or spaces preference', paneName: 'w4-1' },
+      ],
+    };
+    const liveFanoutSessions = () => [
+      ['daemon-0567273e', PLAIN, 'Workspace 1'],
+      ['daemon-41e038ce', OWNER, 'fleet owner'],
+      ['daemon-5b9aa7c3', TASK_DONE, 'wtask: finish quickly'],
+      ['daemon-4b1edf50', TASK_ASK, 'wtask: ask the user'],
+    ].map(([id, ws, name]) => ({
+      id, cwd: '/repo', cols: 80, rows: 24, state: 'attached',
+      agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+      env: { WMUX_WORKSPACE_ID: ws, WMUX_WORKSPACE_NAME: name }, cmd: '/bin/zsh',
+    }));
+
+    it('still serves the fields on the first poll after a quiet spell (live fan-out data)', async () => {
+      // Regression: a snapshot older than the staleness bound because NOBODY
+      // polled (not because the desktop failed) was dropped, so any client
+      // polling less often than every 10 s saw no sidebar fields at all.
+      const fixture = live.splice(0, live.length, ...liveFanoutSessions());
+      try {
+        const calls = attachDesktop(() => ({ workspaces: [], sidebar: liveFanoutSnapshot }));
+        const info = await startRO();
+        const token = info.token as string;
+        const check = async () => {
+          const body = await getJson(token, '/api/workspaces');
+          expect(body.activeWorkspaceId).toBe(OWNER);
+          const rows = new Map((body.workspaces as Row[]).map((w) => [w.id as string, w]));
+          expect(rows.get(OWNER)).toMatchObject({ order: 1, gitBranch: 'main', taskSummary: { tasks: 2, needYou: 1, toReview: 1, finished: 1 } });
+          for (const id of [TASK_DONE, TASK_ASK]) expect(rows.get(id)).toMatchObject({ ownerWorkspaceId: OWNER, detached: false, nested: true });
+          expect(rows.get(PLAIN)).toMatchObject({ order: 0, gitIsWorktree: false });
+          const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+          expect(sessions.find((r) => r.id === 'daemon-4b1edf50')).toMatchObject({ surfaceTitle: '✳ Tabs or spaces preference', paneName: 'w4-1' });
+        };
+        await check();
+        // Twelve quiet seconds, then a single poll.
+        clockOffsetMs += 12_000;
+        await check();
+        expect(calls).toEqual(['workspaces.list', 'workspaces.list']);
+      } finally {
+        live.splice(0, live.length, ...fixture);
+      }
+    });
+
+    it('keeps every other field when one live task row is malformed, and logs the reason once', async () => {
+      const logs: string[] = [];
+      const fixture = live.splice(0, live.length, ...liveFanoutSessions());
+      const logged = new WebTerminalServer({
+        sessionManager,
+        desktop: () => desktopBridge,
+        desktopSidebarFirstPaintMs: 150,
+        now: () => Date.now() + clockOffsetMs,
+        log: (level, msg) => { if (level === 'warn') logs.push(msg); },
+        assetsDir: os.tmpdir(),
+      } as ConstructorParameters<typeof WebTerminalServer>[0]);
+      try {
+        const broken = JSON.parse(JSON.stringify(liveFanoutSnapshot));
+        broken.workspaces[3].task.ownerWorkspaceId = { SECRET: 'value' };
+        attachDesktop(() => ({ workspaces: [], sidebar: broken }));
+        const info = await logged.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false });
+        const get = async (route: string) => (await fetch(`http://127.0.0.1:${info.port}${route}`, { headers: bearer(info.token as string) })).json() as Promise<Record<string, unknown>>;
+        for (let i = 0; i < 3; i++) {
+          const body = await get('/api/workspaces');
+          const rows = new Map((body.workspaces as Row[]).map((w) => [w.id as string, w]));
+          expect(body.activeWorkspaceId).toBe(OWNER);
+          expect(rows.get(TASK_ASK)).toMatchObject({ order: 3, gitBranch: 'wtask/ask-the-user-n9znqi5b' });
+          expect(rows.get(TASK_ASK)).not.toHaveProperty('ownerWorkspaceId');
+          expect(rows.get(TASK_DONE)).toMatchObject({ ownerWorkspaceId: OWNER, nested: true });
+          expect(rows.get(OWNER)).toMatchObject({ taskSummary: { tasks: 1, needYou: 0, toReview: 1, finished: 1 } });
+          clockOffsetMs += 1500; // each poll after the first refreshes again
+        }
+        expect(logs.filter((m) => m.includes('sidebar'))).toEqual(['[web] desktop sidebar fields left out: workspace.task×1']);
+      } finally {
+        await logged.stop();
+        live.splice(0, live.length, ...fixture);
+      }
+    });
+
+    it('answers at once without the fields when a quiet spell meets a hung desktop', async () => {
+      const desktop = manualDesktop();
+      const info = await startRO();
+      const token = info.token as string;
+      desktop.stub.autoReply = snapshotTitled('A');
+      expect(await titleOf(token)).toBe('A');
+      desktop.stub.autoReply = undefined;
+      clockOffsetMs += 12_000;
+      // One bounded wait on the refresh it started, then no more waiting and no duplicate request.
+      expect(await titleOf(token)).toBeUndefined();
+      clockOffsetMs += 1000;
+      expect(await titleOf(token)).toBeUndefined();
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      desktop.answer(1, snapshotTitled('B'));
+      await flush();
+      expect(await titleOf(token)).toBe('B');
+    });
+
+    it('ignores a refresh that lands after the server restarted', async () => {
+      const desktop = manualDesktop();
+      let info = await startRO();
+      expect(await titleOf(info.token as string)).toBeUndefined(); // request 0 still pending
+      await server.stop();
+      info = await startRO();
+      const token = info.token as string;
+      expect(await titleOf(token)).toBeUndefined(); // request 1, under the new generation
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      // The pre-restart answer lands: it must neither fill the cache nor free
+      // the new generation's in-flight slot.
+      desktop.answer(0, snapshotTitled('OLD'));
+      await flush();
+      clockOffsetMs += 5000;
+      expect(await titleOf(token)).toBeUndefined();
+      expect(desktop.stub.request).toHaveBeenCalledTimes(2);
+      desktop.answer(1, snapshotTitled('NEW'));
+      await flush();
+      expect(await titleOf(token)).toBe('NEW');
+    });
+
+    it('omits the fields when the desktop request fails', async () => {
+      const calls = attachDesktop(() => new Error('renderer unavailable'));
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(calls).toEqual(['workspaces.list']);
+      expect(sessions.some((r) => 'surfaceTitle' in r || 'paneName' in r)).toBe(false);
+      expect(sessions[0].workspaceId).toBe('ws-1');
+    });
+
+    it('omits the fields for a desktop that predates them (no sidebar key)', async () => {
+      const calls = attachDesktop(() => ({ workspaces: [{ id: 'ws-1', name: 'Workspace 1', sessionId: 's1' }] }));
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(calls).toEqual(['workspaces.list']);
+      expect(sessions.some((r) => 'surfaceTitle' in r || 'paneName' in r)).toBe(false);
+      const body = await getJson(info.token as string, '/api/workspaces');
+      for (const w of body.workspaces as Row[]) expect(Object.keys(w).sort()).toEqual(['id', 'name', 'panes']);
+    });
+
+    it('drops malformed desktop fields at the daemon boundary', async () => {
+      attachDesktop(() => ({ workspaces: [], sidebar: {
+        activeWorkspaceId: 'ws-1',
+        workspaces: [{ id: 'ws-1', order: 0, pinned: false, color: 'javascript:alert(1)', gitBranch: 'a\u0000b', extra: 'secret-extra' }],
+        panes: [{ ptyId: 's1', workspaceId: 'ws-1', surfaceTitle: 'x'.repeat(500), paneName: 'w1-1', cwd: '/secret-cwd' }],
+      } }));
+      const info = await startRO();
+      const sessions = (await getJson(info.token as string, '/api/sessions')).sessions as Row[];
+      expect(sessions[0]).toMatchObject({ paneName: 'w1-1' });
+      expect('surfaceTitle' in sessions[0]).toBe(false);
+      const body = await getJson(info.token as string, '/api/workspaces');
+      const ws1 = (body.workspaces as Row[]).find((w) => w.id === 'ws-1')!;
+      expect(ws1).toMatchObject({ order: 0, pinned: false });
+      expect(ws1).not.toHaveProperty('color');
+      expect(ws1).not.toHaveProperty('gitBranch');
+      expect(JSON.stringify(body)).not.toMatch(/secret-extra|secret-cwd/);
+    });
+
+    it('advertises fleetSidebar when a desktop bridge is wired, attached or not', async () => {
+      // Wired, nothing attached (the getter returns no bridge right now).
+      desktopBridge = null;
+      let info = await startRO();
+      expect((await getJson(info.token as string, '/api/config')).fleetSidebar).toBe(true);
+      await server.stop();
+      attachDesktop(() => ({ workspaces: [], sidebar: sidebar() }));
+      info = await startRO();
+      expect((await getJson(info.token as string, '/api/config')).fleetSidebar).toBe(true);
+    });
+
+    it('omits fleetSidebar from a daemon with no desktop bridge wired', async () => {
+      const bare = new WebTerminalServer({
+        sessionManager,
+        log: () => { /* silent in tests */ },
+        assetsDir: os.tmpdir(),
+      } as ConstructorParameters<typeof WebTerminalServer>[0]);
+      const info = await bare.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false });
+      try {
+        const res = await fetch(`http://127.0.0.1:${info.port}/api/config`, { headers: bearer(info.token as string) });
+        expect(res.status).toBe(200);
+        expect('fleetSidebar' in ((await res.json()) as Record<string, unknown>)).toBe(false);
+      } finally {
+        await bare.stop();
       }
     });
   });

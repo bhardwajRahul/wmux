@@ -10,6 +10,7 @@ import { sessionFiles, searchSessionFiles, SessionFileError } from './sessionFil
 import http from 'node:http';
 import type { AgentStatus } from '../../shared/types';
 import { isRemoteAgentStatus } from '../../shared/remoteHosts';
+import { createSidebarDropLog, parsePhoneSidebarSnapshot, phoneTaskNesting, type PhoneSidebarSnapshot, type PhoneSidebarTaskSummary, type PhoneSidebarWorkspace } from '../../shared/phoneFleetSidebar';
 import https from 'node:https';
 import crypto from 'node:crypto';
 import os from 'node:os';
@@ -519,6 +520,12 @@ interface WebTerminalServerDeps {
    */
   now?: () => number;
   /**
+   * How long the FIRST `/api/sessions` / `/api/workspaces` poll with no
+   * sidebar snapshot yet may wait for the desktop's first answer. Test seam;
+   * defaults to DESKTOP_SIDEBAR_FIRST_PAINT_MS.
+   */
+  desktopSidebarFirstPaintMs?: number;
+  /**
    * The daemon's transcript projector — the phone turn-view contract (#782).
    * Optional like `approvals`: a daemon/test that has not wired one still serves
    * every other route, and `/api/sessions/:id/turns` answers 503 rather than
@@ -707,6 +714,27 @@ const LIVENESS_SNAPSHOT_STALE_MS = 300_000;
  * next poll — the field is a summary, and arriving a second late costs nothing.
  */
 const MAX_LAST_ASSISTANT_READS_PER_POLL = 8;
+/**
+ * The desktop sidebar fields on `/api/sessions` and `/api/workspaces`, served
+ * stale-while-revalidate. Both routes are polled by every paired device (and
+ * `/api/workspaces` by attached remote desktops), so a poll never waits on the
+ * desktop once a snapshot exists:
+ *   - TTL: a snapshot older than this starts ONE background refresh;
+ *   - MAX_STALE: a good snapshot is served up to this age while refreshes
+ *     fail transiently (bridge busy, timeout, a failed request) — past it the
+ *     fields are omitted. A desktop that is gone drops them at once;
+ *   - RETRY: after a failed refresh, how long before the next attempt, so a
+ *     failing desktop is not asked on every poll;
+ *   - FIRST_PAINT: with no servable snapshot (none yet, or one past MAX_STALE
+ *     because nobody polled for a while), polls may wait this long after the
+ *     refresh STARTED (a deadline shared by every such poll, not a wait each),
+ *     so a phone opening or returning to the Fleet paints with the fields when
+ *     the desktop is healthy; a slow desktop costs this once, not per poll.
+ */
+const DESKTOP_SIDEBAR_TTL_MS = 1000;
+const DESKTOP_SIDEBAR_MAX_STALE_MS = 10_000;
+const DESKTOP_SIDEBAR_RETRY_MS = 2000;
+const DESKTOP_SIDEBAR_FIRST_PAINT_MS = 250;
 /** A decision body is two fields; anything larger is not one of ours. */
 const MAX_JSON_BODY_BYTES = 8 * 1024;
 /**
@@ -1081,6 +1109,19 @@ export class WebTerminalServer {
   private phoneGitRequests = 0;
   private readonly agentSettingsRequests = new Set<string>();
   private readonly pendingLiveness = new Map<string, AgentLivenessBody>();
+  /** Last GOOD desktop sidebar snapshot and when it was taken. */
+  private desktopSidebarCache: { at: number; value: PhoneSidebarSnapshot } | null = null;
+  /** The one background refresh in flight, and when it started. */
+  private desktopSidebarInFlight: { promise: Promise<void>; startedAt: number } | null = null;
+  /** When the last refresh failed (0 = not since the last success). */
+  private desktopSidebarFailedAt = 0;
+  /**
+   * Bumped by stop(). A refresh started under an older generation may still
+   * land after a restart; it must touch neither the cache nor the slot.
+   */
+  private desktopSidebarGeneration = 0;
+  /** The last sidebar drop summary logged (see warnDesktopSidebar). */
+  private desktopSidebarLastWarning = '';
   /**
    * Last liveness state seen per pane, for the `/api/sessions` snapshot.
    *
@@ -1519,6 +1560,13 @@ export class WebTerminalServer {
     for (const timer of this.chatBlockedTimers.values()) clearTimeout(timer);
     this.chatBlockedTimers.clear();
     this.chatBlockedState.clear();
+    // A restarted server asks the desktop afresh rather than serving a
+    // snapshot (or a remembered miss) from before the stop, and a refresh
+    // still in flight from before it lands in a dead generation.
+    this.desktopSidebarGeneration += 1;
+    this.desktopSidebarCache = null;
+    this.desktopSidebarInFlight = null;
+    this.desktopSidebarFailedAt = 0;
 
     const server = this.server;
     this.server = null;
@@ -2055,13 +2103,19 @@ export class WebTerminalServer {
         ...(this.deps.gateEnabled
           ? { gateEnabled: this.deps.gateEnabled() && this.canResolveGates }
           : {}),
+        // This daemon merges the desktop sidebar's fields into
+        // `/api/sessions` and `/api/workspaces` whenever the desktop answers.
+        // It says the daemon SUPPORTS them — a desktop bridge is wired — not
+        // that they are present now: each field is omitted while the desktop
+        // is away. Omitted without a bridge, and by an older daemon.
+        ...(this.deps.desktop ? { fleetSidebar: true } : {}),
         protocolVersion: PHONE_PROTOCOL_VERSION,
         minProtocolVersion: MIN_PHONE_PROTOCOL_VERSION,
         serverVersion: daemonServerVersion(),
       });
     }
     if (req.method === 'GET' && p === '/api/sessions') {
-      return this.json(res, 200, { sessions: this.listSessions() });
+      return this.handleSessionsList(res);
     }
     if (req.method === 'GET' && p === '/api/history') {
       if (this.opts?.allowTranscript !== true) return this.json(res, 403, {error:'history-disabled'});
@@ -2247,6 +2301,12 @@ export class WebTerminalServer {
     agent: string | null;
     lastActivity: string;
     workspace?: string;
+    /**
+     * The pane's workspace id — the `WMUX_WORKSPACE_ID` main stamps at spawn,
+     * the same provenance `/api/workspaces` groups by. Daemon-side, so it is
+     * present with or without the desktop.
+     */
+    workspaceId?: string;
     /** Short program name (`pwsh`, `bash`) — what to call a pane with no agent. */
     shell?: string;
     /**
@@ -2338,6 +2398,7 @@ export class WebTerminalServer {
         ...(s.lastDetectedAgent ? { lastDetectedAgent: s.lastDetectedAgent } : {}),
         ...cwdLeafOf(s.cwd),
         ...workspaceLabelOf(s.env),
+        ...workspaceIdOf(s.env),
         ...shellLabelOf(s.cmd),
         ...this.livenessSummary(s.id),
         ...this.lastAssistantSummary(s.id, reads),
@@ -2467,11 +2528,15 @@ export class WebTerminalServer {
    * Same provenance as `rejectWorkspaceId` (main force-stamps
    * `WMUX_WORKSPACE_ID` at spawn; the daemon persists the resolved env), so a
    * workspace exists here iff at least one live pane runs in it. The uuid id
-   * IS surfaced — unlike the label-only `/api/sessions` field — because
-   * attach needs an address, and this route sits behind the same bearer auth
-   * that already exposes full scrollback.
+   * IS surfaced (and `/api/sessions` carries it as `workspaceId`, never as
+   * the `workspace` label) because attach needs an address, and this route
+   * sits behind the same bearer auth that already exposes full scrollback.
+   *
+   * While the desktop is attached, each row also carries the sidebar's own
+   * fields (see `desktopSidebar`), merged onto rows this list already holds.
    */
-  private handleWorkspacesList(res: http.ServerResponse): void {
+  private async handleWorkspacesList(res: http.ServerResponse): Promise<void> {
+    const sidebar = await this.desktopSidebar();
     const byId = new Map<string, { id: string; name: string; panes: RemotePaneSummary[] }>();
     for (const s of this.deps.sessionManager.listLiveSessions()) {
       // Same exclusion as /api/sessions: the orchestrator brain pane must be
@@ -2538,7 +2603,137 @@ export class WebTerminalServer {
         if (aUnnamed !== bUnnamed) return aUnnamed ? 1 : -1;
         return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
       });
-    return this.json(res, 200, { workspaces });
+    if (!sidebar) return this.json(res, 200, { workspaces });
+    // Merged onto the daemon's own rows only: a workspace still exists here iff
+    // a live, non-brain pane runs in it, and the desktop cannot add one.
+    const fields = new Map(sidebar.workspaces.map((w) => [w.id, w]));
+    const nesting = phoneTaskNesting(sidebar.workspaces, new Set(byId.keys()));
+    const merged = workspaces.map((w) => {
+      const extra = fields.get(w.id);
+      return extra ? { ...w, ...sidebarWorkspaceFields(extra, nesting.nested.get(w.id), nesting.summaries.get(w.id)) } : w;
+    });
+    // Only an id this reply lists, so the active workspace cannot name one the
+    // phone is not allowed to see (a brain-only workspace, for one).
+    const active = sidebar.activeWorkspaceId;
+    return this.json(res, 200, {
+      workspaces: merged,
+      ...(active && byId.has(active) ? { activeWorkspaceId: active } : {}),
+    });
+  }
+
+  /**
+   * `GET /api/sessions` — the pane list, with the desktop sidebar's per-pane
+   * labels merged by ptyId when the desktop answers in time. Brain panes are
+   * already gone from `listSessions`, and nothing is added for a ptyId the
+   * list does not hold.
+   */
+  private async handleSessionsList(res: http.ServerResponse): Promise<void> {
+    const sidebar = await this.desktopSidebar();
+    const sessions = this.listSessions();
+    if (!sidebar) return this.json(res, 200, { sessions });
+    const labels = new Map(sidebar.panes.map((p) => [p.ptyId, p]));
+    return this.json(res, 200, {
+      sessions: sessions.map((s) => {
+        const pane = labels.get(s.id);
+        if (!pane) return s;
+        return {
+          ...s,
+          ...(pane.surfaceTitle !== undefined ? { surfaceTitle: pane.surfaceTitle } : {}),
+          ...(pane.paneName !== undefined ? { paneName: pane.paneName } : {}),
+        };
+      }),
+    });
+  }
+
+  /**
+   * The desktop sidebar snapshot for the two polled list routes, or null.
+   * Stale-while-revalidate (see DESKTOP_SIDEBAR_TTL_MS): answers from the
+   * current snapshot at once and refreshes it in the background; only a poll
+   * with no snapshot at all may wait, and only until the shared first-paint
+   * deadline. Never rejects: a list route must not fail because the desktop did.
+   */
+  private async desktopSidebar(): Promise<PhoneSidebarSnapshot | null> {
+    const desktop = this.availableDesktop();
+    if (!desktop) {
+      // Gone, not slow: its fields go with it.
+      this.desktopSidebarCache = null;
+      return null;
+    }
+    const now = this.now();
+    const cached = this.desktopSidebarCache;
+    if ((!cached || now - cached.at >= DESKTOP_SIDEBAR_TTL_MS) && now - this.desktopSidebarFailedAt >= DESKTOP_SIDEBAR_RETRY_MS) {
+      this.refreshDesktopSidebar(desktop);
+    }
+    if (cached && now - cached.at <= DESKTOP_SIDEBAR_MAX_STALE_MS) return cached.value;
+    // No servable snapshot: none yet, or one too old to serve as-is. "Too old"
+    // is usually NOT a failing desktop — it is a quiet spell with nobody
+    // polling, so nothing refreshed it (a phone in the background, a client
+    // polling every 15 s). That case must paint like a first poll: the refresh
+    // just started above, so wait for it until the shared first-paint
+    // deadline. A desktop that is actually failing is in back-off with no
+    // refresh running, and answers at once without the fields.
+    const inFlight = this.desktopSidebarInFlight;
+    if (!inFlight) return null;
+    const firstPaintMs = this.deps.desktopSidebarFirstPaintMs ?? DESKTOP_SIDEBAR_FIRST_PAINT_MS;
+    const remaining = inFlight.startedAt + firstPaintMs - now;
+    if (remaining <= 0) return null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([inFlight.promise, new Promise<void>((resolve) => { timer = setTimeout(resolve, remaining); })]);
+    clearTimeout(timer);
+    const fresh = this.desktopSidebarCache;
+    return fresh && this.now() - fresh.at <= DESKTOP_SIDEBAR_MAX_STALE_MS ? fresh.value : null;
+  }
+
+  /**
+   * Log what the sidebar parse dropped — reason tags only, never values —
+   * when the set of reasons changes, not on every refresh (one a second while
+   * a phone polls).
+   */
+  private warnDesktopSidebar(summary: string): void {
+    if (summary === this.desktopSidebarLastWarning) return;
+    this.desktopSidebarLastWarning = summary;
+    if (summary) this.deps.log('warn', `[web] desktop sidebar fields left out: ${summary}`);
+  }
+
+  /** Start the single background refresh, unless one is already running. */
+  private refreshDesktopSidebar(desktop: DesktopPhoneBridge): void {
+    if (this.desktopSidebarInFlight) return;
+    const generation = this.desktopSidebarGeneration;
+    const entry: { promise: Promise<void>; startedAt: number } = { promise: Promise.resolve(), startedAt: this.now() };
+    entry.promise = desktop.request('workspaces.list', {})
+      .then(
+        (reply) => {
+          if (generation !== this.desktopSidebarGeneration) return;
+          const raw = (reply as { sidebar?: unknown } | null)?.sidebar;
+          const drops = createSidebarDropLog();
+          const value = parsePhoneSidebarSnapshot(raw, drops.report);
+          if (!value && raw !== undefined) drops.report('sidebar.notSnapshot');
+          this.warnDesktopSidebar(drops.summary());
+          if (value) {
+            this.desktopSidebarCache = { at: this.now(), value };
+            this.desktopSidebarFailedAt = 0;
+          } else {
+            // The desktop answered and has no sidebar to give (an older build,
+            // or a renderer still starting): nothing to keep serving.
+            this.desktopSidebarCache = null;
+            this.desktopSidebarFailedAt = this.now();
+          }
+        },
+        (error: unknown) => {
+          if (generation !== this.desktopSidebarGeneration) return;
+          this.desktopSidebarFailedAt = this.now();
+          // A desktop that is gone drops its fields now. Anything else — the
+          // bridge's slots full, a timeout, a failed renderer call — is
+          // transient: the last good snapshot keeps serving until MAX_STALE.
+          if (error instanceof DesktopPhoneError && (error.tag === 'desktop-unavailable' || error.tag === 'desktop-disconnected')) {
+            this.desktopSidebarCache = null;
+          }
+        },
+      )
+      .finally(() => {
+        if (this.desktopSidebarInFlight === entry) this.desktopSidebarInFlight = null;
+      });
+    this.desktopSidebarInFlight = entry;
   }
 
   // --- pane diff (read-only git) -------------------------------------------
@@ -6443,6 +6638,44 @@ function sameCaller(original: WebPrincipal, now: WebPrincipal): boolean {
   return now.kind === 'operator'
     ? original.kind === 'operator'
     : original.kind === 'device' && now.deviceId === original.deviceId;
+}
+
+/**
+ * A sidebar workspace row as `/api/workspaces` carries it: the task link is
+ * flattened onto the row (`ownerWorkspaceId`, `detached`, `createdAt`,
+ * `nested`), present only on a fan-out task workspace; `taskSummary` only on
+ * an owner row with nested tasks. `nested` and the summary are the phone-list
+ * view from `phoneTaskNesting`; the per-task state bits stay internal.
+ */
+function sidebarWorkspaceFields(
+  row: PhoneSidebarWorkspace,
+  nested: boolean | undefined,
+  taskSummary: PhoneSidebarTaskSummary | undefined,
+): Record<string, unknown> {
+  const { task } = row;
+  return {
+    order: row.order,
+    pinned: row.pinned,
+    ...(row.color !== undefined ? { color: row.color } : {}),
+    ...(row.gitBranch !== undefined ? { gitBranch: row.gitBranch } : {}),
+    ...(row.gitIsWorktree !== undefined ? { gitIsWorktree: row.gitIsWorktree } : {}),
+    ...(row.gitSync !== undefined ? { gitSync: row.gitSync } : {}),
+    ...(taskSummary !== undefined ? { taskSummary } : {}),
+    ...(task
+      ? {
+          ownerWorkspaceId: task.ownerWorkspaceId,
+          detached: task.detached,
+          ...(task.createdAt !== undefined ? { createdAt: task.createdAt } : {}),
+          nested: nested === true,
+        }
+      : {}),
+  };
+}
+
+/** The pane's workspace id from its spawn env, bounded like every id on the wire. */
+function workspaceIdOf(env: Record<string, string> | undefined): { workspaceId?: string } {
+  const value = env?.[ENV_KEYS.WORKSPACE_ID];
+  return typeof value === 'string' && value.length > 0 && value.length <= 128 ? { workspaceId: value } : {};
 }
 
 function workspaceLabelOf(env: Record<string, string> | undefined): { workspace?: string } {
