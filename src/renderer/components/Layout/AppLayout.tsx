@@ -11,7 +11,7 @@ import { EmptyLeafFunnel } from './EmptyLeafFunnel';
 import { selectProjectCwdSignature } from '../../stores/selectors/appLayout';
 import { selectInboxOwnsApprovals } from '../../stores/selectors/approvalInbox';
 import { shouldShowInstallError, shouldReannounceAfterError, truncateReason } from './updateNoticePolicy';
-import { shouldShowAutoUpdatePrompt, shouldShowCheatSheet, shouldStartOnboarding } from './firstBootSequence';
+import { hooksLaunchCheck, shouldShowAutoUpdatePrompt, shouldShowCheatSheet, shouldStartOnboarding } from './firstBootSequence';
 import { registerSessionSaver, saveSessionNow } from '../../utils/sessionSaveBridge';
 import { resolveReconcileRebind } from '../../hooks/resolveReconcileRebind';
 import { getLeafPanes, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
@@ -746,6 +746,14 @@ export default function AppLayout() {
   const cheatSheetForceShown = useStore((s) => s.cheatSheetForceShown);
   const setFirstRunCompleted = useStore((s) => s.setFirstRunCompleted);
   const [showFirstRunWizard, setShowFirstRunWizard] = useState<'firstRun' | 'reopen' | null>(null);
+  // The wizard ran on this boot — it offered the hooks install itself, so the
+  // launch-time hooks prompt stands down (hooksLaunchCheck).
+  const [firstRunWizardRanThisBoot, setFirstRunWizardRanThisBoot] = useState(false);
+  // Set only by the firstRun.check outcome (resolved, rejected or absent).
+  // The store's firstRunCompleted is not enough: loadSession can set it before
+  // the probe answers, which would let the hooks check run before we know the
+  // wizard is coming.
+  const [firstRunProbeSettled, setFirstRunProbeSettled] = useState(false);
 
   const [showAutoUpdatePrompt, setShowAutoUpdatePrompt] = useState(false);
   const t = useT();
@@ -1419,18 +1427,27 @@ export default function AppLayout() {
   useEffect(() => {
     let cancelled = false;
     const api = window.electronAPI.firstRun;
-    if (!api) return; // preload may not yet expose firstRun in non-Electron contexts (tests)
+    if (!api) {
+      // preload may not yet expose firstRun in non-Electron contexts (tests)
+      setFirstRunProbeSettled(true);
+      return;
+    }
     void api.check().then((result) => {
       if (cancelled) return;
+      setFirstRunProbeSettled(true);
       if (!result.shown) {
         setShowFirstRunWizard('firstRun');
+        setFirstRunWizardRanThisBoot(true);
       } else {
         setFirstRunCompleted(true);
       }
     }).catch(() => {
       // Best-effort. If main is unreachable, fall back to "completed" so
       // the user is not blocked by a missing wizard channel.
-      if (!cancelled) setFirstRunCompleted(true);
+      if (!cancelled) {
+        setFirstRunCompleted(true);
+        setFirstRunProbeSettled(true);
+      }
     });
     return () => {
       cancelled = true;
@@ -2046,7 +2063,11 @@ export default function AppLayout() {
       )}
       <FloatingPane />
       <ToastContainer />
-      <HooksInstallPromptContainer t={t} />
+      <HooksInstallPromptContainer
+        t={t}
+        launchCheck={hooksLaunchCheck({ firstRunSettled: firstRunProbeSettled, firstRunWizardRanThisBoot })}
+        deferred={showFirstRunWizard !== null}
+      />
       </div>
     </div>
     </ErrorBoundary>
