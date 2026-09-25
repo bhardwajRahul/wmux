@@ -14,7 +14,7 @@ import { HIT_TARGET_24_ROW } from '../hitArea';
 import { timeAgo } from '../../utils/timeAgo';
 import { AGENT_STATUS_ICON } from './agentStatusIcon';
 import { fleetIdleForMs, formatStaleMinutes, selectUnverifiablePaneMinutes } from '../../stores/selectors/fleet';
-import { AgentGlyph, StatusMarkView } from './AgentMarks';
+import { StatusMarkView } from './AgentMarks';
 import { selectSidebarUnseen } from '../../stores/selectors/sidebarSeen';
 import { formatIdle, IDLE_SHOW_AFTER_MS, IDLE_TICK_MS } from '../../utils/idleTime';
 
@@ -191,7 +191,6 @@ function WorkspaceRosterSummary({
   agentCount,
   stashedCount,
   agents = [],
-  extra = 0,
   open,
   onToggle,
 }: WorkspaceRosterSummaryProps) {
@@ -247,19 +246,21 @@ function WorkspaceRosterSummary({
       >
         <IconChevron size={8} />
       </span>
-      {/* #1481 — who is here and what they are doing, instead of a bare
-          count: up to three identity glyphs, grouped by status with one mark
-          per group (idle groups draw no mark), then "+N" for the rest. */}
-      {agentCount > 0 && agents.length === 0 && <span>{agentCount}</span>}
-      {groupChipAgents(agents).map((group, gi) => (
-        <span key={`${group[0].status}-${gi}`} className="flex items-center gap-0.5" data-roster-chip-group={group[0].status}>
-          {group[0].status !== 'idle' && <StatusMarkView status={group[0].status} quiet neutralRunning />}
-          {group.map((agent, ai) => (
-            <AgentGlyph key={ai} slug={agent.slug} name={agent.agentName} decorative />
-          ))}
-        </span>
-      ))}
-      {extra > 0 && agents.length > 0 && <span data-roster-chip-extra>+{extra}</span>}
+      {/* #1481 — what is happening, instead of a bare count: one mark and a
+          count per non-idle status group, most urgent first. Idle agents are
+          not listed beside them (a bare number would read as part of the
+          previous group); when every agent is idle the total stands alone.
+          The accessible name carries the full count. */}
+      {(() => {
+        const active = groupChipAgents(agents).filter((group) => group[0].status !== 'idle');
+        if (active.length === 0) return agentCount > 0 ? <span>{agentCount}</span> : null;
+        return active.map((group, gi) => (
+          <span key={`${group[0].status}-${gi}`} className="flex items-center gap-0.5" data-roster-chip-group={group[0].status}>
+            <StatusMarkView status={group[0].status} quiet neutralRunning />
+            <span>{group.length}</span>
+          </span>
+        ));
+      })()}
       {/* The stash glyph draws only when it is the ONLY thing to report.
           Beside an agent count it cost 17px of a row whose name column has
           none to spare (measured: it was the difference between eleven
@@ -308,7 +309,6 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
 
   // Computed once per render, not per row: the vendor column earns its width
   // only when the workspace actually mixes vendors.
-  const mixedVendors = rosterHasMixedVendors(roster.rows);
   const stamps = useStore.getState();
   const stampCtx = {
     now,
@@ -357,7 +357,7 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
             // no title either — without this the row would render with no text at
             // all. Visible rows always carry an agent name, so it is a no-op there.
             const primary = rosterPrimaryLabel(row) || t('surface.terminal');
-            const secondary = rosterSecondaryLabel(row, { showVendor: mixedVendors });
+            const secondary = rosterSecondaryLabel(row, { showVendor: false });
             const detail = row.pendingQuestion ?? row.activity;
             // #1481 — last activity rides the title line (muted) unless the
             // agent is blocked on a question, which keeps its own red line.
@@ -442,7 +442,7 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                   }}
                 >
                   {/* #1481 — status by shape (StatusMarkView) then identity by
-                      monogram (AgentGlyph). A stashed row keeps a FILLED mark
+                      the agent kind in muted text (non-Claude only). A stashed row keeps a FILLED mark
                       for its live statuses (DESIGN.md 2026-08-24): the mark
                       table's shapes are all border- or fill-drawn, none uses
                       box-shadow, so forced-colors keeps every one. #1176 — a
@@ -454,7 +454,6 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                     unverifiable={!!unverifiableLabel}
                     quiet={!!row.questionSeen && !row.attentionStatus}
                   />
-                  <AgentGlyph slug={row.slug} name={agentLabel} decorative />
                   {/* Name and location on one line. The title truncates first;
                       the coordinate (w85-1 etc.) takes at most 40% before it
                       ellipses too. */}
@@ -471,6 +470,14 @@ function WorkspaceAgentRoster({ workspaceId, pulsingPaneId }: WorkspaceAgentRost
                     <span className="min-w-0 flex-1 truncate text-[10px] font-semibold text-[var(--text-main)]">
                       {primary}
                     </span>
+                    {/* Claude is the default agent and gets no mark; any other
+                        agent names itself in muted text so the exception is
+                        the only thing that reads. */}
+                    {row.surfaceTitle && row.slug && row.slug !== 'claude' && (
+                      <span className="max-w-[35%] flex-none truncate text-[10px] text-[var(--text-muted)]" data-roster-agent-kind>
+                        {agentLabel}
+                      </span>
+                    )}
                     {row.ptyId && unseenByPtyId[row.ptyId] && (
                       <span className="h-1.5 w-1.5 flex-none self-center rounded-full bg-[var(--text-main)]" aria-hidden="true" data-sidebar-unseen />
                     )}
