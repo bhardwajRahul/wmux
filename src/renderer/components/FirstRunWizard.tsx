@@ -909,39 +909,51 @@ export function StatuslineBlock({
     );
   }
 
-  // Optional and cosmetic, so never the primary action.
+  // Optional and cosmetic, so never the primary action. The clip spans the
+  // full group width under the row: the statusline is one long line of small
+  // text, unreadable at the width of the row's text column.
   return (
-    <SetupRow
-      status={state === 'error' ? 'error' : 'todo'}
-      testId="first-run-wizard-statusline-offer"
-      title={t('firstRunWizard.statuslineHeading')}
-      detail={t('firstRunWizard.statuslineDescription')}
-      action={
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={onInstall}
-          disabled={state === 'installing'}
-          data-testid="first-run-wizard-statusline-install"
-        >
-          {state === 'installing'
-            ? t('firstRunWizard.statuslineInstalling')
-            : t('firstRunWizard.statuslineEnableButton')}
-        </Button>
-      }
-    >
-      {state === 'error' && (
-        <p className="ui-row-error" data-testid="first-run-wizard-statusline-error">
-          {withInlineCode(t('firstRunWizard.statuslineError'))}
-          {errorDetail ? <> (<code className="ui-code">{errorDetail}</code>)</> : null}
-        </p>
-      )}
-    </SetupRow>
+    <div>
+      <SetupRow
+        status={state === 'error' ? 'error' : 'todo'}
+        testId="first-run-wizard-statusline-offer"
+        title={t('firstRunWizard.statuslineHeading')}
+        detail={t('firstRunWizard.statuslineDescription')}
+        action={
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={onInstall}
+            disabled={state === 'installing'}
+            data-testid="first-run-wizard-statusline-install"
+          >
+            {state === 'installing'
+              ? t('firstRunWizard.statuslineInstalling')
+              : t('firstRunWizard.statuslineEnableButton')}
+          </Button>
+        }
+      >
+        {state === 'error' && (
+          <p className="ui-row-error" data-testid="first-run-wizard-statusline-error">
+            {withInlineCode(t('firstRunWizard.statuslineError'))}
+            {errorDetail ? <> (<code className="ui-code">{errorDetail}</code>)</> : null}
+          </p>
+        )}
+      </SetupRow>
+      <div className="px-3 pb-3">
+        <MediaPreview
+          clip={MEDIA_CLIPS.statusline}
+          label={t('firstRunWizard.statuslineDescription')}
+          className="wmux-welcome-statusline-clip"
+          data-testid="first-run-wizard-statusline-preview"
+        />
+      </div>
+    </div>
   );
 }
 
 /**
- * The sample task offer: the clip, then a notice row (title + description ·
+ * The sample task offer: a notice row (title + description ·
  * divider · action). Try / Continue are the dialog's primary only when
  * {@link decidePrimaryAction} says so, and never while disabled.
  */
@@ -967,17 +979,8 @@ export function SampleTaskBlock({
   const isReopen = uiState === 'reopen';
   const date = formatCompletedAt(completedAt);
 
-  const frame = (testId: string, row: React.ReactNode, withClip = false) => (
+  const frame = (testId: string, row: React.ReactNode) => (
     <section className="ui-group wmux-welcome-sample" data-testid={testId}>
-      {withClip && (
-        <div className="p-3 pb-0">
-          <MediaPreview
-            clip={MEDIA_CLIPS.split}
-            label={t('firstRunWizard.sampleTaskDescription')}
-            data-testid="first-run-wizard-sample-preview"
-          />
-        </div>
-      )}
       {row}
     </section>
   );
@@ -1054,6 +1057,5 @@ export function SampleTaskBlock({
         </Button>
       </div>
     </div>,
-    true,
   );
 }

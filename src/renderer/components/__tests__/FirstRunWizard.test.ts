@@ -555,18 +555,26 @@ describe('primary styling follows the decision', () => {
 });
 
 describe('welcome typography and media', () => {
-  it('shows a labelled preview clip on the idle sample task card', () => {
+  it('keeps the sample task card text only: its copy describes the task, not a clip', () => {
     const html = renderToStaticMarkup(
       createElement(SampleTaskBlock, {
         uiState: 'ready', sampleState: 'idle', completedAt: undefined,
         onTry: noop, onFallbackContinue: noop,
       }),
     );
-    expect(html).toContain('first-run-wizard-sample-preview');
-    expect(html).toContain('role="img"');
-    expect(html).toMatch(/aria-label="Open a 2x2 split/);
-    expect(html).toMatch(/<video[^>]*autoPlay|<video[^>]*autoplay/);
-    expect(html).toContain('.webm');
+    expect(html).toContain('first-run-wizard-try');
+    expect(html).not.toContain('first-run-wizard-sample-preview');
+    expect(html).not.toContain('<video');
+  });
+
+  it('shows the statusline clip, labelled by the row copy, only while the statusline is offered', () => {
+    const offer = renderToStaticMarkup(createElement(StatuslineBlock, { state: 'offer', onInstall: noop }));
+    expect(offer).toContain('first-run-wizard-statusline-preview');
+    expect(offer).toMatch(/aria-label="Show model, context usage, and rate limits/);
+    expect(offer).toMatch(/statusline[^"]*\.webm/);
+
+    const installed = renderToStaticMarkup(createElement(StatuslineBlock, { state: 'installed', onInstall: noop }));
+    expect(installed).not.toContain('first-run-wizard-statusline-preview');
   });
 
   it('draws no emoji-style status glyphs in the chrome', () => {
