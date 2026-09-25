@@ -35,6 +35,15 @@ export interface ScheduledPromptDeliveryDeps {
   acceptRunning?: boolean;
   /** Chat only: pasted one by one before the prompt (image paths). */
   leadingPastes?: readonly string[];
+  /** Caller re-authorization, run immediately before the first write
+   *  (`first-write`: the first leading paste, else the prompt paste) and
+   *  again as the last await before the submit write (`submit`).
+   *  `false` stops with `error` and writes nothing further. */
+  authorized?: (stage: 'first-write' | 'submit') => Promise<boolean>;
+  /** Called immediately before each write is attempted, so a caller can tell
+   *  "nothing reached the PTY" from "the paste may be visible". `queued` is
+   *  true on `submit` when the prompt was accepted while the turn ran. */
+  onWrite?: (stage: 'paste' | 'submit', queued?: boolean) => void;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -87,14 +96,22 @@ export async function deliverScheduledPrompt(
       now.inputRevision === before.inputRevision + writes;
   };
   try {
+    if (deps.authorized && !(await deps.authorized('first-write'))) return 'error';
+  } catch {
+    return 'error';
+  }
+
+  try {
     for (const [index, paste] of leading.entries()) {
       // Only the first write can still be refused cleanly; after it the
       // composer already holds our input.
       if (index > 0 && !untouched(index)) return 'error';
+      deps.onWrite?.('paste');
       if (!deps.write(formatBracketedPastePayload(paste))) return index === 0 ? 'unavailable' : 'error';
       await (deps.delay ?? sleep)(SESSION_PROMPT_ATTACHMENT_DELAY_MS);
     }
     if (leading.length && !untouched(leading.length)) return 'error';
+    deps.onWrite?.('paste');
     if (!deps.write(formatBracketedPastePayload(leading.length ? ` ${prompt}` : prompt))) return leading.length ? 'error' : 'unavailable';
   } catch {
     return 'error';
@@ -106,6 +123,14 @@ export async function deliverScheduledPrompt(
   // revision check stays the last thing before Enter.
   try {
     if (!(await deps.isAgentProcessAlive())) return 'error';
+  } catch {
+    return 'error';
+  }
+
+  // A grant withdrawn inside the submit delay must not be pressed through.
+  // The last await before Enter: only synchronous state checks follow it.
+  try {
+    if (deps.authorized && !(await deps.authorized('submit'))) return 'error';
   } catch {
     return 'error';
   }
@@ -125,6 +150,8 @@ export async function deliverScheduledPrompt(
 
   try {
     const submit = deps.submitKeys ?? (isMultilinePtyPayload(prompt) ? '\r\r' : '\r');
+    // Still running at Enter: the agent's composer queues the prompt.
+    deps.onWrite?.('submit', running && after.status === 'running');
     return deps.write(submit) ? 'sent' : 'error';
   } catch {
     return 'error';

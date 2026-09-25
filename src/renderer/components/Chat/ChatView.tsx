@@ -39,6 +39,8 @@ export default function ChatView({ ptyId, active, onTerminal }: { ptyId: string;
 function ChatThread({ ptyId, data, onTerminal }: { ptyId: string; data: ReturnType<typeof useTranscript>; onTerminal: () => void }) {
   const t = useT();
   const [sendState, setSendState] = useState<string | null>(null);
+  // What the last refused send did to the pane, when the daemon reports it.
+  const [sendEffect, setSendEffect] = useState<'none' | 'uncertain' | 'submitted' | null>(null);
   const [sending, setSending] = useState(false);
   const [launchAgent, setLaunchAgent] = useState<TerminalLaunchAgent>('claude');
   const [launchMode, setLaunchMode] = useState<TerminalLaunchMode>('default');
@@ -60,7 +62,9 @@ function ChatThread({ ptyId, data, onTerminal }: { ptyId: string; data: ReturnTy
   const progress = managed ? ({ connecting: 'connecting', ready: 'ready', running: 'working', blocked: 'blocked', disconnected: 'disconnected', unconfirmed: 'unconfirmed' } as const)[managed.phase] : legacyProgress;
   const busy = progress === 'working' || progress === 'waiting';
   const ended = progress === 'ended';
-  const uncertain = managed ? ['unconfirmed', 'disconnected', 'connecting'].includes(managed.phase) : progress === 'unconfirmed' || sendState === 'error' || sendState === 'unconfirmed';
+  const uncertain = managed ? ['unconfirmed', 'disconnected', 'connecting'].includes(managed.phase) : progress === 'unconfirmed' ||
+    // An older daemon reports no effect: fall back to the result enum.
+    (sendEffect ? sendEffect === 'uncertain' : sendState === 'error' || sendState === 'unconfirmed');
   const messages = useMemo(() => transcriptMessages(data.events, true), [data.events]);
   const capabilities = managed ? undefined : data.status.terminal?.capabilities;
   // Claude queues a prompt typed mid-turn; other agents are sent to after the reply.
@@ -159,7 +163,7 @@ function ChatThread({ ptyId, data, onTerminal }: { ptyId: string; data: ReturnTy
     void loadEarlier();
   }, [latestUser, hasMore, loading, loadingEarlier, error, data.events.length, loadEarlier]);
   useEffect(() => {
-    if (sendState && latestUser !== sentAfterUser.current) setSendState(null);
+    if (sendState && latestUser !== sentAfterUser.current) { setSendState(null); setSendEffect(null); }
   }, [latestUser, sendState]);
   const onNew = useCallback(async (message: AppendMessage) => {
     const text = message.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n');
@@ -182,22 +186,26 @@ function ChatThread({ ptyId, data, onTerminal }: { ptyId: string; data: ReturnTy
       throw new MessageNotSentError(t('chat.sendUnavailable'));
     }
     sentAfterUser.current = latestUser;
-    inFlight.current = true; setSending(true); setSendState(null);
+    inFlight.current = true; setSending(true); setSendState(null); setSendEffect(null);
     const images = attachments;
     const before = new Set(data.events.filter((e) => e.kind === 'user_text').map((e) => e.id));
     try {
+      // The time prefix lets the daemon refuse this id once its receipt is pruned.
       const response = await window.electronAPI.chat.send({ ptyId, agentSessionId: data.status.agentSessionId, text,
-        ...((managed || data.status.terminal) ? { requestId: crypto.randomUUID() } : {}),
+        ...((managed || data.status.terminal) ? { requestId: `${Date.now()}-${crypto.randomUUID()}` } : {}),
         ...(images.length ? { attachments: images.map((image) => image.path) } : {}) });
       if (response.result !== 'sent') {
-        setSendState(response.result);
+        // `effect: none` proves nothing was written, even for a result the
+        // enum alone would read as uncertain.
+        const state = response.effect === 'none' && (response.result === 'unconfirmed' || response.result === 'error') ? 'refused' : response.result;
+        setSendState(state); setSendEffect(response.effect ?? null);
         // Keep the draft on a refused/uncertain delivery. The error text makes
         // partial delivery explicit; it is never retried automatically.
-        throw new MessageNotSentError(t(`chat.send.${response.result}`));
+        throw new MessageNotSentError(t(`chat.send.${state}`));
       }
       setSendState('sent');
       setAttachments((current) => current.filter((item) => !images.includes(item)));
-      setPending((current) => [...current, { id: crypto.randomUUID(), text, images, queued: busy, before }].slice(-8));
+      setPending((current) => [...current, { id: crypto.randomUUID(), text, images, queued: busy || response.queued === true, before }].slice(-8));
     } catch (error) {
       if (error instanceof MessageNotSentError) throw error;
       setSendState('error');

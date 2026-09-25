@@ -1581,3 +1581,392 @@ foreground settings target. A loaded `systemError` thread can change settings fo
 its next turn; an `active` thread remains busy and `notLoaded` remains unavailable.
 Catalog pagination is bounded to four pages of 100 entries; incomplete or ambiguous
 catalogs are unavailable rather than silently truncated.
+
+## Native chat
+
+The phone's Chat surface drives the **native conversation already running in the
+pane's terminal** (Claude, Codex, OpenCode): same PTY, same native session id.
+Opening Chat never spawns an agent, creates a native session or sends a prompt.
+Approvals, native permission dialogs and Stop stay in Terminal; there is no file
+undo. The only thing Chat can start is an agent in an empty shell (launch, below).
+
+Everything here sits behind the normal Bearer gate. No chat route accepts a
+stream ticket, and every response carries `Cache-Control: no-store`. The four
+chat routes (send, send receipt, launch, launch receipt) answer
+`404 {error:"session not found"}` for the orchestrator brain pane for **every**
+credential, the operator token included, exactly as `/turns` does.
+
+### Capabilities in `/api/config`
+
+Additive, computed per caller, and omitted entirely when the daemon has no chat
+bridge. A missing key reads as `false`; none of them moves `protocolVersion`.
+
+| Key | Meaning |
+| --- | --- |
+| `chatBinding` | `/turns` carries the `chat` object and v2 cursors. Needs `--allow-transcript` |
+| `chatSend` | `POST …/chat/messages` exists and **this caller** may use it (`chatBinding` and input permission) |
+| `chatLaunch` | `POST …/chat/launch` exists and this caller may use it (same condition) |
+| `chatLaunchModes` | Present only when `chatLaunch` is true. `{claude:[…], codex:[…]}`: `default` only, plus `bypass` (Claude) / `yolo` (Codex) when the server was started with `wmux web --allow-dangerous-launch` |
+| `chatSkills` | `/commands` accepts `?agent=` and answers the native catalogue |
+| `chatVersion` | Version of this chat contract (`1`). Bumped only on a breaking change |
+
+Gate the composer on `chatSend`, not on `allowInput`: a read-only device reads
+chat but never gets a composer.
+
+### Reading: the `chat` object on `/turns`
+
+`GET /api/sessions/<id>/turns` stays the one reading route. With `chatBinding`
+the daemon resolves the pane the way the desktop Chat does — OpenCode TUI
+plugin first, then a managed record (only with no live agent and no
+transcript), then the Claude/Codex transcript file — and adds `chat` to every
+200, including `available:false`:
+
+```jsonc
+"chat": {
+  "binding": "terminal",          // "terminal" | "managed" | "none"
+  "agent": "codex",               // terminal only; open set
+  "agentSessionId": "0199f1c2-…", // absent when binding is "none"
+  "historyEpoch": "h1:5b0c…",     // opaque; "rows you hold still belong to this history"
+  "historyTruncated": false,
+  "maxSendBytes": 23000,          // only when the binding has a byte limit (OpenCode)
+  "agentStatus": "complete",      // open set
+  "agentAlive": true,
+  "capabilities": { "history": true, "send": true, "permissions": false, "cancel": false,
+                    "fileUndo": false, "streaming": false, "launch": false, "skills": true },
+  "blocked": { "by": "approval", "approvalId": "apr_…" },  // only while blocked
+  "launch": { "ready": true, "reason": "ok", "agents": ["claude", "codex"], "maxPromptUnits": 2000 },  // binding "none" only
+  "managed": { "provider": {…}, "phase": "…" }              // binding "managed" only; read-only on the phone
+}
+```
+
+- **Decide by capability, never by agent name.** An absent additive key
+  (`streaming`, `launch`, `skills`) is unknown and reads as `false`. `send:true`
+  is a precondition, not a promise: every send is re-checked in the daemon.
+- **Capability rules.** `skills` is true only for a `terminal` binding whose
+  `agent` is `claude` or `codex`, or a `none` binding with `launch.ready`.
+  `launch` is true only on a `none` binding with `launch.ready`. `streaming` is
+  `false` on transcript-file bindings (Claude/Codex rows land per record, not
+  per token) and absent for OpenCode. A `managed` binding has `history:true`
+  and every other capability `false` or absent. `cancel` is always `false` on
+  the phone (Stop is in Terminal). `queue:true` (live Claude) means a send
+  during a running turn can be accepted and answered with `queued:true`.
+- **`blocked` is authoritative and computed at read time**: a pending approval
+  (`by:"approval"`), or `by:"terminal"` for a hook `awaiting_input`, an OpenCode
+  `awaiting_input` phase, or a dialog the send screen gate sees on the rendered
+  screen (checked on every read of a Claude/Codex binding with `send`).
+- **`launch.reason`** is an open set: `ok`, `shell-busy`, `shell-not-empty`,
+  `unsupported-shell`, `approval-pending`, `launch-pending`, `not-integrated`,
+  `agent-running`. `agent-running` means an agent owns the pane without a
+  readable chat (OpenCode off a session route, OpenCode without the plugin,
+  another live agent with no transcript yet): send the user to Terminal. The
+  preview is cheap and never enumerates processes, so `shell-has-children` only
+  ever arrives from the launch POST, which re-verifies everything.
+- **`historyEpoch`** is `h1:` (transcript file), `t1:` (OpenCode, a hash — the
+  raw plugin epoch never leaves the daemon) or `m1:` (managed). Compare it for
+  equality; never parse it. Evicting old rows sets `historyTruncated` and keeps
+  the epoch.
+
+**Cursor v2.** Still opaque base64url; store and return it verbatim. It now binds
+the source, the native id and the epoch. On **every** read that carries a cursor,
+forward or `dir=back`, a cursor that does not match the current conversation
+(a v1 cursor, another source, another native id, another epoch, or the file
+shrink/line-boundary checks) answers a tail snapshot with `reset:true`, never an
+error. A v1 cursor from before the upgrade therefore resets once.
+
+**`mode` and `reset`.** Every body adds `mode`:
+
+| `mode` | Merge |
+| --- | --- |
+| `snapshot` | replace your rows |
+| `delta` | upsert by `id`, append new ids; never concatenate text |
+| `older` | (`dir=back`) prepend ids you do not have |
+
+`reset` is present **only** on the answer to a read that carried a cursor.
+OpenCode (`tui`) and managed reads are full bounded pages every time, so a forward
+read with a cursor on those always answers `mode:"snapshot", reset:true`; they
+have no back paging (`dir=back` answers an empty `older` page with
+`hasMore:false`). `reset` is a merge instruction only. To tell a refresh from a
+conversation change, compare the `chat` you held with the one you got:
+`binding`, `agentSessionId` or `historyEpoch` changed → conversation change
+(replace rows, and settle every unfinished send for the old conversation as
+"check Terminal"); all equal → refresh.
+
+When a pane that had a conversation has none any more, a read with a cursor
+answers `{available:false, reason, reset:true, events:[], chat:{binding:"none", …}}`
+with **no** `cursor`. Drop the rows and read again without one.
+
+### Sending: `POST /api/sessions/<id>/chat/messages`
+
+```json
+{ "agentSessionId": "0199f1c2-…", "historyEpoch": "h1:5b0c9a1e7f3d2c4b",
+  "clientMessageId": "1758712345123-6f1d2c3b-4a59-4e87-9b10-2c3d4e5f6a7b",
+  "text": "fix only the failing tests" }
+```
+
+- `clientMessageId` is `<13-digit Unix ms>-<lowercase UUID>` (`-`, not `.`; the
+  OpenCode plugin accepts only `[a-zA-Z0-9-]`). Mint it once, **when Send is
+  tapped**, and persist it with the text before the POST. A malformed id is
+  `400 invalid-chat-request`. An id whose time prefix is 24 h old, or more than
+  60 s ahead of the host clock, is refused (`message-id-expired`) before any
+  receipt lookup — so a pruned receipt can never lead to a second dispatch.
+  Never POST an entry older than 24 h minus 10 minutes; settle it as
+  "check Terminal".
+- `historyEpoch` must equal the current one; a mismatch is `session-changed`.
+- `text`: non-blank, at most 16,000 UTF-16 code units (`String.utf16.count`,
+  not graphemes). When `chat.maxSendBytes` is present, also at most that many
+  UTF-8 bytes; the daemon's own measurement of the exact OpenCode request stays
+  authoritative. Newlines are allowed.
+- All four fields are required strings; any other key is
+  `400 invalid-chat-request`. The body cap is 96 KiB.
+
+**Grants.** `--allow-transcript` and input permission, both checked before the
+body is read and again after it with a fresh authentication of the same caller;
+the pane must still be the same incarnation (`409 pane-incarnation-changed`
+otherwise). The daemon then re-authorizes (the same checks, plus
+`--allow-transcript`) immediately before the first write: before the paste on
+Claude/Codex, and as the last await before the request leaves for the OpenCode
+plugin. On the Claude/Codex paste path it re-authorizes again as the last await
+before Enter. The first-write check also refuses when the HTTP connection has
+already closed; the Enter check does not, so a phone that hangs up between paste
+and Enter does **not** abort Enter — read the outcome from the send receipt. A
+grant withdrawn before Enter presses nothing and answers
+`401 authorization-expired` with `effect:"uncertain"` (the paste is in the
+agent's composer).
+
+**Idempotency.** Receipts live in the daemon's shared send path — the desktop
+uses the same store — keyed by `(owner, clientMessageId)`; owners are
+`device:<id>`, `operator` and `desktop`, and none can read another's receipts.
+The daemon looks the id up and inserts `pending` in one synchronous step, and
+persists it before any write. The same id with the same fingerprint replays the
+stored outcome (`replayed:true`), or answers `202 {state:"pending"}` while the
+first dispatch is still running. It never dispatches twice. A `pending` receipt
+found after a daemon restart is final-uncertain: a re-POST replays
+`{result:"unconfirmed", error:"delivery-unconfirmed", effect:"uncertain"}`.
+
+Two refinements of the draft contract, on purpose:
+
+- **Replay runs before binding resolution.** A retry after the agent exited
+  replays the stored outcome instead of answering `no-conversation`.
+- **The fingerprint is `(pane, agentSessionId, historyEpoch, text)`, without the
+  pane incarnation.** A retry after a pane restart replays rather than
+  answering `message-id-conflict`.
+
+Every daemon answer carries `effect`, and `result` (the desktop's verbatim enum)
+whenever the send reached a verdict. **Act on `effect`**: the same `unconfirmed`
+means "refused, nothing typed" on Claude/Codex and "may have been delivered" on
+OpenCode.
+
+| `effect` | Meaning | Client |
+| --- | --- | --- |
+| `none` | nothing reached the PTY or the native client | text back to the draft; the user may send again |
+| `uncertain` | something may have reached it | lock the entry; check the receipt, then Terminal; **never resend** |
+| `submitted` | the submit step completed (Enter written, `promptAsync` accepted) | final; not proof the agent processed it |
+
+| Outcome | HTTP | Body | `effect` |
+| --- | --- | --- | --- |
+| sent | 202 | `{result:"sent", replayed:false, clientMessageId, queued?:true}` | `submitted` |
+| replay of a final outcome | 200 | the stored body, `replayed:true` | stored |
+| replay of a receipt left `pending` by a daemon restart | 200 | `{error:"delivery-unconfirmed", result:"unconfirmed", replayed:true}` | `uncertain` |
+| same id, first dispatch still running | 202 | `{state:"pending", replayed:true, clientMessageId}` | absent — poll the receipt |
+| per-pane fence, agent not ready | 409 | `{error:"chat-busy", result:"busy"}` | `none` |
+| approval or dialog open | 409 | `{error:"chat-blocked", result:"blocked", blockedBy:"approval"\|"terminal"}` | `none` |
+| native id or epoch changed | 409 | `{error:"session-changed", result:"session_changed", agentSessionId?, historyEpoch?}` | `none` |
+| agent not alive or plugin unreachable before the write | 409 | `{error:"chat-unavailable", result:"unavailable"}` | `none` |
+| Claude/Codex input line not provably empty | 409 | `{error:"input-not-provably-empty", result:"unconfirmed"}` | `none` |
+| safety proof changed after the paste, before Enter | 409 | `{error:"send-interrupted", result:"error"}` | `uncertain` |
+| OpenCode dispatch outcome unknown, or the dispatch failed internally | 409 | `{error:"delivery-unconfirmed", result:"unconfirmed"}` | `uncertain` |
+| grant withdrawn between paste and Enter | 401 | `{error:"authorization-expired", result:"error"}` | `uncertain` |
+| grant withdrawn, or connection closed, before the first write | 401 | `{error:"authorization-expired", result:"error"}` | `none` |
+| schema or validation refusal, malformed `clientMessageId` | 400 | `{error:"invalid-chat-request", result?:"error", detail?}` | `none` |
+| over 16,000 units or the OpenCode byte budget | 400 | `{error:"text-too-long", result:"error", limit:"units"\|"bytes", maxSendBytes?}` | `none` |
+| id 24 h old or clock ahead | 400 | `{error:"message-id-expired"}` | `none` — settle as "check Terminal", not draft |
+| same id, different fingerprint | 409 | `{error:"message-id-conflict"}` | `none` — id is spent; a new Send mints a new id |
+| no conversation (use launch) | 409 | `{error:"no-conversation"}` | `none` |
+| managed record | 409 | `{error:"managed-read-only"}` | `none` |
+| receipt store full (10,000 receipts inside 24 h) | 409 | `{error:"message-history-full"}` | `none` |
+| receipt store unavailable, or `pending` could not be persisted | 500 | `{error:"chat-persist-failed"}` | `none` |
+| OpenCode plugin holds 512 unexpired receipts | 409 | `{error:"opencode-receipts-full", result:"unavailable"}` | `none` — "restart OpenCode in Terminal" |
+| send path threw inside the route | 500 | `{error:"chat-send-failed", clientMessageId}` | absent — **unknown**, poll the receipt |
+
+Every body also carries `clientMessageId` (on a schema refusal, only when the
+body had a string one).
+
+**Mid-turn sends (Claude).** A Claude pane whose turn is still running accepts a
+send when its empty composer is on screen, the same rule the desktop Chat view
+uses: Claude's composer queues the prompt and runs it after the current turn.
+The daemon decides this from the pane's fresh screen and state, never from the
+request. Such a send answers `202` with `queued:true` (kept on replay and in the
+receipt); show it as queued until its `user_text` row appears in `/turns`. Absent
+`queued` means the prompt was submitted into an idle agent. A running Claude
+turn with a draft in the composer still answers `chat-busy`, and a running
+Codex turn is refused as before (`chat-busy` or `input-not-provably-empty`).
+
+`opencode-receipts-full` reaches the daemon from the plugin as
+`{result:"unavailable", reason:"receipts-full"}`, so a daemon that predates the
+reason still reads it as a plain refusal. The plugin drops receipts past the id
+retention before it refuses, and never evicts a younger one.
+
+Errors the route gates produce before the daemon sees the send carry no
+`effect`: 403 (`--allow-transcript` off, no input permission, or input
+permission gone after the body), `404 session not found`,
+`503 chat-unavailable` (no chat bridge), 413, 400 `invalid JSON body`,
+`401 authorization-expired` (the caller failed re-authentication after the
+body) and `409 pane-incarnation-changed`. A 4xx without `effect` is `none`. A
+5xx without `effect`, or no response at all, is **unknown** — poll the receipt,
+never assume `none`.
+
+### Send receipt: `GET /api/sessions/<id>/chat/messages/<clientMessageId>`
+
+```
+→ 200 {clientMessageId, state, result?, error?, queued?, agentSessionId?, historyEpoch?, at?}
+→ 404 {error: 'session not found'}
+```
+
+Read-only and bound to the owner **and the pane**; it needs `--allow-transcript`
+but **not** input permission, so a device whose input grant was withdrawn still
+learns whether its send landed. `at` is the id's own time prefix. `queued:true`
+rides on a `submitted` receipt the agent queued behind its running turn.
+
+| `state` | Client |
+| --- | --- |
+| `pending` | dispatch still running; check again in 5 s |
+| `submitted` | final |
+| `refused` | final, `effect:"none"`; text back to the draft |
+| `uncertain` | final-uncertain; check Terminal. A `pending` found after a daemon restart reads `uncertain` |
+| `unknown` | no receipt for this owner, pane and id: the POST never reached the store. Safe to POST again **with the same id**, only while the id is younger than 24 h and `/turns` still shows the same `agentSessionId` and `historyEpoch` |
+
+Poll every `unknown` or `pending` entry every 5 s, even with a healthy SSE —
+nothing on `/api/events` names a send. `404` means the pane is gone: settle the
+entry as "check Terminal" and stop polling. Retention is 24 hours from the id's
+time prefix.
+
+### Launch: `POST /api/sessions/<id>/chat/launch`
+
+```json
+{ "agent": "codex", "mode": "default",
+  "clientLaunchId": "1758712345123-0a9b8c7d-6e5f-4a3b-8c2d-1e0f9a8b7c6d",
+  "prompt": "explain the test layout\ndo not edit files" }
+```
+
+Starts `claude` or `codex` in the pane's own empty shell with the first message,
+through the same daemon function the desktop uses. Same grants and
+post-body re-authentication as send, 16 KiB body cap. `agent ∈ {claude, codex}`;
+`prompt` non-blank, at most 2,000 UTF-16 units, newlines allowed, no other
+control characters; `clientLaunchId` has the send id format (malformed →
+`400 invalid-chat-request`) and a **10-minute** age limit, 60 s clock skew
+allowed (`launch-id-expired`). Model, effort, arguments, command, cwd and
+environment are refused; model and effort for new panes stay on
+`POST /api/sessions {agentLaunch}`.
+
+The daemon re-authorizes once more as the last await before the launcher is
+typed; a withdrawn grant or a closed connection types nothing
+(`401 authorization-expired`, `effect:"none"`).
+
+**Dangerous modes.** `mode:"bypass"` (Claude, `--dangerously-skip-permissions`) and
+`mode:"yolo"` (Codex, `--dangerously-bypass-approvals-and-sandbox`) need both:
+
+1. the host's ceiling, **off by default**: `wmux web --allow-dangerous-launch`.
+   Without it the route answers `403 {error:'dangerous-launch-disabled: …'}` and
+   `chatLaunchModes` lists only `default`. There is no per-device grant: once the
+   operator opens the ceiling, every input-capable caller may use it;
+2. `confirm` equal to `"<agent>:<mode>"` exactly (e.g. `"codex:yolo"`), set only
+   by a confirmation step for that combination. Missing or different →
+   `428 {error:'dangerous-mode-unconfirmed'}`.
+
+The ceiling is re-read after the body and again before typing. `claude+yolo` or
+`codex+bypass` is `400 invalid-chat-request`. A dangerous launch that is typed,
+or ends `launch-unconfirmed`, raises a notification on the host; those outcomes
+and the two refusals above are written to the daemon's audit log (no prompt
+text). Reset the mode to `default` after every attempt and whenever the agent
+changes; never persist it.
+
+| Outcome | HTTP | Body | `effect` |
+| --- | --- | --- | --- |
+| launcher typed | 202 | `{ok:true, replayed:false, clientLaunchId}` | `submitted` |
+| replay | 200 | stored body, `replayed:true` | stored |
+| same id, first attempt still running | 202 | `{state:"pending", replayed:true, clientLaunchId}` | absent |
+| launch receipt store full | 429 | `{error:"launch-busy"}` | `none` — retry later |
+| another launch running on this pane | 409 | `{error:"launch-pending"}` | `none` |
+| pane already has a conversation | 409 | `{error:"conversation-exists"}` | `none` |
+| shell not ready | 409 | `{error:"launch-not-ready", reason:"shell-not-empty"\|"shell-busy"\|"approval-pending"\|"not-integrated"}` | `none` |
+| shell cannot launch | 409 | `{error:"launch-unsupported", reason:"unsupported-shell"\|"shell-has-children"}` | `none` |
+| same id, different request | 409 | `{error:"launch-id-conflict"}` | `none` |
+| malformed id or request | 400 | `{error:"invalid-chat-request", detail?}` | `none` |
+| id expired | 400 | `{error:"launch-id-expired"}` | `none` — "check Terminal" |
+| dangerous mode refused | 403 / 428 | see above | `none` |
+| grant withdrawn or connection closed before typing | 401 | `{error:"authorization-expired"}` | `none` |
+| launcher not installed | 409 | `{error:"agent-not-installed"}` | `none` |
+| Codex native runtime could not start | 502 | `{error:"agent-runtime-unavailable"}` | `none` |
+| failure provably before typing | 502 | `{error:"launch-unconfirmed"}` | `none` |
+| failure once typing started | 502 | `{error:"launch-unconfirmed"}` | `uncertain` |
+
+Every body also carries `clientLaunchId` when the request had one.
+`unsupported-shell` means a WSL pane, a Windows host, or a shell other than
+zsh, bash or sh. A shell process that is gone at the idle check reads as
+`launch-not-ready` with `shell-busy` (the pane is being torn down). The launch
+fingerprint is `(pane, incarnation, agent, mode, prompt)`: unlike send, a retry
+after a pane restart is `launch-id-conflict`.
+
+`202` means the launcher line was typed, not that the agent started: login and
+trust prompts are answered in Terminal. Watch `/turns` until `chat.binding` is
+`terminal` with an `agentSessionId`, and give up after 60 s with "check Terminal".
+`shell-not-empty` clears only after a **completed command** in that shell (tell
+the user to run one, e.g. `clear`); `shell-has-children` (a resident helper such
+as a prompt theme's status daemon) does not clear by itself.
+
+`GET /api/sessions/<id>/chat/launch/<clientLaunchId>` → `{clientLaunchId, state}`
+with `state ∈ pending | submitted | refused | uncertain | unknown`, bound to the
+owner and the pane. Like the send receipt it needs `--allow-transcript` but not
+input permission. It is memory-only and answers `unknown` after a daemon
+restart. A receipt is kept until 10 minutes plus 60 s past the id's own time
+prefix; a `pending` one is never dropped, and a full store (256 receipts) never
+evicts a live receipt — it refuses new ids with `429 launch-busy` instead.
+Retry a launch with the same id only inside 10 minutes, with receipt `unknown`
+and `/turns` still `binding:"none"` with `launch.ready`; if the binding became
+`terminal`, the launch happened.
+
+### Native skills: `GET /api/sessions/<id>/commands?agent=claude|codex`
+
+Without `agent` the legacy answer is unchanged. With it (`chatSkills`):
+
+```
+→ 200 {state: "ready"|"partial"|"unavailable", reason?: "bridge-outdated",
+       commands: [{name, description, source, kind: "skill", invocation}]}
+→ 400 {error: "invalid-chat-request", detail}   // agent is not claude or codex
+```
+
+Insert `invocation` verbatim followed by a space, keep the arguments after the
+leading token, and never send on selection; a bare `/` or `$` cannot be sent.
+Refusals (wrong live agent, WSL, a pane that is not live, no directory, a
+failed scan) answer `200 {state:"unavailable", commands:[]}`. Codex is
+`unavailable` until its account server exists, so offer a retry after launch.
+`reason:"bridge-outdated"` reads as unavailable with "update wmux on the
+computer". The directory is the pane's spawn directory for Claude (never the
+OSC 7 cwd, which pane output can aim), and for Codex the live native thread's
+own cwd when the daemon's relay knows it, else the spawn directory. Names and
+descriptions only; no bodies, no paths.
+
+### `chat.blocked` / `chat.unblocked` on `/api/events`
+
+```
+event: chat.blocked
+data: {"sessionId":"pty-7f3c","by":"terminal","agent":"opencode","at":1758712345123}
+
+event: chat.unblocked
+data: {"sessionId":"pty-7f3c","at":1758712399000}
+```
+
+**Live-only**, like `transcript.nudge`: no `id:`, not in the backlog, never
+replayed, only for panes whose `/turns` you have read, never for the brain pane.
+`by` is `approval` (carries `approvalId`; dedupe with the `approval` event) or
+`terminal`; treat an unknown value as `terminal`. Only transitions emit: the
+first `chat.blocked` value the server observes for a pane is recorded without
+an event (whoever read it just saw it in `/turns`). The server recomputes the
+value at most once a second per pane, when an approval opens or closes, the
+agent's status changes or a transcript nudge fires, and only while some caller
+that read the pane's `/turns` holds `/api/events` open. The events only tell you
+to re-read sooner — the authoritative state is `chat.blocked` on `/turns`, so
+re-read after every reconnect instead of reconstructing from events. A dialog
+seen only on the rendered screen shows on the next `/turns` read (and as
+`blockedBy:"terminal"` on a refused send); a send refused that way emits
+nothing itself.

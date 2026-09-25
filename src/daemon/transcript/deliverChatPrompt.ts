@@ -3,11 +3,14 @@ import type { ChatSendResult } from '../../shared/transcript/turnEvents';
 import { screenBlocksChatSend } from './chatScreenGate';
 import { quoteImagePathForPty } from '../../shared/imagePaste';
 
+/** Screen rows, optionally with a dim-blanked copy of each row (same indexes). */
+export type ChatScreenRows = readonly string[] & { readonly undimmed?: readonly string[] };
+
 export interface ChatDeliveryDeps extends ScheduledPromptDeliveryDeps {
   getTranscriptSessionId: () => string | undefined;
   hasOpenApproval: () => boolean;
   /** The pane's visible grid, parsed; null when it cannot be read. */
-  readScreen: () => Promise<readonly string[] | null>;
+  readScreen: () => Promise<ChatScreenRows | null>;
 }
 
 /** Keep transcript identity and approval checks inside the daemon, including
@@ -26,7 +29,7 @@ export async function deliverChatPrompt(
   // Status and the approval registry are blind to Claude's own select dialogs
   // (`/model`, the post-turn auto-mode wizard): Enter would confirm one.
   // Ahead of the idle refusal so the user is told about the prompt, not a draft.
-  let rows: readonly string[] | null = null;
+  let rows: ChatScreenRows | null = null;
   try { rows = await deps.readScreen(); } catch { /* unreadable = refuse */ }
   if (screenBlocksChatSend(rows)) return 'blocked';
   // Claude restores the submitted draft after an interrupted turn. Idle alone
@@ -69,26 +72,33 @@ export async function deliverChatPrompt(
   });
 }
 
-/** Claude Code 2.1 TUI: the prompt row between the two rules, with nothing typed. */
-export function claudeComposerEmpty(rows: readonly string[] | null): boolean {
+/** Claude Code 2.1 TUI: the prompt row between the two rules, with nothing typed.
+ *  After a turn Claude dims a suggested next prompt into the empty composer;
+ *  with `undimmed` rows that suggestion reads as empty, typed text never does. */
+export function claudeComposerEmpty(rows: ChatScreenRows | null): boolean {
   if (!rows || screenBlocksChatSend(rows)) return false;
   const tail = rows.map(row => row.trim());
   const rule = (row: string | undefined) => !!row && /^─{8,}$/.test(row);
   let at = -1;
   tail.forEach((row, index) => { if (/^❯(?:\s|$)/.test(row)) at = index; });
   // A fresh session dims a suggestion into the empty prompt: `❯ Try "…"`.
-  return at > 0 && /^❯(?: Try "[^"]*")?$/.test(tail[at]) && rule(tail[at - 1]) && rule(tail[at + 1]);
+  const empty = /^❯(?: Try "[^"]*")?$/.test(tail[at] ?? '') || /^❯$/.test(rows.undimmed?.[at]?.trim() ?? '');
+  return at > 0 && empty && rule(tail[at - 1]) && rule(tail[at + 1]);
 }
 
-/** Codex 0.156 TUI; positive evidence, not an absence-of-errors heuristic.
- * Match only the bottom composer with its own model/cwd footer. */
-export function codexComposerEmpty(rows: readonly string[] | null): boolean {
+/** Codex 0.156/0.157 TUI; positive evidence, not an absence-of-errors heuristic.
+ * Match only the bottom composer with its own model/cwd footer. 0.157 adds a
+ * `? for shortcuts` hint under the footer; with `undimmed` rows a prompt row
+ * holding only dim text (placeholder or suggestion) is empty, typed text is not. */
+export function codexComposerEmpty(rows: ChatScreenRows | null): boolean {
   if (!rows || codexScreenBlocked(rows)) return false;
   const tail = rows.map(row => row.trimEnd());
   const prompts = tail.flatMap((row, index) => /^\s*› /.test(row) ? [index] : []);
   const at = prompts.at(-1);
-  if (at === undefined || !/^\s*› Ask Codex to do anything\s*$/.test(tail[at])) return false;
-  const below = tail.slice(at + 1).filter(row => row.trim());
+  if (at === undefined) return false;
+  const empty = /^\s*› Ask Codex to do anything\s*$/.test(tail[at]) || /^\s*›$/.test(rows.undimmed?.[at]?.trimEnd() ?? '');
+  if (!empty) return false;
+  const below = tail.slice(at + 1).filter(row => row.trim() && !/^\s*\? for shortcuts$/.test(row));
   return below.length === 1 && /^\s*\S.+ · (?:[A-Za-z]:[\\/]|\/|~)/.test(below[0]);
 }
 

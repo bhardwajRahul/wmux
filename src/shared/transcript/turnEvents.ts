@@ -266,8 +266,16 @@ export interface ChatBridgeApi {
   skills?: (args: { ptyId: string; agent: string }) => Promise<import('./chatSkills').ChatSkillCatalog>;
   launchTerminal?: (args: { ptyId: string; agent: 'claude' | 'codex'; prompt: string; mode?: import('./terminalChat').TerminalLaunchMode }) => Promise<{ ok: boolean; error?: string }>;
   controls?: import('./chatSession').ChatControls;
-  /** Identity-bound, daemon-serialized input into the existing terminal agent process. */
-  send: (args: { ptyId: string; agentSessionId: string; text: string; requestId?: string; attachments?: string[] }) => Promise<{ result: ChatSendResult }>;
+  /**
+   * Identity-bound, daemon-serialized input into the existing terminal agent process.
+   * `requestId` is `<13-digit ms>-<lowercase uuid>`. `effect`, when present, is
+   * what the send did to the pane and outranks `result` for the UI: `none`
+   * wrote nothing, `uncertain` may have written. An older daemon omits it.
+   * `queued` marks a `sent` the agent's composer queued behind a running turn.
+   */
+  send: (args: { ptyId: string; agentSessionId: string; text: string; requestId?: string; attachments?: string[] }) => Promise<{
+    result: ChatSendResult; replayed?: boolean; effect?: 'none' | 'uncertain' | 'submitted'; queued?: true;
+  }>;
   /** ESC into the live terminal agent, only while its turn is running. */
   interrupt?: (args: { ptyId: string; agentSessionId: string }) => Promise<{ result: ChatInterruptResult }>;
   attachment?: (args: { path: string }) => Promise<ChatAttachmentPreview>;

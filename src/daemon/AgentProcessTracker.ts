@@ -48,7 +48,9 @@
  */
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { AGENT_SLUG_SET, type AgentSlug } from '../shared/agentIdentity';
 
 const execFileAsync = promisify(execFile);
@@ -345,6 +347,114 @@ export function selectAgentProcess(
   return directChild !== undefined ? { pid: directChild } : undefined;
 }
 
+const GITSTATUS_VALUE_FLAGS = new Map<string, RegExp>([
+  ['-s', /^-?\d{1,9}$/], ['-u', /^-?\d{1,9}$/], ['-c', /^-?\d{1,9}$/], ['-d', /^-?\d{1,9}$/],
+  ['-m', /^-?\d{1,12}$/], ['-t', /^\d{1,4}$/], ['-v', /^[A-Z]{1,8}$/],
+]);
+const GITSTATUS_SWITCHES = new Set(['-e', '-U', '-W', '-D']);
+
+/** Homebrew's powerlevel10k package (Apple silicon, Intel): the only roots outside home. */
+const GITSTATUS_PACKAGE_DIRS = [
+  '/opt/homebrew/share/powerlevel10k/gitstatus/usrbin',
+  '/usr/local/share/powerlevel10k/gitstatus/usrbin',
+] as const;
+
+/**
+ * The fixed package dirs, plus each one's resolved form when it exists:
+ * Homebrew links `share/powerlevel10k` into its Cellar, so the real image
+ * (lsof / `/proc/<pid>/exe`) names the versioned Cellar directory. Still an
+ * exact-directory list; nothing here comes from the pane.
+ */
+export function gitstatusPackageDirs(realpath: (dir: string) => string = fs.realpathSync): ReadonlySet<string> {
+  const dirs = new Set<string>(GITSTATUS_PACKAGE_DIRS);
+  for (const dir of GITSTATUS_PACKAGE_DIRS) {
+    try { dirs.add(realpath(dir)); } catch { /* not installed */ }
+  }
+  return dirs;
+}
+
+/**
+ * Whether `image` is a gitstatusd install: under the daemon user's home,
+ * `gitstatusd-<os>-<arch>` in the gitstatus download cache
+ * (`$GITSTATUS_CACHE_DIR`, `${XDG_CACHE_HOME:-~/.cache}/gitstatus`,
+ * `~/.cache/gitstatus`) or `gitstatusd` in a plugin checkout's
+ * `gitstatus/usrbin`; outside home, only `gitstatusd` whose directory is
+ * exactly one of `packageDirs` (the Homebrew powerlevel10k package), never a
+ * suffix match. Absolute, normalized path; a pane env or a checkout in /tmp
+ * cannot widen it, and the `$GITSTATUS_DAEMON` override is not trusted.
+ */
+export function isHelperImage(
+  image: string | undefined,
+  env: NodeJS.ProcessEnv = {},
+  userHome = os.homedir(),
+  packageDirs: ReadonlySet<string> = gitstatusPackageDirs(),
+): boolean {
+  if (!image || !path.posix.isAbsolute(image) || path.posix.normalize(image) !== image) return false;
+  const home = path.posix.normalize(userHome).replace(/\/+$/, '');
+  const underHome = (value: string) => home.length > 1 && value.startsWith(home + '/');
+  const base = path.posix.basename(image);
+  const dir = path.posix.dirname(image);
+  const cacheDirs = [env.GITSTATUS_CACHE_DIR, path.posix.join(env.XDG_CACHE_HOME || path.posix.join(home, '.cache'), 'gitstatus'),
+    path.posix.join(home, '.cache', 'gitstatus')].filter((value): value is string => !!value && path.posix.isAbsolute(value))
+    .map(value => path.posix.normalize(value).replace(/\/+$/, '')).filter(underHome);
+  return /^gitstatusd-[a-z0-9_]+-[a-z0-9_]+$/.test(base) && cacheDirs.includes(dir) ||
+    base === 'gitstatusd' && (packageDirs.has(dir) || dir.endsWith('/gitstatus/usrbin') && underHome(dir));
+}
+
+/**
+ * A resident shell child that cannot be reading the terminal, so typing a
+ * launcher at the prompt still reaches the shell (N19). Only gitstatusd
+ * (gitstatus / powerlevel10k), and only when every property matches the way
+ * gitstatus.plugin.zsh starts it — a process NAME alone never qualifies:
+ *   - argv[0] passes `isHelperImage`;
+ *   - argv exactly `<image> -G v<x.y.z>` followed only by the plugin's flags;
+ *   - a direct child of this shell with no children of its own.
+ * argv is self-reported (`exec -a`), so `idleShellState` also checks the real
+ * executable image. Note the current plugin starts the daemon from a
+ * backgrounded process substitution, which usually reparents it away from the
+ * shell; this covers installs where it does stay the shell's child. Pure
+ * apart from resolving the fixed package roots — exported for tests.
+ */
+export function isVerifiedPassiveHelper(
+  entry: ProcessTreeEntry,
+  shellPid: number,
+  entries: ReadonlyArray<ProcessTreeEntry>,
+  env: NodeJS.ProcessEnv = {},
+  userHome = os.homedir(),
+): boolean {
+  if (entry.ppid !== shellPid || entries.some(other => other.ppid === entry.pid)) return false;
+  const image = entry.name;
+  if (!isHelperImage(image, env, userHome)) return false;
+  const argv = (entry.cmdline ?? '').trim().split(/\s+/);
+  if (argv[0] !== image || argv[1] !== '-G' || !/^v\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(argv[2] ?? '')) return false;
+  for (let i = 3; i < argv.length; i++) {
+    const value = GITSTATUS_VALUE_FLAGS.get(argv[i]);
+    if (value) { if (!value.test(argv[++i] ?? '')) return false; continue; }
+    if (!GITSTATUS_SWITCHES.has(argv[i])) return false;
+  }
+  return true;
+}
+
+/**
+ * The executable image a process really runs, or undefined when it cannot be
+ * read — never argv[0], which the process sets itself. darwin: the first `txt`
+ * name lsof reports; linux: `/proc/<pid>/exe`. Absolute lsof path, no PATH trust.
+ */
+export async function readExecutableImage(pid: number): Promise<string | undefined> {
+  try {
+    if (process.platform === 'linux') return fs.realpathSync(`/proc/${pid}/exe`);
+    if (process.platform !== 'darwin') return undefined;
+    const { stdout } = await execFileAsync('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'txt', '-Fn'],
+      { encoding: 'utf-8', timeout: 5_000 });
+    const lines = (stdout as string).split('\n');
+    const txt = lines.indexOf('ftxt');
+    const name = txt === -1 ? undefined : lines[txt + 1];
+    return name?.startsWith('n') && name.length > 1 ? name.slice(1) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** One full process-table snapshot (pid/ppid/name[/cmdline]). Windows has no
  *  PPID in tasklist, so this shells out to Windows PowerShell 5.1 (always
  *  present, absolute System32 path — no PATH trust) for a single CIM
@@ -414,13 +524,29 @@ export class AgentProcessTracker {
   constructor(
     private readonly watcher: PidWatcher,
     private readonly enumerate: () => Promise<ProcessTreeEntry[]> = enumerateProcesses,
+    private readonly readImage: (pid: number) => Promise<string | undefined> = readExecutableImage,
+    private readonly userHome: string = os.homedir(),
   ) {}
 
   async verifyIdleShell(pid: number): Promise<boolean> {
+    return (await this.idleShellState(pid)).ok;
+  }
+
+  /** Which launch precondition failed, so a phone can be told what to do.
+   *  `env` is the pane's spawn env, used only to locate a helper's install. */
+  async idleShellState(pid: number, env: NodeJS.ProcessEnv = {}): Promise<{ ok: true } | { ok: false; reason: 'missing' | 'unsupported-shell' | 'shell-has-children' }> {
     const entries = await this.snapshot();
     const root = entries.find(entry => entry.pid === pid);
-    return !!root && /^(?:-?)(?:zsh|bash|sh)$/i.test(path.basename(root.name)) &&
-      !entries.some(entry => entry.ppid === pid);
+    if (!root) return { ok: false, reason: 'missing' };
+    if (!/^(?:-?)(?:zsh|bash|sh)$/i.test(path.basename(root.name))) return { ok: false, reason: 'unsupported-shell' };
+    for (const child of entries.filter(entry => entry.ppid === pid)) {
+      // The real image is read only for a child whose self-reported argv already qualifies.
+      if (!isVerifiedPassiveHelper(child, pid, entries, env, this.userHome) ||
+          !isHelperImage(await this.readImage(child.pid).catch(() => undefined), env, this.userHome)) {
+        return { ok: false, reason: 'shell-has-children' };
+      }
+    }
+    return { ok: true };
   }
 
   private static watchKey(sessionId: string): string {
