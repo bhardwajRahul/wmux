@@ -55,7 +55,7 @@ import { LanLinkController } from './lanlink/controller';
 import { LanLinkServer } from './lanlink/server';
 import { PeerStore } from './lanlink/peers';
 import { coerceLanLinkPatch } from '../shared/lanlink';
-import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
+import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
 import { AppendOnlyLog } from './eventlog/AppendOnlyLog';
 import { SnapshotStore, SNAPSHOT_DIRNAME } from './eventlog/SnapshotStore';
 import { manifestFileExists, pingFormatVersionField } from './eventlog/EventLogManifest';
@@ -6619,7 +6619,16 @@ async function main(): Promise<void> {
     listLiveSessions: () =>
       sessionManager.listLiveSessions().map((meta) => ({
         id: meta.id,
-        ...(meta.lastDetectedAgent !== undefined ? { lastDetectedAgent: meta.lastDetectedAgent as string } : {}),
+        // A pane whose agent returned to the shell is a shell, whatever it
+        // last ran — see wakeAgentSlug for the marker/process precedence.
+        ...(() => {
+          const agent = wakeAgentSlug(
+            meta.lastDetectedAgent as string | undefined,
+            sessionManager.getSession(meta.id)?.promptLog.commandRunningIfKnown(),
+            agentProcessTracker.identityFor(meta.id),
+          );
+          return agent !== undefined ? { lastDetectedAgent: agent } : {};
+        })(),
         // Fail SAFE on a broken/missing timestamp (GLM review): a NaN getTime()
         // must not become 0, which reads as "quiet since the epoch" and makes
         // the pane permanently pass the quiet gate (perpetual nudge candidate).
