@@ -13,7 +13,7 @@ import { markRetentionMigrationDone } from '../retentionMigration';
 import { DEFAULT_BROWSER_BACKEND, isBrowserBackend, type BrowserBackend } from '../../../shared/browserBackend';
 import { CHROME_PRESET_VALUES } from '../../../shared/chromePresets';
 import { sanitizeShortcutOverrides, type ShortcutActionId, type ShortcutOverrides } from '../../../shared/keymap';
-import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth, type SidebarSortMode } from '../../utils/sidebarLayout';
+import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth, isNestedTask, togglePinned, type SidebarSortMode } from '../../utils/sidebarLayout';
 
 /**
  * #517: read main's authoritative browser backend synchronously at store-module
@@ -500,7 +500,8 @@ export interface UISlice {
    *  shows a one-time notice with Undo and clears the flag. */
   sidebarSortMigrated: boolean;
   clearSidebarSortMigrated: () => void;
-  /** Workspaces that keep their manual position in the Attention order. */
+  /** Workspaces pinned to the top of the sidebar. Always a prefix of
+   *  `workspaces` (sidebarLayout.pinnedFirst), so the stored order is pinned-first. */
   sidebarPinnedIds: string[];
   toggleSidebarPin: (workspaceId: string) => void;
   /** Session-only: when a workspace was created, for the new-workspace hold. */
@@ -705,6 +706,9 @@ export interface UISlice {
   // silently reject the actual markdown text drop. Keeping reorder state
   // out-of-band lets dataTransfer carry pure text/plain markdown.
   draggedWorkspaceIndex: number | null;
+  /** The dragged workspace's id, captured with the index at dragstart. Drops
+   *  resolve the source by id: closing a workspace mid-drag shifts indexes. */
+  draggedWorkspaceId: string | null;
   setDraggedWorkspaceIndex: (index: number | null) => void;
 
   // ─── Terminal text-drop trust boundary ────────────────────────────────
@@ -1508,9 +1512,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   sidebarPinnedIds: [],
   toggleSidebarPin: (workspaceId) => set((state) => {
     if (!workspaceId) return;
-    const i = state.sidebarPinnedIds.indexOf(workspaceId);
-    if (i >= 0) state.sidebarPinnedIds.splice(i, 1);
-    else state.sidebarPinnedIds.push(workspaceId);
+    // A nested task cannot be pinned (it has no top-level slot): refuse
+    // rather than pin-then-unpin, which would still move the row.
+    if (!state.sidebarPinnedIds.includes(workspaceId) && isNestedTask(state, workspaceId)) return;
+    const r = togglePinned(state.workspaces, state.sidebarPinnedIds, workspaceId);
+    if (!r) return;
+    state.workspaces = r.items;
+    state.sidebarPinnedIds = r.pinnedIds;
   }),
   sidebarNewAt: {},
   sidebarSeen: {},
@@ -1762,8 +1770,10 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   },
 
   draggedWorkspaceIndex: null as number | null,
+  draggedWorkspaceId: null as string | null,
   setDraggedWorkspaceIndex: (index) => set((state) => {
     state.draggedWorkspaceIndex = index;
+    state.draggedWorkspaceId = index === null ? null : state.workspaces[index]?.id ?? null;
   }),
 
   terminalTextDropDragActive: false,
