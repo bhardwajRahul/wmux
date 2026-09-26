@@ -570,7 +570,13 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
   };
 
   const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
-    if (!workspace || reorderOff) return;
+    // A row always drags its markdown out (dropping it on an agent's pane
+    // hands that agent this workspace to message). Only the reorder half
+    // depends on reorderOff: a sorted order used to cancel the whole drag,
+    // which silently killed the hand-off for every unpinned row. While
+    // renaming, a text drag in the input bubbles up here: let it stay a text
+    // drag instead of overwriting it with the workspace markdown.
+    if (!workspace || editing) return;
     // Roster controls live inside this draggable card. Chromium chooses the
     // nearest draggable ancestor as the native source, so `draggable={false}`
     // on a nested button is not enough. Reject a drag whose pointer originated
@@ -592,8 +598,10 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
     // dropEffect='move' for reorder, which is only valid against an
     // effectAllowed that includes 'move'. External chat composers
     // accept the 'copy' half of 'copyMove' just as well.
-    e.dataTransfer.effectAllowed = 'copyMove';
-    setDraggedWorkspaceIndex(index);
+    // A row that cannot reorder offers copy only and leaves no reorder
+    // source, so no sidebar row lights up as a drop target for it.
+    e.dataTransfer.effectAllowed = reorderOff ? 'copy' : 'copyMove';
+    if (!reorderOff) setDraggedWorkspaceIndex(index);
     setTerminalTextDropDragActive(true);
     // Apply the "being dragged" visual synchronously by mutating the
     // element's inline style. The previous setTimeout(setIsDragging) +
@@ -632,9 +640,11 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
 
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     if (reorderOff) return;
-    e.preventDefault();
+    // A drag with no reorder source (a copy-only hand-off, or text from
+    // outside) is not for this row: leave the drop unclaimed.
     const reorderFrom = dragSourceIndex();
     if (reorderFrom === -1) return;
+    e.preventDefault();
     // Codex P1: do NOT force dropEffect='move' on the source row itself.
     // While the pointer is still over the row that started the drag,
     // the operation must stay 'copy' (the effectAllowed='copyMove'
@@ -659,16 +669,17 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     if (reorderOff) return;
-    e.preventDefault();
     setDropIndicator(null);
     // Reorder source comes from the store, not dataTransfer. No source
-    // means the drop originated from outside the sidebar (or the user
-    // dragged a workspace out and back in) — silently ignore so foreign
-    // markdown drops never reshuffle the list. Both ends are resolved by
-    // id, so a workspace closed mid-drag cannot redirect the move.
+    // means the drop originated from outside the sidebar (or a copy-only
+    // hand-off) — leave it unclaimed so foreign markdown never reshuffles
+    // the list. Both ends are resolved by id, so a workspace closed
+    // mid-drag cannot redirect the move.
     const fromIndex = dragSourceIndex();
     const index = ownIndex();
-    if (fromIndex === -1 || index === -1 || fromIndex === index) return;
+    if (fromIndex === -1 || index === -1) return;
+    e.preventDefault();
+    if (fromIndex === index) return;
     // A sorted order only accepts pinned-to-pinned drops.
     if (sortPaused && !draggedRowPinned(fromIndex)) return;
 
@@ -796,7 +807,8 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
       )}
 
       <div
-        draggable={!reorderOff}
+        // Not while renaming: a text drag inside the input must stay a text drag.
+        draggable={!!workspace && !editing}
         {...tokenAttrs('bgSurface', 'bg')}
         className={`group sidebar-row px-3 py-1.5 cursor-pointer rounded-md select-none ${needsYou ? 'sidebar-row-needs' : ''} ${
           isActive
