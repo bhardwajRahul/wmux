@@ -89,6 +89,13 @@ export interface FanOutAuditRecord {
   approvedBy: 'auto' | 'human';
   /** The worker permission mode the tasks launch with (Settings → Agents). */
   workerPermissionMode: string;
+  /** The operator preset the caller named, when it named one (additive). */
+  preset?: string;
+  /** Per task: the agent CLI (+ model, + unattended) a preset or the caller's
+   *  `agents[]` chose, index-aligned with `titles` (additive). */
+  agents?: string[];
+  /** worktree:false — the batch folder the tasks write into (additive). */
+  outputBatchDir?: string;
   /** kind 'launched': the line each task's pane was actually started with. */
   launched?: { title: string; workspaceId?: string; command?: string; error?: string }[];
 }
@@ -406,6 +413,35 @@ export class FanOutGuards {
       // Still counted for this process; only a restart would forget it.
       this.hourly = next;
       console.warn(`[fanout] could not persist the hourly cap stamp: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Give back `count` tasks of a started fan-out's hourly stamp: they never got
+   * a workspace, so nothing was launched for them. The stamp is shrunk (or
+   * dropped at zero) on disk too, so a restart does not bring the charge back.
+   */
+  refundStart(key: string, count: number): void {
+    if (!(count > 0)) return;
+    const hourly = this.loadHourly();
+    let left = count;
+    const next: HourlyStamp[] = [];
+    // Newest first: the stamp commitStart just appended for this key.
+    for (const s of [...hourly].reverse()) {
+      if (left > 0 && s.id === key) {
+        const take = Math.min(left, s.count);
+        left -= take;
+        if (s.count - take > 0) next.unshift({ ...s, count: s.count - take });
+        continue;
+      }
+      next.unshift(s);
+    }
+    if (left === count) return;
+    try {
+      this.saveHourly(next);
+    } catch (err) {
+      this.hourly = next;
+      console.warn(`[fanout] could not persist the hourly cap refund: ${String(err)}`);
     }
   }
 

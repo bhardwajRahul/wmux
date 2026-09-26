@@ -500,6 +500,17 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.FANOUT_WORKER_MODE_SET, mode) as Promise<
         import('../shared/workerLaunch').FanoutWorkerPermissionMode
       >,
+    getPresets: () =>
+      ipcRenderer.invoke(IPC.FANOUT_PRESETS_GET) as Promise<{
+        presets: import('../shared/fanoutPreset').FanoutPreset[];
+        dropped: import('../shared/fanoutPreset').FanoutPresetDropped[];
+        unreadable?: true;
+      }>,
+    setPresets: (presets: unknown[]) =>
+      ipcRenderer.invoke(IPC.FANOUT_PRESETS_SET, presets) as Promise<
+        | { ok: true; presets: import('../shared/fanoutPreset').FanoutPreset[] }
+        | ({ ok: false } & import('../shared/fanoutPreset').FanoutIssue)
+      >,
   },
   // Command Deck Phase 2 — the Commander brain. `send` runs one orchestrator
   // turn (resolves with the accept/reject verdict; the turn's content streams
