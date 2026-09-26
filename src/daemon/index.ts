@@ -13,6 +13,7 @@ import { workspaceAccountEnv } from './phone/workspaceAccountEnv';
 import { DesktopPhoneBridge } from './phone/DesktopPhoneBridge';
 import { RunHistoryStore } from './history/RunHistoryStore';
 import { InputReceiptStore } from './web/InputReceiptStore';
+import { SCROLLBACK_ROWS } from './web/hostSearch';
 import { recoveryCwd, isWslShell, isWslCwdMissingError } from '../shared/wsl';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -303,6 +304,27 @@ let gateBroker: GateBroker | null = null;
 let gateRuntimeOff = false;
 
 /**
+ * The phone's scrollback search (`GET /api/search`) reads a pane through the
+ * same headless parse `daemon.readSessionText` runs, on the same shared
+ * concurrency-1 queue, keeping as many rows as that RPC does by default. The
+ * web server caches the extracted text per pane, so a pane nobody wrote to
+ * since the last search is not parsed again.
+ */
+function sessionTextReader(sessionManager: DaemonSessionManager) {
+  return async (sessionId: string) => {
+    const managed = sessionManager.getSession(sessionId);
+    if (!managed) return null;
+    const outcome = await generateTextSnapshot({
+      cols: managed.meta.cols ?? 80,
+      rows: managed.meta.rows ?? 24,
+      scrollback: SCROLLBACK_ROWS,
+      initial: managed.ringBuffer.readAll(),
+    });
+    return outcome.ok ? outcome.rows : null;
+  };
+}
+
+/**
  * Build the registry. Split out of main() only so the two dependencies that
  * need a live sessionManager can be closures over it.
  *
@@ -489,6 +511,8 @@ async function restoreWebServer(sessionManager: DaemonSessionManager): Promise<v
         agentState: (id) => readAgentStateForWeb?.(id),
         // #1342 — resume state for the same route, same lazy indirection.
         resumeState: (id) => readResumeStateForWeb?.(id),
+        // The scrollback scope of GET /api/search.
+        sessionText: sessionTextReader(sessionManager),
         // M3 — without this, /pair degrades to handing out the shared operator
         // token and nothing is individually revocable. Injected at BOTH
         // construction sites: a restored server serves paired phones on their
@@ -2730,6 +2754,8 @@ function registerRpcHandlers(
       agentState: (id) => readAgentStateForWeb?.(id),
       // #1342 — see the restore path.
       resumeState: (id) => readResumeStateForWeb?.(id),
+      // See the restore path.
+      sessionText: sessionTextReader(sessionManager),
       // M3 — see the restore path for why the roster is injected at both sites.
       devices: getDeviceStore(),
       runHistory: getRunHistory,
