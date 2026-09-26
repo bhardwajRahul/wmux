@@ -34,6 +34,7 @@ import type {
   ApprovalRequest,
   ApprovalResolveResult,
 } from '../../approvals/types';
+import { TERMINAL_PROMPT_WEB_ANSWER } from '../../approvals/types';
 import type { DaemonSessionManager } from '../../DaemonSessionManager';
 
 // A minimal fake of exactly what WebTerminalServer touches: getSession() (for
@@ -4042,6 +4043,7 @@ describe('WebTerminalServer', () => {
     head: string,
     tail: string,
     withdraw: (record: { revoked: boolean; allowInput: boolean }) => void,
+    headers: Record<string, string> = {},
   ): Promise<number | undefined> => {
     let entered!: () => void;
     const authenticated = new Promise<void>((resolve) => { entered = resolve; });
@@ -4049,7 +4051,7 @@ describe('WebTerminalServer', () => {
     const spy = vi.spyOn(deviceRoster, 'get').mockImplementation((id: string) => { entered(); return lookup(id); });
     let request!: ReturnType<typeof httpReq>;
     const status = new Promise<number | undefined>((resolve, reject) => {
-      request = httpReq(url, { method: 'POST', headers: { ...bearer(phone.token), 'Content-Type': 'application/json' } }, (res) => {
+      request = httpReq(url, { method: 'POST', headers: { ...bearer(phone.token), 'Content-Type': 'application/json', ...headers } }, (res) => {
         res.resume(); res.on('end', () => resolve(res.statusCode));
       });
       request.on('error', reject);
@@ -4218,6 +4220,282 @@ describe('WebTerminalServer', () => {
     const refused = await postApproval(narrowed.token, 'ap-queued-gate', { decision: 'approve' });
     expect(refused.status).toBe(403);
     expect((await refused.json()).error).toMatch(/^read-only:/);
+  });
+
+  // ── terminal_prompt: the agent's own dialog, per-client ──────────────────
+  describe('terminal_prompt records', () => {
+    const CAPS = { 'X-Wmux-Client-Caps': 'terminal-prompt-answer' };
+    const FP = 'ab'.repeat(16);
+    const tp = (over: Partial<ApprovalRequest> = {}): ApprovalRequest => mkApproval({
+      id: 'ap-tp',
+      kind: 'terminal_prompt',
+      toolName: 'Bash',
+      summary: 'rm -rf build/cache · Remove the build cache',
+      risk: 'critical',
+      question: 'Do you want to proceed?',
+      reason: 'Permission rule Bash(rm -rf *) requires confirmation for this command.',
+      choices: [{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }],
+      promptFingerprint: FP,
+      // Daemon-internal: must never reach the web wire.
+      toolUseId: 'toolu_01',
+      dialogKey: 'k',
+      keyRevisionAtCreate: 3,
+      ...over,
+    });
+    const postTp = (token: string, body: unknown, headers: Record<string, string> = CAPS, id = 'ap-tp') =>
+      fetch(`${base()}/api/approvals/${id}`, {
+        method: 'POST',
+        headers: { ...bearer(token), 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+    const answerBody = { decision: 'approve', choiceKey: '1', promptFingerprint: FP };
+
+    it('an older client sees the card only; a capable one sees the dialog', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp(), tp({ id: 'ap-tp-info', question: undefined, reason: undefined, choices: undefined, promptFingerprint: undefined }));
+      const legacy = await (await fetch(`${base()}/api/approvals`, { headers: bearer(info.token as string) })).json();
+      expect(legacy.pending[0]).toEqual({
+        id: 'ap-tp', sessionId: 's1', agent: 'claude', kind: 'terminal_prompt', state: 'pending',
+        createdAt: 1_700_000_000_000, toolName: 'Bash', summary: 'rm -rf build/cache · Remove the build cache',
+        risk: 'critical',
+      });
+      const capable = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...CAPS } })).json();
+      expect(capable.pending[0]).toMatchObject({
+        question: 'Do you want to proceed?',
+        reason: 'Permission rule Bash(rm -rf *) requires confirmation for this command.',
+        choices: [{ key: '1', label: 'Yes' }, { key: '2', label: 'No' }],
+        promptFingerprint: FP,
+      });
+      // A record that is not answerable carries no dialog, whoever asks.
+      expect(capable.pending[1]).not.toHaveProperty('question');
+      expect(capable.pending[1]).not.toHaveProperty('choices');
+      expect(capable.pending[1]).not.toHaveProperty('promptFingerprint');
+      expect(capable.pending[0]).toMatchObject({ risk: 'critical' });
+      const wire = JSON.stringify([legacy, capable]);
+      for (const internal of ['screenTail', 'toolUseId', 'toolu_01', 'dialogKey', 'keyRevisionAtCreate']) {
+        expect(wire).not.toContain(internal);
+      }
+    });
+
+    it('once answered, the dialog stays readable but offers nothing to press', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp({ pressedAt: 1_700_000_005_000, selectedChoiceKey: '1', decision: 'approve' }));
+      const capable = await (await fetch(`${base()}/api/approvals`, { headers: { ...bearer(info.token as string), ...CAPS } })).json();
+      expect(capable.pending[0]).toMatchObject({ question: 'Do you want to proceed?', pressedAt: 1_700_000_005_000, selectedChoiceKey: '1' });
+      expect(capable.pending[0]).not.toHaveProperty('choices');
+      expect(capable.pending[0]).not.toHaveProperty('promptFingerprint');
+    });
+
+    it('a capable client answering a record that is not answerable gets 501 before any body check', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp({ question: undefined, reason: undefined, choices: undefined, promptFingerprint: undefined }));
+      // No fingerprint in the body at all: still 501, not 400.
+      const res = await postTp(info.token as string, { decision: 'approve', choiceKey: '1' });
+      expect(res.status).toBe(501);
+      expect(await res.json()).toEqual({ error: 'answer-in-terminal' });
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('"No, …" is the deny option', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp({ choices: [{ key: '1', label: 'Yes' }, { key: '3', label: 'No, and tell Claude what to do differently (esc)' }] }));
+      expect((await postTp(info.token as string, { decision: 'deny', choiceKey: '3', promptFingerprint: FP })).status).toBe(200);
+      expect((await postTp(info.token as string, { decision: 'approve', choiceKey: '3', promptFingerprint: FP })).status).toBe(400);
+    });
+
+    it('an older client is answered 501 answer-in-terminal, and nothing reaches the registry', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      const res = await postTp(info.token as string, answerBody, {});
+      expect(res.status).toBe(501);
+      expect(await res.json()).toEqual({ error: 'answer-in-terminal' });
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('a capable answer reaches the registry with the fingerprint and the route\'s marker', async () => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      approvalBox.result = { ok: true, durable: true, request: tp({ pressedAt: 1_700_000_005_000, selectedChoiceKey: '1', decision: 'approve' }) };
+      const res = await postTp(info.token as string, answerBody);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ state: 'pending', pressedAt: 1_700_000_005_000, durable: true });
+      expect(resolveCalls).toHaveLength(1);
+      expect(resolveCalls[0]).toMatchObject({ id: 'ap-tp', decision: 'approve', choiceKey: '1', promptFingerprint: FP });
+      expect((resolveCalls[0] as Record<string, unknown>).terminalPromptAnswer).toBe(TERMINAL_PROMPT_WEB_ANSWER);
+      // A deny names the plain No.
+      const deny = await postTp(info.token as string, { decision: 'deny', choiceKey: '2', promptFingerprint: FP });
+      expect(deny.status).toBe(200);
+    });
+
+    it.each([
+      ['no fingerprint', { decision: 'approve', choiceKey: '1' }, 'invalid-prompt-fingerprint'],
+      ['a malformed fingerprint', { decision: 'approve', choiceKey: '1', promptFingerprint: 'nope' }, 'invalid-prompt-fingerprint'],
+      ['deny on the Yes option', { decision: 'deny', choiceKey: '1', promptFingerprint: FP }, 'invalid-choice'],
+      ['approve on the No option', { decision: 'approve', choiceKey: '2', promptFingerprint: FP }, 'invalid-choice'],
+      ['no choiceKey', { decision: 'approve', promptFingerprint: FP }, 'invalid-choice'],
+      ['a choiceKey outside the choices', { decision: 'approve', choiceKey: '3', promptFingerprint: FP }, 'invalid-choice'],
+    ])('400 for %s, before the registry', async (_label, body, error) => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      const res = await postTp(info.token as string, body);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error });
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it.each([
+      ['answer-in-terminal', 501],
+      ['already-answered', 409],
+      ['prompt-changed', 409],
+      ['answer-too-soon', 425],
+      ['invalid-choice', 400],
+    ] as const)('maps the registry\'s %s to %i', async (reason, status) => {
+      const info = await startRW();
+      approvalRecords.push(tp());
+      approvalBox.result = { ok: false, reason, request: tp() };
+      const res = await postTp(info.token as string, answerBody);
+      expect(res.status).toBe(status);
+      expect(await res.json()).toEqual({ error: reason });
+    });
+
+    it('a read-only caller is refused before the body (site 1)', async () => {
+      const ro = await startRO();
+      approvalRecords.push(tp());
+      expect((await postTp(ro.token as string, answerBody)).status).toBe(403);
+      await server.stop();
+      await startRW();
+      const phone = await pairDevice('Read-only phone', false);
+      expect((await postTp(phone.token, answerBody)).status).toBe(403);
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('a grant narrowed while the body is on the wire is refused (site 2)', async () => {
+      await startRW();
+      const phone = await pairDevice('Narrowing phone', true);
+      approvalRecords.push(tp());
+      const body = JSON.stringify(answerBody);
+      expect(await withdrawMidBody(`${base()}/api/approvals/ap-tp`, phone, body.slice(0, 8), body.slice(8), (r) => { r.allowInput = false; }, CAPS))
+        .toBe(403);
+      expect(resolveCalls).toEqual([]);
+    });
+
+    it('a grant narrowed inside the registry link is refused (site 3)', async () => {
+      await startRW();
+      const phone = await pairDevice('Queued tp phone', true);
+      approvalRecords.push(tp());
+      approvalBox.beforeAuthorize = () => {
+        (deviceRoster.get(phone.deviceId) as unknown as { allowInput: boolean }).allowInput = false;
+      };
+      const refused = await postTp(phone.token, answerBody);
+      expect(refused.status).toBe(403);
+      expect((await refused.json()).error).toMatch(/^read-only:/);
+    });
+
+    it('the SSE approval event carries the kind and no content', async () => {
+      const info = await startRO();
+      emitApproval('create', tp());
+      const { text: body } = await readEventStream(`${base()}/api/events`, /ap-tp/, bearer(info.token as string));
+      expect(body).toContain('event: approval');
+      expect(body).toContain('"kind":"terminal_prompt"');
+      expect(body).toContain('ap-tp');
+      expect(body).toContain('"risk":"critical"');
+      for (const content of ['rm -rf build/cache', 'Do you want to proceed', 'Permission rule', FP, '"toolName"', '"choices"', 'toolu_01']) {
+        expect(body).not.toContain(content);
+      }
+    });
+
+    describe('raw input while the dialog is up', () => {
+      const typeInto = (token: string, body: string, headers: Record<string, string> = {}) =>
+        fetch(`${base()}/api/input?session=s1`, { method: 'POST', headers: { ...bearer(token), ...headers }, body });
+
+      it('refuses a typed answer, whether or not the record is answerable', async () => {
+        const info = await startRW();
+        const phone = await pairDevice('Reply from a notification', true);
+        for (const record of [tp(), tp({ choices: undefined, promptFingerprint: undefined })]) {
+          approvalRecords.splice(0, approvalRecords.length, record);
+          for (const token of [phone.token, info.token as string]) {
+            for (const body of ['1\r', '1', '\r', '\x1b\r', '\x1b[B', '\x1b[200~1\r\x1b[201~']) {
+              const res = await typeInto(token, body);
+              expect(res.status, JSON.stringify(body)).toBe(409);
+              expect(await res.json()).toEqual({ error: 'terminal-prompt-active', effect: 'none' });
+            }
+          }
+        }
+        expect(write).not.toHaveBeenCalled();
+      });
+
+      it('lets a lone Esc or a lone Ctrl-C through', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp());
+        expect((await typeInto(info.token as string, '\x1b')).status).toBe(204);
+        expect((await typeInto(info.token as string, '\x03')).status).toBe(204);
+        expect(write.mock.calls).toEqual([['\x1b'], ['\x03']]);
+      });
+
+      it('only a terminal_prompt on THIS pane blocks it', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp({ sessionId: 's2' }), mkApproval({ id: 'ap-gate', kind: 'awaiting_permission' }));
+        expect((await typeInto(info.token as string, '1\r')).status).toBe(204);
+        expect(write).toHaveBeenCalledWith('1\r');
+      });
+
+      it('flows again once the dialog is resolved', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp());
+        expect((await typeInto(info.token as string, 'ls\r')).status).toBe(409);
+        approvalRecords[0].state = 'resolved';
+        expect((await typeInto(info.token as string, 'ls\r')).status).toBe(204);
+        expect(write).toHaveBeenCalledTimes(1);
+      });
+
+      it('a receipted input journals nothing when refused, and its retry is checked again', async () => {
+        const info = await startRW();
+        approvalRecords.push(tp());
+        const headers = {
+          'X-Wmux-Input-Request-ID': `${Date.now()}.${crypto.randomUUID()}`,
+          'X-Wmux-Pane-Incarnation': 'incarnation-1',
+        };
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const refused = await typeInto(info.token as string, '1\r', headers);
+          expect(refused.status).toBe(409);
+          expect(await refused.json()).toEqual({ error: 'terminal-prompt-active', effect: 'none' });
+        }
+        expect(write).not.toHaveBeenCalled();
+        approvalRecords[0].state = 'expired';
+        const written = await typeInto(info.token as string, '1\r', headers);
+        expect(written.status).toBe(200);
+        expect(await written.json()).toEqual({ status: 'written', replayed: false });
+        expect(write).toHaveBeenCalledTimes(1);
+      });
+
+      it('is decided when the body completes, not when the headers arrive', async () => {
+        await startRW();
+        const phone = await pairDevice('Slow typist', true);
+        let observed!: () => void;
+        const entered = new Promise<void>((resolve) => { observed = resolve; });
+        const original = sessionManager.getSession.bind(sessionManager);
+        const spy = vi.spyOn(sessionManager, 'getSession').mockImplementation((id) => {
+          const result = original(id);
+          if (id === 's1') observed();
+          return result;
+        });
+        let request: ReturnType<typeof httpReq>;
+        const response = new Promise<number | undefined>((resolve, reject) => {
+          request = httpReq(`${base()}/api/input?session=s1`, { method: 'POST', headers: bearer(phone.token) }, (res) => {
+            res.resume(); res.on('end', () => resolve(res.statusCode));
+          });
+          request.on('error', reject);
+          request.write('1');
+        });
+        try {
+          await entered;
+          approvalRecords.push(tp());
+          request!.end('\r');
+          expect(await response).toBe(409);
+          expect(write).not.toHaveBeenCalled();
+        } finally { spy.mockRestore(); request!.destroy(); }
+      });
+    });
   });
 
   it('answers 500 rather than hanging when the registry list throws after the body arrives', async () => {
